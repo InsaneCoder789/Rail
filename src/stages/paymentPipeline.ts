@@ -14,14 +14,23 @@ const WALLET_RESERVE_KEY = "wallet.reserveId";
 
 function validateBasics(ctx: PaymentContext): Promise<void> {
   const { txn } = ctx;
-  if (txn.amountMinor <= 0) {
+  if (!Number.isSafeInteger(txn.amountMinor) || txn.amountMinor <= 0) {
     return Promise.reject(new PipelineError("invalid_amount", "INVALID_AMOUNT", false));
+  }
+  if (!/^[A-Z]{3}$/.test(txn.currency)) {
+    return Promise.reject(new PipelineError("invalid_currency", "INVALID_CURRENCY", false));
   }
   if (txn.senderWalletId === txn.receiverWalletId) {
     return Promise.reject(new PipelineError("self_transfer", "SELF_TRANSFER", false));
   }
   if ((txn.channel === "nfc" || txn.channel === "ble" || txn.channel === "qr") && !txn.offlineTokenId) {
     return Promise.reject(new PipelineError("offline_token_required", "OFFLINE_TOKEN", false));
+  }
+  if ((txn.channel === "nfc" || txn.channel === "ble" || txn.channel === "qr") && !txn.deviceId) {
+    return Promise.reject(new PipelineError("offline_device_required", "OFFLINE_DEVICE", false));
+  }
+  if (txn.channel === "online" && txn.offlineTokenId) {
+    return Promise.reject(new PipelineError("offline_token_not_allowed_for_online", "OFFLINE_TOKEN_FOR_ONLINE", false));
   }
   return Promise.resolve();
 }
