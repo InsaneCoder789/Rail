@@ -73,6 +73,9 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
     if (!txn.offlineTokenId) {
       return { ok: false, reason: "offline_token_required" };
     }
+    if (!txn.deviceId) {
+      return { ok: false, reason: "offline_device_required" };
+    }
     const tid = txn.offlineTokenId;
 
     const client = await this.pool.connect();
@@ -97,7 +100,7 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
         await client.query("ROLLBACK");
         return { ok: false, reason: "wallet_mismatch" };
       }
-      if (txn.deviceId !== undefined && txn.deviceId !== String(row.device_id)) {
+      if (txn.deviceId !== String(row.device_id)) {
         await client.query("ROLLBACK");
         return { ok: false, reason: "device_mismatch" };
       }
