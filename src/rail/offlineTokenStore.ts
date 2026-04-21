@@ -73,6 +73,9 @@ export class OfflineTokenStore implements IOfflineTokenStore {
     if (!txn.offlineTokenId) {
       return { ok: false, reason: "offline_token_required" };
     }
+    if (!txn.deviceId) {
+      return { ok: false, reason: "offline_device_required" };
+    }
     const tid = txn.offlineTokenId;
 
     return this.mutex.runExclusive(async () => {
@@ -87,7 +90,7 @@ export class OfflineTokenStore implements IOfflineTokenStore {
       if (row.walletId !== txn.senderWalletId) {
         return { ok: false, reason: "wallet_mismatch" };
       }
-      if (txn.deviceId !== undefined && txn.deviceId !== row.deviceId) {
+      if (txn.deviceId !== row.deviceId) {
         return { ok: false, reason: "device_mismatch" };
       }
       if (txn.currency !== row.currency) {
