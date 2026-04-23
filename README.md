@@ -2,7 +2,14 @@
 
 **Rail** is an **offline-capable payment orchestration service**: it issues **spend tokens** while the client is online, validates **offline channel** payments (NFC / BLE / QR) against those tokens, runs an **idempotent execution pipeline** (risk, saga, ledger events, outbox), and accepts **batched sync** when devices reconnect. It is designed to sit **next to** bank / UPI / PSP systems—Rail does **not** replace NPCI or licensed settlement rails; it coordinates **authorization headroom**, **audit**, and **replay-safe** processing.
 
+
+<img width="1774" height="887" alt="image" src="https://github.com/user-attachments/assets/c9401ae1-30cf-446b-99cf-873ec81a5cf1" />
+
+
+
+
 **Repository:** [github.com/InsaneCoder789/Rail](https://github.com/InsaneCoder789/Rail)
+
 
 ---
 
