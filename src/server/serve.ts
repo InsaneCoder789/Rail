@@ -14,6 +14,8 @@ import { consoleTracer } from "../pipeline/tracing.js";
 import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
 import { OfflineTokenStore, type IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { processSyncBatch } from "../rail/syncBatch.js";
+import { createAuthorization } from "../stages/authorizationStage.js";
+import { verifyAuthorization } from "../crypto/authorizationSigning.js";
 
 const tracer = consoleTracer("[rail]");
 const PORT = Number(process.env.PORT ?? 8787);
@@ -332,6 +334,45 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
+      if (req.method === "POST" && url.pathname === "/v1/payments/authorize") {
+        if (!requireApiKey(req, res)) return;
+        if (!requireJsonContentType(req, res)) return;
+
+        const parsed = await readAndParseJson(req);
+
+        if (!parsed || typeof parsed !== "object") {
+          throw new RequestError(422, "invalid_body", "expected object body");
+        }
+
+        const o = parsed as Record<string, unknown>;
+
+        if (
+          !isSafeText(o.txId, 8, 128) ||
+          !isSafeText(o.senderWalletId, 3, 128) ||
+          !isSafeText(o.receiverWalletId, 3, 128) ||
+          !isValidAmountMinor(o.amountMinor) ||
+          !isCurrency(o.currency)
+        ) {
+          throw new RequestError(
+            422,
+            "invalid_body",
+            "invalid authorization request",
+            "txId, senderWalletId, receiverWalletId, amountMinor, currency required"
+          );
+        }
+
+        const auth = createAuthorization({
+          txId: o.txId as string,
+          senderWalletId: o.senderWalletId as string,
+          receiverWalletId: o.receiverWalletId as string,
+          amountMinor: o.amountMinor as number,
+          currency: o.currency as string,
+        });
+
+        json(res, 200, { authorization: auth });
+        return;
+      }
+
       if (req.method === "POST" && url.pathname === "/v1/offline/tokens/issue") {
         if (!requireApiKey(req, res)) return;
         if (!requireJsonContentType(req, res)) return;
@@ -375,12 +416,33 @@ async function bootstrap(): Promise<void> {
 
         const parsed = await readAndParseJson(req);
 
+        const body = parsed as Record<string, unknown>;
+        const auth = body.authorization as any;
+        if (!auth || typeof auth !== "object") {
+          throw new RequestError(401, "authorization_required", "missing authorization");
+        }
+        const secret = process.env.RAIL_SIGNING_SECRET ?? "";
+        if (!secret) {
+          throw new RequestError(500, "server_misconfig", "missing signing secret", undefined, false);
+        }
+        const isValid = verifyAuthorization(auth, secret);
+        if (!isValid) {
+          throw new RequestError(401, "invalid_authorization", "authorization verification failed");
+        }
+
         if (!isPaymentTransaction(parsed)) {
           json(res, 422, { error: "invalid_body", hint: "expected PaymentTransaction fields" });
           return;
         }
 
-        const txn = toPaymentTransaction(parsed);
+        const { authorization: _auth, ...txnRaw } = body;
+
+        if (!isPaymentTransaction(txnRaw)) {
+          json(res, 422, { error: "invalid_body", hint: "expected PaymentTransaction fields" });
+          return;
+        }
+
+        const txn = toPaymentTransaction(txnRaw as PaymentTransaction);
         const result = await engine.execute(txn);
         json(res, 200, { result });
         return;
