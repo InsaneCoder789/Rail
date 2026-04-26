@@ -10,6 +10,9 @@ dotenv.config({ path: join(__dirname, "../../.env") });
 import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import process from "node:process";
+
+import * as bcrypt from "bcryptjs";
+import { generateToken, verifyToken } from "../auth/jwt.js";
 import type { PaymentTransaction } from "../domain/types.js";
 import { PaymentPipelineEngine } from "../pipeline/engine.js";
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
@@ -81,6 +84,7 @@ function secureEquals(a: string, b: string): boolean {
   return timingSafeEqual(aBuf, bBuf);
 }
 
+
 function resolveApiKeyHeader(req: http.IncomingMessage): string | undefined {
   const h = req.headers;
   const v =
@@ -91,6 +95,47 @@ function resolveApiKeyHeader(req: http.IncomingMessage): string | undefined {
   if (typeof v === "string") return v;
   if (Array.isArray(v)) return v[0];
   return undefined;
+}
+
+function resolveBearerToken(req: http.IncomingMessage): string | undefined {
+  const h = req.headers["authorization"];
+  if (!h) return undefined;
+  const v = Array.isArray(h) ? h[0] : h;
+  if (!v) return undefined;
+  const parts = v.split(" ");
+  if (parts.length === 2 && parts[0] === "Bearer") return parts[1];
+  return undefined;
+}
+
+// --- API key to wallet binding helper ---
+let globalPool: any = null;
+
+async function getWalletFromApiKey(apiKey: string): Promise<string> {
+  if (!globalPool) {
+    throw new Error("DB_NOT_INITIALIZED");
+  }
+
+  const res = await globalPool.query(
+    `SELECT wallet_id FROM api_keys WHERE api_key = $1`,
+    [apiKey]
+  );
+
+  if (res.rowCount === 0) {
+    throw new Error("INVALID_API_KEY");
+  }
+
+  return res.rows[0].wallet_id;
+}
+
+// get wallet from JWT (users table)
+async function getWalletFromUser(userId: string): Promise<string> {
+  if (!globalPool) throw new Error("DB_NOT_INITIALIZED");
+  const res = await globalPool.query(
+    `SELECT wallet_id FROM users WHERE user_id = $1`,
+    [userId]
+  );
+  if (res.rowCount === 0) throw new Error("USER_NOT_FOUND");
+  return res.rows[0].wallet_id;
 }
 
 function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -302,6 +347,7 @@ async function bootstrap(): Promise<void> {
 
   if (databaseUrl) {
     const pool = createPool(databaseUrl);
+    globalPool = pool;
     await runMigrations(pool);
 
     // initialize wallet + ledger systems
@@ -351,11 +397,79 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
+      // 🔐 Register
+      if (req.method === "POST" && url.pathname === "/auth/register") {
+        if (!requireJsonContentType(req, res)) return;
+        const parsed = await readAndParseJson(req);
+        const body = parsed as any;
+
+        if (!body.userId || !body.password) {
+          throw new RequestError(422, "invalid_body", "userId and password required");
+        }
+
+        const hash = await bcrypt.hash(body.password, 10);
+
+        // create wallet if not exists
+        await globalPool.query(
+          `INSERT INTO wallets (wallet_id, balance, reserved)
+           VALUES ($1, 0, 0)
+           ON CONFLICT (wallet_id) DO NOTHING`,
+          [body.userId]
+        );
+
+        await globalPool.query(
+          `INSERT INTO users (user_id, password_hash, wallet_id)
+           VALUES ($1, $2, $1)`,
+          [body.userId, hash]
+        );
+
+        json(res, 200, { ok: true });
+        return;
+      }
+
+      // 🔐 Login
+      if (req.method === "POST" && url.pathname === "/auth/login") {
+        if (!requireJsonContentType(req, res)) return;
+        const parsed = await readAndParseJson(req);
+        const body = parsed as any;
+
+        const resDb = await globalPool.query(
+          `SELECT password_hash FROM users WHERE user_id = $1`,
+          [body.userId]
+        );
+
+        if (resDb.rowCount === 0) {
+          throw new RequestError(401, "invalid_credentials", "user not found");
+        }
+
+        const valid = await bcrypt.compare(body.password, resDb.rows[0].password_hash);
+        if (!valid) {
+          throw new RequestError(401, "invalid_credentials", "wrong password");
+        }
+
+        const token = generateToken(body.userId);
+        json(res, 200, { token });
+        return;
+      }
+
       if (req.method === "POST" && url.pathname === "/v1/payments/authorize") {
-        if (!requireApiKey(req, res)) return;
         if (!requireJsonContentType(req, res)) return;
 
         const parsed = await readAndParseJson(req);
+
+        // --- Enforce API key or JWT → wallet binding ---
+        let walletFromKey: string | null = null;
+        const bearer = resolveBearerToken(req);
+        if (bearer) {
+          const decoded = verifyToken(bearer);
+          walletFromKey = await getWalletFromUser(decoded.userId);
+        } else {
+          const apiKey = resolveApiKeyHeader(req);
+          if (!apiKey) {
+            throw new RequestError(401, "unauthorized", "missing auth");
+          }
+          walletFromKey = await getWalletFromApiKey(apiKey);
+        }
 
         if (!parsed || typeof parsed !== "object") {
           throw new RequestError(422, "invalid_body", "expected object body");
@@ -376,6 +490,11 @@ async function bootstrap(): Promise<void> {
             "invalid authorization request",
             "txId, senderWalletId, receiverWalletId, amountMinor, currency required"
           );
+        }
+
+        // --- Enforce identity binding ---
+        if (o.senderWalletId !== walletFromKey) {
+          throw new RequestError(403, "identity_mismatch", "sender does not match auth");
         }
 
         const auth = await createAuthorization({
@@ -428,10 +547,23 @@ async function bootstrap(): Promise<void> {
       }
 
       if (req.method === "POST" && url.pathname === "/v1/payments/execute") {
-        if (!requireApiKey(req, res)) return;
         if (!requireJsonContentType(req, res)) return;
 
         const parsed = await readAndParseJson(req);
+
+        // --- Enforce API key or JWT → wallet binding ---
+        let walletFromKey: string | null = null;
+        const bearer = resolveBearerToken(req);
+        if (bearer) {
+          const decoded = verifyToken(bearer);
+          walletFromKey = await getWalletFromUser(decoded.userId);
+        } else {
+          const apiKey = resolveApiKeyHeader(req);
+          if (!apiKey) {
+            throw new RequestError(401, "unauthorized", "missing auth");
+          }
+          walletFromKey = await getWalletFromApiKey(apiKey);
+        }
 
         const body = parsed as Record<string, unknown>;
         const auth = body.authorization as any;
@@ -455,7 +587,16 @@ async function bootstrap(): Promise<void> {
         }
 
         const txn = toPaymentTransaction(txnRaw as PaymentTransaction);
-        const result = await engine.execute(txn);
+
+        // --- Enforce identity binding ---
+        if (txn.senderWalletId !== walletFromKey) {
+          throw new RequestError(403, "identity_mismatch", "sender does not match auth");
+        }
+
+        // attach authorization in a new object (important for idempotency layer)
+        const txnWithAuth = { ...(txn as any), authorization: auth };
+
+        const result = await engine.execute(txnWithAuth);
         json(res, 200, { result });
         return;
       }

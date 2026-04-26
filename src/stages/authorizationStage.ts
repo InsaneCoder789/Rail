@@ -19,10 +19,8 @@ function requirePool(): Pool {
 }
 
 // 🔒 Reserve money (authorization step)
-export async function reserveFunds(walletId: string, amount: number): Promise<void> {
-  const db = requirePool();
-
-  const res = await db.query(
+export async function reserveFunds(client: any, walletId: string, amount: number): Promise<void> {
+  const res = await client.query(
     `UPDATE wallets
      SET balance = balance - $2,
          reserved = reserved + $2
@@ -36,35 +34,22 @@ export async function reserveFunds(walletId: string, amount: number): Promise<vo
 }
 
 // 💸 Consume reserved money (final debit)
-export async function consumeReservation(walletId: string, amount: number): Promise<void> {
-  const db = requirePool();
+export async function consumeReservation(client: any, walletId: string, amount: number): Promise<void> {
+  const res = await client.query(
+    `UPDATE wallets
+     SET reserved = reserved - $2
+     WHERE wallet_id = $1 AND reserved >= $2`,
+    [walletId, amount]
+  );
 
-  await db.query("BEGIN");
-
-  try {
-    const res = await db.query(
-      `UPDATE wallets
-       SET reserved = reserved - $2
-       WHERE wallet_id = $1 AND reserved >= $2`,
-      [walletId, amount]
-    );
-
-    if (res.rowCount === 0) {
-      throw new Error("INVALID_RESERVATION");
-    }
-
-    await db.query("COMMIT");
-  } catch (err) {
-    await db.query("ROLLBACK");
-    throw err;
+  if (res.rowCount === 0) {
+    throw new Error("INVALID_RESERVATION");
   }
 }
 
 // 🔄 Release reserved money (rollback case)
-export async function releaseReservation(walletId: string, amount: number): Promise<void> {
-  const db = requirePool();
-
-  await db.query(
+export async function releaseReservation(client: any, walletId: string, amount: number): Promise<void> {
+  await client.query(
     `UPDATE wallets
      SET balance = balance + $2,
          reserved = reserved - $2
@@ -74,10 +59,8 @@ export async function releaseReservation(walletId: string, amount: number): Prom
 }
 
 // 💰 Credit the receiver's wallet
-export async function creditWallet(walletId: string, amount: number): Promise<void> {
-  const db = requirePool();
-
-  const res = await db.query(
+export async function creditWallet(client: any, walletId: string, amount: number): Promise<void> {
+  const res = await client.query(
     `UPDATE wallets
      SET balance = balance + $2
      WHERE wallet_id = $1`,
@@ -104,7 +87,8 @@ export async function createAuthorization(input: {
   }
 
   // 1) Reserve funds first (real money lock)
-  await reserveFunds(input.senderWalletId, input.amountMinor);
+  const db = requirePool();
+  await reserveFunds(db, input.senderWalletId, input.amountMinor);
 
   // 2) Build FULL authorization object (must match verifier exactly)
   const auth = {

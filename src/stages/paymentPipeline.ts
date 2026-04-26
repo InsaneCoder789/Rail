@@ -19,20 +19,35 @@ export function initLedger(pool: Pool) {
 }
 
 async function recordLedgerEntry(
+  client: any,
   type: "debit" | "credit",
   walletId: string,
   amount: number,
   txId: string
 ) {
-  if (!ledgerPool) {
-    throw new Error("ledger_not_initialized");
-  }
-
-  await ledgerPool.query(
+  await client.query(
     `INSERT INTO ledger_entries (tx_id, wallet_id, entry_type, amount_minor)
      VALUES ($1, $2, $3, $4)`,
     [txId, walletId, type, amount]
   );
+}
+
+// 🔐 Replay protection helper
+async function ensureAuthNotUsed(
+  client: any,
+  authId: string,
+  txId: string
+) {
+  const res = await client.query(
+    `INSERT INTO authorization_usage (auth_id, tx_id)
+     VALUES ($1, $2)
+     ON CONFLICT (auth_id) DO NOTHING`,
+    [authId, txId]
+  );
+
+  if (res.rowCount === 0) {
+    throw new Error("AUTH_ALREADY_USED");
+  }
 }
 
 const WALLET_RESERVE_KEY = "wallet.reserveId";
@@ -115,31 +130,61 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
     {
       name: "wallet.transfer",
       forward: async (ctx) => {
-        // 1. Debit sender (consume reserved funds)
-        await consumeReservation(
-          ctx.txn.senderWalletId,
-          ctx.txn.amountMinor
-        );
+        if (!ledgerPool) throw new Error("db_not_initialized");
+        const client = await ledgerPool.connect();
 
-        // 2. Credit receiver
-        await creditWallet(
-          ctx.txn.receiverWalletId,
-          ctx.txn.amountMinor
-        );
+        try {
+          await client.query("BEGIN");
+
+          // 🔐 Replay protection
+          const auth = (ctx as any).authorization ?? (ctx.txn as any).authorization;
+          if (!auth?.authId) {
+            throw new Error("MISSING_AUTH_ID");
+          }
+
+          await ensureAuthNotUsed(
+            client,
+            auth.authId,
+            ctx.txn.txId
+          );
+
+          // 1. Debit sender
+          await consumeReservation(
+            client,
+            ctx.txn.senderWalletId,
+            ctx.txn.amountMinor
+          );
+
+          // 2. Credit receiver
+          await creditWallet(
+            client,
+            ctx.txn.receiverWalletId,
+            ctx.txn.amountMinor
+          );
+
+          // attach client to context for next stage
+          (ctx as any)._dbClient = client;
+
+        } catch (err) {
+          await client.query("ROLLBACK");
+          client.release();
+          throw err;
+        }
       },
       compensate: async (ctx) => {
-        // Rollback: give money back to sender
-        await releaseReservation(
-          ctx.txn.senderWalletId,
-          ctx.txn.amountMinor
-        );
+        const client = (ctx as any)._dbClient;
+        if (!client) return;
 
-        // NOTE: In production, you'd also reverse receiver credit via ledger reversal
+        await client.query("ROLLBACK");
+        client.release();
       },
     },
     {
       name: "ledger.post",
       forward: async (ctx) => {
+        const client = (ctx as any)._dbClient;
+        if (!client) throw new Error("missing_db_client");
+
         if (ctx.risk?.decision === "challenge") {
           ctx.outbox.append({
             type: "payments.step_up_required",
@@ -149,6 +194,7 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
 
         // 🔥 PERSISTENT DOUBLE ENTRY LEDGER
         await recordLedgerEntry(
+          client,
           "debit",
           ctx.txn.senderWalletId,
           ctx.txn.amountMinor,
@@ -156,6 +202,7 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         );
 
         await recordLedgerEntry(
+          client,
           "credit",
           ctx.txn.receiverWalletId,
           ctx.txn.amountMinor,
@@ -177,12 +224,20 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
           await tokenStore.finalizeOfflineSpend(ctx.txn);
         }
 
+        await client.query("COMMIT");
+        client.release();
+
         ctx.result = {
           status: "accepted",
           ledgerEntryId: `leg_${ctx.txn.txId}`,
         };
       },
       compensate: async (ctx) => {
+        const client = (ctx as any)._dbClient;
+        if (client) {
+          await client.query("ROLLBACK");
+          client.release();
+        }
         ctx.outbox.append({
           type: "payments.ledger_reversed",
           payload: { txId: ctx.txn.txId },

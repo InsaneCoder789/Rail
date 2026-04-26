@@ -45,6 +45,27 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_tx ON ledger_entries(tx_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_wallet ON ledger_entries(wallet_id);
+
+CREATE TABLE IF NOT EXISTS authorization_usage (
+  auth_id TEXT PRIMARY KEY,
+  tx_id TEXT NOT NULL,
+  used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  api_key TEXT PRIMARY KEY,
+  wallet_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_wallet ON api_keys(wallet_id);
+
+CREATE TABLE IF NOT EXISTS users (
+  user_id TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  wallet_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_id);
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

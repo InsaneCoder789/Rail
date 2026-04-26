@@ -39,6 +39,16 @@ export function verifyAuthorization(
 ): boolean {
   const { signature, ...unsigned } = auth;
 
+  // ⏱️ Expiry validation
+  try {
+    const expiry = new Date(unsigned.expiresAt).getTime();
+    if (!Number.isFinite(expiry) || Date.now() > expiry) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
   const expected = createHmac("sha256", Buffer.from(secret, "utf8"))
     .update(canonicalAuthorizationPayload(unsigned))
     .digest();
