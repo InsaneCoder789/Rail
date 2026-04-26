@@ -9,6 +9,7 @@ import { defaultRetryPolicy } from "../pipeline/retry.js";
 import type { Tracer } from "../pipeline/tracing.js";
 import { verifyTransactionSignatureIfRequired } from "../crypto/transactionSigning.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
+import { consumeReservation, releaseReservation } from "./authorizationStage.js";
 
 const WALLET_RESERVE_KEY = "wallet.reserveId";
 
@@ -88,16 +89,18 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         ]
       : []),
     {
-      name: "wallet.reserve",
+      name: "wallet.consume_reserved",
       forward: async (ctx) => {
-        const reserveId = `res_${ctx.txn.txId}`;
-        ctx.state[WALLET_RESERVE_KEY] = reserveId;
+        await consumeReservation(
+          ctx.txn.senderWalletId,
+          ctx.txn.amountMinor
+        );
       },
       compensate: async (ctx) => {
-        const reserveId = ctx.state[WALLET_RESERVE_KEY];
-        if (typeof reserveId === "string") {
-          // release hold
-        }
+        await releaseReservation(
+          ctx.txn.senderWalletId,
+          ctx.txn.amountMinor
+        );
       },
     },
     {
