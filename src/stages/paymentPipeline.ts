@@ -9,7 +9,31 @@ import { defaultRetryPolicy } from "../pipeline/retry.js";
 import type { Tracer } from "../pipeline/tracing.js";
 import { verifyTransactionSignatureIfRequired } from "../crypto/transactionSigning.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
-import { consumeReservation, releaseReservation } from "./authorizationStage.js";
+import { consumeReservation, releaseReservation, creditWallet } from "./authorizationStage.js";
+import { Pool } from "pg";
+
+let ledgerPool: Pool | null = null;
+
+export function initLedger(pool: Pool) {
+  ledgerPool = pool;
+}
+
+async function recordLedgerEntry(
+  type: "debit" | "credit",
+  walletId: string,
+  amount: number,
+  txId: string
+) {
+  if (!ledgerPool) {
+    throw new Error("ledger_not_initialized");
+  }
+
+  await ledgerPool.query(
+    `INSERT INTO ledger_entries (tx_id, wallet_id, entry_type, amount_minor)
+     VALUES ($1, $2, $3, $4)`,
+    [txId, walletId, type, amount]
+  );
+}
 
 const WALLET_RESERVE_KEY = "wallet.reserveId";
 
@@ -89,18 +113,28 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         ]
       : []),
     {
-      name: "wallet.consume_reserved",
+      name: "wallet.transfer",
       forward: async (ctx) => {
+        // 1. Debit sender (consume reserved funds)
         await consumeReservation(
           ctx.txn.senderWalletId,
           ctx.txn.amountMinor
         );
+
+        // 2. Credit receiver
+        await creditWallet(
+          ctx.txn.receiverWalletId,
+          ctx.txn.amountMinor
+        );
       },
       compensate: async (ctx) => {
+        // Rollback: give money back to sender
         await releaseReservation(
           ctx.txn.senderWalletId,
           ctx.txn.amountMinor
         );
+
+        // NOTE: In production, you'd also reverse receiver credit via ledger reversal
       },
     },
     {
@@ -112,6 +146,23 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
             payload: { txId: ctx.txn.txId, correlationId: ctx.correlationId },
           });
         }
+
+        // 🔥 PERSISTENT DOUBLE ENTRY LEDGER
+        await recordLedgerEntry(
+          "debit",
+          ctx.txn.senderWalletId,
+          ctx.txn.amountMinor,
+          ctx.txn.txId
+        );
+
+        await recordLedgerEntry(
+          "credit",
+          ctx.txn.receiverWalletId,
+          ctx.txn.amountMinor,
+          ctx.txn.txId
+        );
+
+        // keep event system
         ctx.outbox.append({
           type: "payments.ledger_posted",
           payload: {
@@ -121,9 +172,11 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
             offline: ctx.txn.channel !== "online",
           },
         });
+
         if (tokenStore) {
           await tokenStore.finalizeOfflineSpend(ctx.txn);
         }
+
         ctx.result = {
           status: "accepted",
           ledgerEntryId: `leg_${ctx.txn.txId}`,

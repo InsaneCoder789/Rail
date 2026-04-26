@@ -1,3 +1,12 @@
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Load .env from project root
+dotenv.config({ path: join(__dirname, "../../.env") });
 import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import process from "node:process";
@@ -12,9 +21,11 @@ import { runMigrations } from "../persistence/migrate.js";
 import { MemoryOutbox } from "../pipeline/outbox.js";
 import { consoleTracer } from "../pipeline/tracing.js";
 import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
+import { initLedger } from "../stages/paymentPipeline.js";
 import { OfflineTokenStore, type IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { processSyncBatch } from "../rail/syncBatch.js";
 import { createAuthorization } from "../stages/authorizationStage.js";
+import { initAuthorizationWallet } from "../stages/authorizationStage.js";
 import { verifyAuthorization } from "../crypto/authorizationSigning.js";
 
 const tracer = consoleTracer("[rail]");
@@ -292,6 +303,12 @@ async function bootstrap(): Promise<void> {
   if (databaseUrl) {
     const pool = createPool(databaseUrl);
     await runMigrations(pool);
+
+    // initialize wallet + ledger systems
+    initAuthorizationWallet(pool);
+
+    // initialize ledger (new)
+    initLedger(pool);
     offlineTokenStore = new PostgresOfflineTokenStore(pool);
     idempotency = new PostgresIdempotencyStore(pool);
     // eslint-disable-next-line no-console
@@ -361,7 +378,7 @@ async function bootstrap(): Promise<void> {
           );
         }
 
-        const auth = createAuthorization({
+        const auth = await createAuthorization({
           txId: o.txId as string,
           senderWalletId: o.senderWalletId as string,
           receiverWalletId: o.receiverWalletId as string,
@@ -428,11 +445,6 @@ async function bootstrap(): Promise<void> {
         const isValid = verifyAuthorization(auth, secret);
         if (!isValid) {
           throw new RequestError(401, "invalid_authorization", "authorization verification failed");
-        }
-
-        if (!isPaymentTransaction(parsed)) {
-          json(res, 422, { error: "invalid_body", hint: "expected PaymentTransaction fields" });
-          return;
         }
 
         const { authorization: _auth, ...txnRaw } = body;
