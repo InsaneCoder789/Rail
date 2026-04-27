@@ -376,6 +376,17 @@ async function bootstrap(): Promise<void> {
 
   const server = http.createServer(async (req, res) => {
     try {
+      // --- CORS ---
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
       if (!req.url || !req.method) {
         json(res, 400, { error: "bad_request" });
         return;
@@ -591,6 +602,21 @@ async function bootstrap(): Promise<void> {
         // --- Enforce identity binding ---
         if (txn.senderWalletId !== walletFromKey) {
           throw new RequestError(403, "identity_mismatch", "sender does not match auth");
+        }
+
+        // --- 🔐 CRITICAL: Authorization ↔ Transaction Binding ---
+        if (
+          auth.txId !== txn.txId ||
+          auth.amountMinor !== txn.amountMinor ||
+          auth.currency !== txn.currency ||
+          auth.senderWalletId !== txn.senderWalletId ||
+          auth.receiverWalletId !== txn.receiverWalletId
+        ) {
+          throw new RequestError(
+            401,
+            "auth_txn_mismatch",
+            "authorization does not match transaction"
+          );
         }
 
         // attach authorization in a new object (important for idempotency layer)
