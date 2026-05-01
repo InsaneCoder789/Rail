@@ -24,24 +24,79 @@
 
 ## Architecture (high level)
 
-```
-┌─────────────┐     online      ┌──────────────────────────────────────┐
-│ Mobile / POS│ ───────────────►│ Rail HTTP API                         │
-│ (Flutter /   │                 │  • POST /v1/offline/tokens/issue      │
-│  Android)    │                 │  • POST /v1/payments/execute          │
-└─────────────┘                 │  • POST /v1/sync/transactions        │
-       │                          │                                       │
-       │ offline QR/NFC/BLE       │  ┌─────────────────────────────────┐ │
-       │ (token-bound payloads)   │  │ Pipeline: validate → parallel   │ │
-       ▼                          │  │ checks → saga (offline reserve,   │ │
-┌─────────────┐                   │  │ wallet, ledger) → outbox          │ │
-│ Local queue │ ── sync when ────►│  └─────────────────────────────────┘ │
-│ (encrypted) │     online        │              │                         │
-└─────────────┘                   │              ▼                         │
-                                  │     PostgreSQL (optional)             │
-                                  │     • rail_idempotency                │
-                                  │     • rail_offline_tokens             │
-                                  └──────────────────────────────────────┘
+```mermaid
+flowchart TD
+
+subgraph group_runtime["Runtime & API"]
+  node_src_index["Entry<br/>bootstrap<br/>[index.ts]"]
+  node_src_server_serve["HTTP Server<br/>api server<br/>[serve.ts]"]
+end
+
+subgraph group_core["Core Flow"]
+  node_domain_model["Payment Txn<br/>domain model<br/>[types.ts]"]
+  node_domain_authz["Authorization<br/>domain model<br/>[authorization.ts]"]
+  node_payment_pipeline["Payment Flow<br/>stage composition<br/>[paymentPipeline.ts]"]
+  node_authorization_stage["Auth Stage<br/>pipeline stage"]
+  node_sync_batch["Sync Batch<br/>replay flow<br/>[syncBatch.ts]"]
+  node_offline_tokens[("Token Store<br/>offline headroom")]
+end
+
+subgraph group_platform["Pipeline & Storage"]
+  node_pipeline_engine["Engine<br/>pipeline runtime<br/>[engine.ts]"]
+  node_pipeline_middle["Middleware<br/>pipeline infra<br/>[middleware.ts]"]
+  node_pipeline_saga["Saga<br/>workflow coordination<br/>[saga.ts]"]
+  node_pipeline_outbox["Outbox<br/>event delivery<br/>[outbox.ts]"]
+  node_pipeline_resilience["Resilience<br/>infra bundle<br/>[backpressure.ts]"]
+  node_pipeline_idem["Idempotency<br/>dedupe<br/>[idempotency.ts]"]
+  node_pipeline_errors["Errors<br/>error model<br/>[errors.ts]"]
+  node_persist_pool[("Postgres Pool<br/>db access<br/>[postgresPool.ts]")]
+  node_persist_stores[("Postgres Stores<br/>durable stores")]
+  node_wallet_store[("Wallet Store<br/>store abstraction<br/>[walletStore.ts]")]
+end
+
+subgraph group_security["Security"]
+  node_tx_signing{{"Tx Signing<br/>integrity crypto"}}
+  node_authz_signing{{"Auth Signing<br/>integrity crypto"}}
+  node_hsm_hooks{{"HSM Hooks<br/>kms integration<br/>[hsm.ts]"}}
+  node_mutex["Mutex<br/>concurrency control<br/>[mutex.ts]"]
+end
+
+node_src_index -->|"starts"| node_src_server_serve
+node_src_server_serve -->|"routes"| node_payment_pipeline
+node_src_server_serve -->|"uses"| node_authorization_stage
+node_src_server_serve -->|"accepts"| node_sync_batch
+node_src_server_serve -->|"issues"| node_offline_tokens
+node_src_server_serve -->|"configures"| node_persist_pool
+node_payment_pipeline -->|"composes"| node_pipeline_engine
+node_payment_pipeline -->|"uses"| node_pipeline_middle
+node_payment_pipeline -->|"orchestrates"| node_pipeline_saga
+node_payment_pipeline -->|"emits"| node_pipeline_outbox
+node_payment_pipeline -->|"relies on"| node_pipeline_resilience
+node_payment_pipeline -->|"dedupes"| node_pipeline_idem
+node_payment_pipeline -->|"signals"| node_pipeline_errors
+node_authorization_stage -->|"models"| node_domain_authz
+node_authorization_stage -->|"verifies"| node_authz_signing
+node_sync_batch -->|"serializes"| node_mutex
+node_sync_batch -->|"reuses"| node_pipeline_idem
+node_offline_tokens -->|"persists"| node_persist_stores
+node_offline_tokens -->|"binds"| node_domain_model
+node_persist_stores -->|"uses"| node_persist_pool
+node_persist_stores -->|"implements"| node_wallet_store
+node_persist_stores -->|"backs"| node_pipeline_idem
+node_domain_model -->|"protected by"| node_tx_signing
+node_domain_model -->|"integrates"| node_hsm_hooks
+node_authz_signing -->|"integrates"| node_hsm_hooks
+node_mutex -->|"coordinates"| node_pipeline_idem
+
+classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
+classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
+classDef toneAmber fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
+classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
+classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
+class node_src_index,node_src_server_serve toneBlue
+class node_domain_model,node_domain_authz,node_payment_pipeline,node_authorization_stage,node_sync_batch,node_offline_tokens toneAmber
+class node_pipeline_engine,node_pipeline_middle,node_pipeline_saga,node_pipeline_outbox,node_pipeline_resilience,node_pipeline_idem,node_pipeline_errors,node_persist_pool,node_persist_stores,node_wallet_store toneMint
+class node_tx_signing,node_authz_signing,node_hsm_hooks,node_mutex toneRose
 ```
 
 **Settlement** (money movement on bank/UPI rails) is **out of scope** for this repository; your PSP or bank integration consumes outbox/webhook events or mirrors the ledger in your core banking system.
