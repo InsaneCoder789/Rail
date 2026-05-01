@@ -22,10 +22,13 @@
 
 ---
 
-## Architecture (high level)
+## Architecture (Real Time Analysis)
+
+> This diagram shows the full Rail execution architecture — from API entry to pipeline orchestration, storage, and security layers. It is intentionally expanded for clarity.
 
 ```mermaid
-flowchart TD
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 80}} }%%
+flowchart LR
 
 subgraph group_runtime["Runtime & API"]
   node_src_index["Entry<br/>bootstrap<br/>[index.ts]"]
@@ -98,6 +101,69 @@ class node_domain_model,node_domain_authz,node_payment_pipeline,node_authorizati
 class node_pipeline_engine,node_pipeline_middle,node_pipeline_saga,node_pipeline_outbox,node_pipeline_resilience,node_pipeline_idem,node_pipeline_errors,node_persist_pool,node_persist_stores,node_wallet_store toneMint
 class node_tx_signing,node_authz_signing,node_hsm_hooks,node_mutex toneRose
 ```
+
+---
+
+## Runtime Pipeline & Observability 
+
+> This diagram represents the live execution flow — including SSE streaming, pipeline stages, error propagation, and the frontend dashboard visualization.
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 50, "rankSpacing": 70}} }%%
+flowchart LR
+
+subgraph backend["Backend Execution"]
+  A["HTTP Request\n/payment/execute"]
+  B["Pipeline Engine\n(validate → risk → wallet → ledger)"]
+  C["Outbox Events\npipeline.stage / errors"]
+  D["SSE Stream\n/v1/events/stream"]
+end
+
+subgraph frontend["Dashboard UI"]
+  E["Event Listener\n(EventSource)"]
+  F["State Engine\n(progressMap + sequence)"]
+  G["Pipeline UI\n(animated nodes + flow)"]
+  H["Logs Panel\n(rail logs)"]
+  I["Fault Buffer\n(system errors)"]
+end
+
+subgraph dataflow["Event Types"]
+  T1["pipeline.stage"]
+  T2["pipeline.error"]
+  T3["system.error"]
+  T4["payments.ledger_posted"]
+end
+
+A --> B
+B --> C
+C --> D
+D --> E
+
+E --> F
+F --> G
+F --> H
+F --> I
+
+C --> T1
+C --> T2
+C --> T3
+C --> T4
+
+T1 --> F
+T2 --> I
+T3 --> I
+T4 --> H
+
+classDef backend fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+classDef frontend fill:#f0fdf4,stroke:#16a34a,color:#14532d
+classDef dataflow fill:#fef3c7,stroke:#d97706,color:#78350f
+
+class A,B,C,D backend
+class E,F,G,H,I frontend
+class T1,T2,T3,T4 dataflow
+```
+
+---
 
 **Settlement** (money movement on bank/UPI rails) is **out of scope** for this repository; your PSP or bank integration consumes outbox/webhook events or mirrors the ledger in your core banking system.
 
