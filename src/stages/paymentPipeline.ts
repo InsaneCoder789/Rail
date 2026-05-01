@@ -10,7 +10,7 @@ import type { Tracer } from "../pipeline/tracing.js";
 import { verifyTransactionSignatureIfRequired } from "../crypto/transactionSigning.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { consumeReservation, releaseReservation, creditWallet } from "./authorizationStage.js";
-import { Pool } from "pg";
+import { Pool, PoolClient } from "pg";
 
 let ledgerPool: Pool | null = null;
 
@@ -52,26 +52,63 @@ async function ensureAuthNotUsed(
 
 const WALLET_RESERVE_KEY = "wallet.reserveId";
 
+// Sequence counter for strict event ordering
+function nextSeq(ctx: PaymentContext): number {
+  if (!(ctx as any)._seq) (ctx as any)._seq = 1;
+  return (ctx as any)._seq++;
+}
+
+function emitStage(
+  ctx: PaymentContext,
+  stage: string,
+  status: "start" | "ok" | "error"
+) {
+  const seq = nextSeq(ctx);
+  const key = `${stage}:${status}`;
+  if (!(ctx as any)._emitted) (ctx as any)._emitted = new Set();
+  if ((ctx as any)._emitted.has(key)) return;
+  (ctx as any)._emitted.add(key);
+
+  ctx.outbox?.append?.({
+    type: "pipeline.stage",
+    payload: {
+      stage,
+      status,
+      txId: ctx.txn.txId,
+      sequence: seq,
+    },
+    occurredAt: new Date(Date.now() + seq).toISOString(),
+  } as any);
+}
+
 function validateBasics(ctx: PaymentContext): Promise<void> {
+  emitStage(ctx, "validate.core", "start");
   const { txn } = ctx;
   if (!Number.isSafeInteger(txn.amountMinor) || txn.amountMinor <= 0) {
+    emitStage(ctx, "validate.core", "error");
     return Promise.reject(new PipelineError("invalid_amount", "INVALID_AMOUNT", false));
   }
   if (!/^[A-Z]{3}$/.test(txn.currency)) {
+    emitStage(ctx, "validate.core", "error");
     return Promise.reject(new PipelineError("invalid_currency", "INVALID_CURRENCY", false));
   }
   if (txn.senderWalletId === txn.receiverWalletId) {
+    emitStage(ctx, "validate.core", "error");
     return Promise.reject(new PipelineError("self_transfer", "SELF_TRANSFER", false));
   }
   if ((txn.channel === "nfc" || txn.channel === "ble" || txn.channel === "qr") && !txn.offlineTokenId) {
+    emitStage(ctx, "validate.core", "error");
     return Promise.reject(new PipelineError("offline_token_required", "OFFLINE_TOKEN", false));
   }
   if ((txn.channel === "nfc" || txn.channel === "ble" || txn.channel === "qr") && !txn.deviceId) {
+    emitStage(ctx, "validate.core", "error");
     return Promise.reject(new PipelineError("offline_device_required", "OFFLINE_DEVICE", false));
   }
   if (txn.channel === "online" && txn.offlineTokenId) {
+    emitStage(ctx, "validate.core", "error");
     return Promise.reject(new PipelineError("offline_token_not_allowed_for_online", "OFFLINE_TOKEN_FOR_ONLINE", false));
   }
+  emitStage(ctx, "validate.core", "ok");
   return Promise.resolve();
 }
 
@@ -95,6 +132,7 @@ function createStableSignatureVerifier(): Stage {
 
 function riskScoreStage(): Stage {
   return async (ctx) => {
+    emitStage(ctx, "risk.score", "start");
     const velocity = Math.abs(ctx.txn.txId.charCodeAt(0) % 5);
     const score = 82 - velocity * 3;
     const decision = score >= 75 ? "allow" : score >= 60 ? "challenge" : "block";
@@ -104,8 +142,10 @@ function riskScoreStage(): Stage {
       reasons: [`velocity_hint=${velocity}`],
     };
     if (decision === "block") {
+      emitStage(ctx, "risk.score", "error");
       throw new PipelineError("risk_blocked", "RISK_BLOCK", false);
     }
+    emitStage(ctx, "risk.score", "ok");
   };
 }
 
@@ -130,8 +170,11 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
     {
       name: "wallet.transfer",
       forward: async (ctx) => {
-        if (!ledgerPool) throw new Error("db_not_initialized");
-        const client = await ledgerPool.connect();
+        emitStage(ctx, "wallet.transfer", "start");
+        if (!ledgerPool) {
+          throw new Error("db_not_initialized");
+        }
+        const client: PoolClient = await ledgerPool.connect();
 
         try {
           await client.query("BEGIN");
@@ -162,34 +205,44 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
             ctx.txn.amountMinor
           );
 
+          emitStage(ctx, "wallet.transfer", "ok");
+
           // attach client to context for next stage
           (ctx as any)._dbClient = client;
 
         } catch (err) {
-          await client.query("ROLLBACK");
-          client.release();
+          emitStage(ctx, "wallet.transfer", "error");
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+          try { client.release(); } catch {}
           throw err;
         }
       },
       compensate: async (ctx) => {
-        const client = (ctx as any)._dbClient;
+        const client = (ctx as any)._dbClient as PoolClient | undefined;
         if (!client) return;
-
-        await client.query("ROLLBACK");
-        client.release();
+        try {
+          await client.query("ROLLBACK");
+        } catch {}
+        try {
+          client.release();
+        } catch {}
       },
     },
     {
       name: "ledger.post",
       forward: async (ctx) => {
-        const client = (ctx as any)._dbClient;
+        emitStage(ctx, "ledger.post", "start");
+        const client = (ctx as any)._dbClient as PoolClient | undefined;
         if (!client) throw new Error("missing_db_client");
 
         if (ctx.risk?.decision === "challenge") {
-          ctx.outbox.append({
+          ctx.outbox?.append?.({
             type: "payments.step_up_required",
             payload: { txId: ctx.txn.txId, correlationId: ctx.correlationId },
-          });
+            occurredAt: new Date().toISOString(),
+          } as any);
         }
 
         // 🔥 PERSISTENT DOUBLE ENTRY LEDGER
@@ -210,7 +263,7 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         );
 
         // keep event system
-        ctx.outbox.append({
+        ctx.outbox?.append?.({
           type: "payments.ledger_posted",
           payload: {
             txId: ctx.txn.txId,
@@ -218,14 +271,20 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
             channel: ctx.txn.channel,
             offline: ctx.txn.channel !== "online",
           },
-        });
+          occurredAt: new Date().toISOString(),
+        } as any);
 
         if (tokenStore) {
           await tokenStore.finalizeOfflineSpend(ctx.txn);
         }
 
+        emitStage(ctx, "ledger.post", "ok");
+
+        if (!client) throw new Error("missing_db_client_commit");
         await client.query("COMMIT");
         client.release();
+
+        emitStage(ctx, "payment.execute", "ok");
 
         ctx.result = {
           status: "accepted",
@@ -233,15 +292,21 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         };
       },
       compensate: async (ctx) => {
-        const client = (ctx as any)._dbClient;
+        emitStage(ctx, "ledger.post", "error");
+        const client = (ctx as any)._dbClient as PoolClient | undefined;
         if (client) {
-          await client.query("ROLLBACK");
-          client.release();
+          try {
+            await client.query("ROLLBACK");
+          } catch {}
+          try {
+            client.release();
+          } catch {}
         }
-        ctx.outbox.append({
+        ctx.outbox?.append?.({
           type: "payments.ledger_reversed",
           payload: { txId: ctx.txn.txId },
-        });
+          occurredAt: new Date().toISOString(),
+        } as any);
         ctx.result = { status: "rejected", reason: "compensated" };
       },
     },
@@ -257,8 +322,16 @@ function buildPipelineWithVerifier(tracer: Tracer, signatureStage: Stage, tokenS
   const saga = walletSaga(tokenStore);
 
   const parallelChecks: Stage = async (ctx) => {
+    // enforce deterministic emit order even if execution is parallel
     await runParallelBounded(
-      [withSpan(tracer, "verify.signatures", signatureStage), withSpan(tracer, "risk.score", riskScoreStage())],
+      [
+        async (c) => {
+          await withSpan(tracer, "verify.signatures", signatureStage)(c);
+        },
+        async (c) => {
+          await withSpan(tracer, "risk.score", riskScoreStage())(c);
+        },
+      ],
       ctx,
       limiter,
     );

@@ -110,6 +110,118 @@ function resolveBearerToken(req: http.IncomingMessage): string | undefined {
 // --- API key to wallet binding helper ---
 let globalPool: any = null;
 
+// 🔥 Simple in-memory outbox (used if DB not initialized)
+const outboxEvents: any[] = [];
+const sseClients = new Set<http.ServerResponse>();
+
+// 🔥 TEMP FIX: capture pipeline logs and forward to SSE + DB
+const originalConsoleLog = console.log;
+console.log = (...args: any[]) => {
+  originalConsoleLog(...args);
+
+  try {
+    // capture outbox_relay logs
+    if (args[0] === "outbox_relay" && args[1] && typeof args[1] === "object") {
+      const evt = args[1];
+
+      const normalizedEvent = {
+        type: evt.type ?? "unknown",
+        payload: evt.payload ?? {},
+        occurredAt: evt.occurredAt ?? new Date().toISOString(),
+      };
+
+      broadcastEvent(normalizedEvent);
+      insertOutboxEvent(normalizedEvent).catch(() => {});
+    }
+  } catch (e) {
+    originalConsoleLog("log_intercept_error", e);
+  }
+};
+
+function broadcastEvent(event: any) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+
+  for (const client of sseClients) {
+    try {
+      client.write(payload);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+// --- Postgres Outbox Helpers ---
+async function insertOutboxEvent(event: {
+  type: string;
+  payload: Record<string, unknown>;
+  occurredAt?: string;
+}): Promise<void> {
+  if (!event || typeof event !== "object") return;
+
+  const finalEvent = {
+    type: event.type ?? "unknown",
+    payload: event.payload ?? {},
+    occurredAt: event.occurredAt ?? new Date().toISOString(),
+  };
+
+  if (!globalPool) {
+    outboxEvents.unshift(finalEvent);
+    if (outboxEvents.length > 20) outboxEvents.pop();
+
+    broadcastEvent(finalEvent);
+    return;
+  }
+
+  try {
+    await globalPool.query(
+      `INSERT INTO outbox (type, payload, occurred_at)
+       VALUES ($1, $2::jsonb, $3::timestamptz)`,
+      [finalEvent.type, JSON.stringify(finalEvent.payload), finalEvent.occurredAt]
+    );
+  } catch (e) {
+    console.error("outbox_db_error", e);
+  }
+
+  broadcastEvent(finalEvent);
+}
+
+// --- Global helper to emit system errors to SSE + DB ---
+function emitSystemError(err: any, stage?: string, txId?: string) {
+  const normalized = {
+    type: "system.error",
+    payload: {
+      name: err?.name ?? "Error",
+      message: err?.message ?? "Unknown error",
+      stage: stage ?? null,
+      txId: txId ?? null,
+    },
+    occurredAt: new Date().toISOString(),
+  };
+
+  broadcastEvent(normalized);
+  insertOutboxEvent(normalized).catch(() => {});
+}
+
+async function listOutboxEvents(limit = 20): Promise<any[]> {
+  if (!globalPool) {
+    return outboxEvents;
+  }
+
+  const res = await globalPool.query(
+    `SELECT type, payload, occurred_at
+     FROM outbox
+     ORDER BY occurred_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+
+  return res.rows.map((r: any) => ({
+    type: r.type,
+    payload: r.payload,
+    occurredAt: r.occurred_at,
+  }));
+}
+
 async function getWalletFromApiKey(apiKey: string): Promise<string> {
   if (!globalPool) {
     throw new Error("DB_NOT_INITIALIZED");
@@ -350,6 +462,21 @@ async function bootstrap(): Promise<void> {
     globalPool = pool;
     await runMigrations(pool);
 
+    // ensure outbox table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS outbox (
+        id BIGSERIAL PRIMARY KEY,
+        type TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    // create index for faster reads
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_outbox_occurred_at_desc
+      ON outbox (occurred_at DESC);
+    `);
+
     // initialize wallet + ledger systems
     initAuthorizationWallet(pool);
 
@@ -373,6 +500,39 @@ async function bootstrap(): Promise<void> {
     dlq: new MemoryDeadLetterQueue(),
     pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore),
   });
+
+  // 🔥 CRITICAL: Forward pipeline outbox events → DB + SSE
+  // access internal outbox (engine keeps it private)
+  const outboxAny = (engine as any).outbox;
+
+  if (outboxAny && typeof outboxAny.append === "function" && !outboxAny.__forwardingEnabled) {
+    const originalAppend = outboxAny.append.bind(outboxAny);
+
+    outboxAny.append = (event: any) => {
+      try {
+        // keep engine internal behavior
+        originalAppend(event);
+
+        // 🔥 Normalize event (CRITICAL FIX)
+        const normalizedEvent = {
+          type: event.type ?? "unknown",
+          payload: event.payload ?? {},
+          occurredAt: event.occurredAt ?? new Date().toISOString(),
+        };
+
+        // 🔥 stream immediately
+        broadcastEvent(normalizedEvent);
+
+        // 🔥 persist correctly
+        insertOutboxEvent(normalizedEvent).catch((err) =>
+          console.error("outbox_forward_error", err)
+        );
+      } catch (err) {
+        console.error("outbox_patch_error", err);
+      }
+    };
+    outboxAny.__forwardingEnabled = true;
+  }
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -472,7 +632,13 @@ async function bootstrap(): Promise<void> {
         let walletFromKey: string | null = null;
         const bearer = resolveBearerToken(req);
         if (bearer) {
-          const decoded = verifyToken(bearer);
+          let decoded;
+          try {
+            decoded = verifyToken(bearer);
+          } catch (err: any) {
+            emitSystemError(err, "auth.verify");
+            throw err;
+          }
           walletFromKey = await getWalletFromUser(decoded.userId);
         } else {
           const apiKey = resolveApiKeyHeader(req);
@@ -566,7 +732,13 @@ async function bootstrap(): Promise<void> {
         let walletFromKey: string | null = null;
         const bearer = resolveBearerToken(req);
         if (bearer) {
-          const decoded = verifyToken(bearer);
+          let decoded;
+          try {
+            decoded = verifyToken(bearer);
+          } catch (err: any) {
+            emitSystemError(err, "auth.verify");
+            throw err;
+          }
           walletFromKey = await getWalletFromUser(decoded.userId);
         } else {
           const apiKey = resolveApiKeyHeader(req);
@@ -623,6 +795,7 @@ async function bootstrap(): Promise<void> {
         const txnWithAuth = { ...(txn as any), authorization: auth };
 
         const result = await engine.execute(txnWithAuth);
+
         json(res, 200, { result });
         return;
       }
@@ -669,12 +842,69 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
-      json(res, 404, { error: "not_found" });
-    } catch (err) {
-      if (!(err instanceof RequestError)) {
-        // eslint-disable-next-line no-console
-        console.error("request_failed", err);
+      // 📡 Live event stream (SSE)
+if (req.method === "GET" && url.pathname === "/v1/events/stream") {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+
+  res.write(": connected\n\n");
+
+  sseClients.add(res);
+  (async () => {
+    const recent = await listOutboxEvents(50);
+    for (const evt of recent.reverse()) {
+      res.write(`data: ${JSON.stringify(evt)}\n\n`);
+    }
+  })();
+
+  const interval = setInterval(() => {
+    try {
+      res.write(": keep-alive\n\n");
+    } catch {
+      clearInterval(interval);
+      sseClients.delete(res);
+    }
+  }, 15000);
+
+  req.on("close", () => {
+    clearInterval(interval);
+    sseClients.delete(res);
+  });
+
+  return;
+}
+
+      
+
+      // 📡 Events endpoint (Postgres-backed outbox)
+      if (req.method === "GET" && url.pathname === "/v1/events") {
+        try {
+          const events = await listOutboxEvents(20);
+          json(res, 200, { events });
+        } catch (e) {
+          json(res, 500, { error: "internal_error" });
+        }
+        return;
       }
+
+      json(res, 200, { status: "success" });
+    } catch (err: any) {
+      // eslint-disable-next-line no-console
+      console.error("request_failed", err);
+
+      // 🔥 emit to SSE
+      emitSystemError(err);
+      if (err instanceof RequestError) {
+        emitSystemError({
+          name: err.code,
+          message: err.message,
+        });
+      }
+
       const mapped = toErrorResponse(err);
       json(res, mapped.status, mapped.body);
     }
