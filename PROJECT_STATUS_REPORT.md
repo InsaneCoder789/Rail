@@ -21,8 +21,13 @@ The major improvements completed in this phase are:
 - payment execution now resolves authorization state from stored records
 - authorization usage is claimed inside the payment transaction
 - expired authorizations are now eligible for automatic reservation release
+- completed same-key retries are now allowed even after an authorization has been consumed
 
 This means the project is no longer relying only on a client-carried signed authorization object for execution safety. The server now has a durable source of truth for authorization lifecycle state.
+
+An important follow-up fix was also applied after live verification: the API boundary now permits legitimate same-idempotency retries for already-completed payments instead of rejecting them early due to the authorization having moved to `used`.
+
+Phase 2 contract-alignment work has now started as well. The first completed Phase 2 improvement is that the sync path has been aligned with stored authorizations instead of accepting bare replay transactions with insufficient execution context.
 
 ## Project Summary
 
@@ -202,6 +207,13 @@ The payment saga performs:
 
 The important change here is that authorization claim now happens in the same transaction as reservation consumption and ledger posting. If the transaction rolls back, the authorization does not remain permanently marked as used.
 
+The execute route now also distinguishes between:
+
+- a legitimate retry of a previously completed request with the same `idempotencyKey`
+- an invalid attempt to reuse an already-consumed authorization with a different request identity
+
+This preserves anti-replay controls without breaking client retry safety.
+
 This is one of the strongest architectural parts of the system because it expresses payment execution as a controlled, compensatable workflow rather than a single unstructured handler.
 
 ## 4. Offline Token Flow
@@ -227,12 +239,14 @@ The sync handler:
 
 - accepts a device id
 - validates a batch of transactions
+- requires each transaction to reference a stored `authorizationId`
 - verifies device consistency across the batch
 - replays the transactions through the same engine
+- rejects online transactions from the sync endpoint
 
 This is a good design direction because it reuses the same idempotent execution path rather than inventing a separate settlement path.
 
-However, the current sync payload shape does not fully align with the execution pipeline requirements, which is discussed later under flaws.
+This closes one of the major inconsistencies identified after Phase 1, because replayed offline payments now carry the same stored-authorization reference required by the main execute path.
 
 ## 6. Persistence Model
 
@@ -316,19 +330,13 @@ The system does not stop at business approval. It actually records debit and cre
 
 The following issues are currently the most important from a correctness and project-readiness perspective.
 
-### 1. Sync contract is incomplete
-
-The sync endpoint accepts plain `PaymentTransaction` items, but the execute path now expects authorization information for successful processing.
-
-This means the documented batch replay flow is not fully aligned with the current execution contract.
-
-### 2. In-memory mode is not truly complete
+### 1. In-memory mode is not truly complete
 
 The README describes a no-Postgres path, but the current server behavior relies heavily on database-backed wallet and identity state.
 
 This means memory mode is currently more of a partial development fallback than a complete supported runtime mode.
 
-### 3. Eventing uses temporary patches
+### 2. Eventing uses temporary patches
 
 The current SSE/outbox flow depends on:
 
@@ -337,11 +345,11 @@ The current SSE/outbox flow depends on:
 
 This works as a temporary bridge but should not be treated as final infrastructure.
 
-### 4. Some abstractions have drifted from the live schema
+### 3. Some abstractions have drifted from the live schema
 
 `PostgresWalletStore` uses column names that do not match the actual migrated wallet table, suggesting that this abstraction is stale or unused.
 
-### 5. Security hardening is incomplete
+### 4. Security hardening is incomplete
 
 Current concerns include:
 
@@ -350,9 +358,9 @@ Current concerns include:
 - client-visible errors may expose too much detail
 - risk scoring is still placeholder logic
 
-### 6. Demo and documentation drift
+### 5. Demo and documentation drift
 
-The demo transaction no longer matches current validation rules, and parts of the README overstate the readiness of some runtime paths.
+The demo transaction no longer matches current validation rules, and some developer-oriented docs still overstate the readiness of memory mode and other non-Postgres flows.
 
 ## What the Project Is Today
 
@@ -381,11 +389,19 @@ This phase specifically improved money safety and lifecycle consistency around a
 
 Phase 1 did not finish the entire hardening roadmap. The main remaining items are:
 
-- redesign sync so it carries or references authorizations correctly
 - clean up memory-mode expectations
 - harden API key and JWT handling
 - replace temporary event forwarding infrastructure
 - improve reconciliation, audit, and test coverage
+
+## Phase 2 Delivered So Far
+
+The first Phase 2 contract-alignment improvement is now in place:
+
+1. sync replay now requires `authorizationId`
+2. sync replay is restricted to offline transactions
+3. sync transactions are prevalidated against stored authorization state before engine execution
+4. sync uses the same authorization-readiness rules as the main execute path
 
 ## Recommended Improvement Roadmap
 

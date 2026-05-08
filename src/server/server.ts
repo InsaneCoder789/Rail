@@ -438,13 +438,44 @@ function assertAuthorizationMatchesTransaction(auth: PaymentAuthorization, txn: 
   }
 }
 
-function assertStoredAuthorizationUsable(auth: { status: string; expiresAt: string }): void {
-  if (auth.status !== "issued") {
-    throw new RequestError(409, "authorization_not_issued", `authorization status is ${auth.status}`);
-  }
+async function assertStoredAuthorizationUsable(
+  auth: { status: string; expiresAt: string },
+  txn: PaymentTransaction,
+  idempotency: MemoryIdempotencyStore | PostgresIdempotencyStore,
+): Promise<void> {
   if (Date.parse(auth.expiresAt) <= Date.now()) {
     throw new RequestError(409, "authorization_expired", "authorization has expired");
   }
+
+  if (auth.status === "issued") {
+    return;
+  }
+
+  if (auth.status === "used") {
+    const completed = await idempotency.getCompleted(txn.idempotencyKey);
+    if (completed) {
+      return;
+    }
+  }
+
+  throw new RequestError(409, "authorization_not_issued", `authorization status is ${auth.status}`);
+}
+
+async function prepareAuthorizedTransaction(
+  txn: PaymentTransaction,
+  idempotency: MemoryIdempotencyStore | PostgresIdempotencyStore,
+): Promise<void> {
+  if (!txn.authorizationId) {
+    throw new RequestError(401, "authorization_required", "missing authorization");
+  }
+
+  const storedAuthorization = await getAuthorizationById(txn.authorizationId);
+  if (!storedAuthorization) {
+    throw new RequestError(404, "authorization_not_found", "authorization not found");
+  }
+
+  assertAuthorizationMatchesTransaction(storedAuthorization, txn);
+  await assertStoredAuthorizationUsable(storedAuthorization, txn, idempotency);
 }
 
 function isIssueTokenRequest(x: unknown): x is {
@@ -815,15 +846,6 @@ async function bootstrap(): Promise<void> {
 
         const body = parsed as Record<string, unknown>;
         const { authorizationId, providedAuthorization } = resolveAuthorizationReference(body);
-        if (!authorizationId) {
-          throw new RequestError(401, "authorization_required", "missing authorization");
-        }
-
-        const storedAuthorization = await getAuthorizationById(authorizationId);
-        if (!storedAuthorization) {
-          throw new RequestError(404, "authorization_not_found", "authorization not found");
-        }
-        assertStoredAuthorizationUsable(storedAuthorization);
 
         const { authorization: _auth, ...txnRaw } = body;
 
@@ -842,8 +864,12 @@ async function bootstrap(): Promise<void> {
           throw new RequestError(403, "identity_mismatch", "sender does not match auth");
         }
 
-        assertAuthorizationMatchesTransaction(storedAuthorization, txn);
+        await prepareAuthorizedTransaction(txn, idempotency);
         if (providedAuthorization) {
+          const storedAuthorization = await getAuthorizationById(txn.authorizationId!);
+          if (!storedAuthorization) {
+            throw new RequestError(404, "authorization_not_found", "authorization not found");
+          }
           assertAuthorizationMatchesTransaction(providedAuthorization, txn);
           if (providedAuthorization.signature !== storedAuthorization.signature) {
             throw new RequestError(
@@ -880,17 +906,34 @@ async function bootstrap(): Promise<void> {
             return;
           }
           const txn = toPaymentTransaction(item);
-          if (txn.channel !== "online" && txn.deviceId !== parsed.deviceId) {
+          if (txn.channel === "online") {
+            json(res, 422, {
+              error: "online_transaction_not_allowed_in_sync",
+              hint: "sync is only for queued offline transactions",
+            });
+            return;
+          }
+          if (txn.deviceId !== parsed.deviceId) {
             json(res, 422, {
               error: "device_mismatch_in_batch",
               hint: "offline transactions must use same deviceId as sync request",
             });
             return;
           }
-          if (txn.channel === "online" && txn.deviceId !== undefined && txn.deviceId !== parsed.deviceId) {
+          if (!txn.authorizationId) {
             json(res, 422, {
-              error: "device_mismatch_in_batch",
-              hint: "transaction.deviceId must match sync deviceId when provided",
+              error: "authorization_required_in_batch",
+              hint: "each synced transaction must include authorizationId",
+            });
+            return;
+          }
+          try {
+            await prepareAuthorizedTransaction(txn, idempotency);
+          } catch (err) {
+            const mapped = toErrorResponse(err);
+            json(res, mapped.status, {
+              ...mapped.body,
+              txId: txn.txId,
             });
             return;
           }

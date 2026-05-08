@@ -7,6 +7,7 @@ type RecordState =
 
 export interface IdempotencyStore {
   dedupe(key: string, run: () => Promise<PipelineResult>): Promise<PipelineResult>;
+  getCompleted(key: string): Promise<PipelineResult | undefined> | PipelineResult | undefined;
 }
 
 /**

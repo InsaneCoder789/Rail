@@ -8,7 +8,9 @@ export interface SyncItemResult {
 }
 
 /**
- * Processes queued offline transactions in order (FIFO). Each item uses the same idempotency + pipeline rules as online execute.
+ * Processes queued offline transactions in order (FIFO). Each item is expected
+ * to have already been validated against a stored authorization reference by the
+ * HTTP layer and then uses the same idempotency + pipeline rules as execute.
  */
 export async function processSyncBatch(
   engine: PaymentPipelineEngine,

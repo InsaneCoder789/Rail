@@ -176,7 +176,7 @@ class T1,T2,T3,T4 dataflow
 | **Offline tokens** | Capped, expiring, device-bound envelopes (`POST /v1/offline/tokens/issue`). |
 | **Pipeline** | Validation, parallel risk + crypto hooks, **saga** with compensate on failure. |
 | **Idempotency** | Memory (dev) or **PostgreSQL** with `pg_advisory_lock` per key. |
-| **Sync API** | FIFO batch replay for queued offline transactions. |
+| **Sync API** | FIFO batch replay for queued offline transactions that carry stored `authorizationId` references. |
 | **Integrity (optional)** | HMAC over a **canonical payload** (`paymentSignature`); production path documented for **HSM / KMS** (`src/crypto/hsm.ts`). |
 
 ---
@@ -300,20 +300,42 @@ Issue spend headroom while **online**.
 
 Execute one payment through the pipeline.
 
-**Body:** `PaymentTransaction` — required fields include `txId`, `idempotencyKey`, `senderWalletId`, `receiverWalletId`, `amountMinor`, `currency`, `channel` (`nfc` | `ble` | `qr` | `online`), `createdAt`.  
-For offline channels, include `offlineTokenId` (and recommended `deviceId`).  
+**Body:** `PaymentTransaction` — required fields include `txId`, `idempotencyKey`, `authorizationId`, `senderWalletId`, `receiverWalletId`, `amountMinor`, `currency`, `channel` (`nfc` | `ble` | `qr` | `online`), `createdAt`.  
+For offline channels, include `offlineTokenId` and `deviceId`.  
+`authorizationId` must reference a stored server-issued authorization whose amount, sender, receiver, and currency match the transaction.
 Optional `paymentSignature` (base64 HMAC) when `RAIL_REQUIRE_TX_SIGNATURE=true`.
 
 ### `POST /v1/sync/transactions`
 
 Replay a **batch** of queued offline transactions (FIFO).
 
+Rules:
+
+- sync accepts offline transactions only
+- every transaction must include `authorizationId`
+- every transaction `deviceId` must match the outer sync `deviceId`
+- each `authorizationId` must reference a stored server-issued authorization
+
 **Body:**
 
 ```json
 {
   "deviceId": "device_pixel_9",
-  "transactions": [ { ...PaymentTransaction }, { ... } ]
+  "transactions": [
+    {
+      "txId": "txn_offline_001",
+      "idempotencyKey": "idem_offline_001",
+      "authorizationId": "auth_123",
+      "senderWalletId": "wallet_user_1",
+      "receiverWalletId": "wallet_shop_1",
+      "amountMinor": 2500,
+      "currency": "INR",
+      "channel": "qr",
+      "offlineTokenId": "otk_123",
+      "deviceId": "device_pixel_9",
+      "createdAt": "2026-05-08T16:00:00.000Z"
+    }
+  ]
 }
 ```
 

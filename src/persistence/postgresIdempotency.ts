@@ -9,6 +9,23 @@ import type { Pool } from "pg";
 export class PostgresIdempotencyStore implements IdempotencyStore {
   constructor(private readonly pool: Pool) {}
 
+  async getCompleted(key: string): Promise<PipelineResult | undefined> {
+    const r = await this.pool.query(
+      "SELECT status, result_json FROM rail_idempotency WHERE idempotency_key = $1",
+      [key],
+    );
+    if (r.rowCount === 0) {
+      return undefined;
+    }
+
+    const row = r.rows[0] as { status: string; result_json: unknown };
+    if (row.status !== "completed") {
+      return undefined;
+    }
+
+    return row.result_json as PipelineResult;
+  }
+
   async dedupe(key: string, run: () => Promise<PipelineResult>): Promise<PipelineResult> {
     const client = await this.pool.connect();
     try {
