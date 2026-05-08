@@ -10,6 +10,32 @@ This document captures the current understanding of the Rail codebase as of the 
 
 The analysis in this report is based on the current source files in `src/`, the root configuration files, the current README, and a validation pass using the TypeScript build.
 
+## How To Use This Page
+
+This page is intended to function as the working wiki for the project.
+
+Use it in the following ways:
+
+- as a high-level project summary for demos and resume walkthroughs
+- as a change log of what the project used to be and what it has become
+- as a technical map of the source tree
+- as a record of current strengths, flaws, and future scope
+
+## Table of Contents
+
+1. Latest Status
+2. Project Timeline
+3. Project Summary
+4. Current Repository Structure
+5. Detailed File Structure
+6. Build and Runtime State
+7. Main Functional Flow Observed
+8. Strong Parts of the Current Project
+9. Important Flaws and Gaps Identified
+10. What the Project Is Today
+11. Phase Delivery Record
+12. Future Scope
+
 ## Latest Status
 
 Phase 1 transaction-safety changes have now been implemented in the codebase.
@@ -45,6 +71,87 @@ An architecture cleanup pass has also now been completed for the HTTP layer. The
 - route-family handlers
 
 `server.ts` now acts as the main bootstrap and composition file rather than holding all infrastructure and route logic inline.
+
+## Project Timeline
+
+This report should be treated as a live project book. It records both what the project used to be and what it is now, so the evolution of the system remains easy to explain.
+
+### Pre-Phase 1 Baseline
+
+Before Phase 1, the project already had the broad shape of an offline-capable payment orchestration system, but several critical safeguards were still incomplete.
+
+The project already supported:
+
+- a payment pipeline engine with staged execution
+- JWT-based login and API-key-based wallet access
+- offline token issuance
+- transaction execution with validation and ledger posting
+- sync batch processing for queued offline transactions
+- PostgreSQL-backed persistence for parts of the system
+- an event and outbox visibility path
+
+However, before Phase 1 the important weaknesses were:
+
+- authorization state was effectively client-carried rather than durably tracked server-side
+- fund reservation and authorization issuance were not tied together as one atomic persisted lifecycle
+- retries could clash with authorization reuse protection
+- sync replay was looser than the main execute path
+- `src/server/server.ts` had become a very large all-in-one file
+
+In other words, before Phase 1 the project had a strong conceptual architecture, but some of the most important money-safety and consistency guarantees were not fully enforced.
+
+### Phase 1 State
+
+Phase 1 changed the project from a promising payment pipeline into a transaction-safer system.
+
+The Phase 1 improvements introduced:
+
+- persisted authorization records in PostgreSQL
+- transactional authorization issuance with reservation
+- execution-time authorization lookup from stored state
+- authorization claim inside the same payment transaction
+- automatic release support for expired unused authorizations
+- same-idempotency retry support after successful execution
+
+This phase established a real authorization lifecycle rather than relying only on a signed authorization object returned to the client.
+
+### Phase 2 Progress
+
+Phase 2 began by aligning offline sync replay with the same authorization-backed execution model as the main payment route.
+
+The implemented Phase 2 changes include:
+
+- sync accepts only offline transactions
+- each synced transaction must carry `authorizationId`
+- device consistency is enforced for sync batches
+- sync transactions are prevalidated against stored authorization state before execution
+
+This removed the earlier mismatch where sync could act like a weaker replay path than the main execute flow.
+
+### Security Hardening Progress
+
+The first hardening pass focused on the most visible and most exploitable edges.
+
+The implemented hardening changes include:
+
+- authenticated access to event endpoints
+- wallet-scoped event visibility for frontend consumption
+- stricter JWT validation behavior
+- generic login failure responses
+- transactional registration with proper duplicate-user handling
+- fail-closed behavior for offline token and sync routes when API key config is missing
+- route-specific in-memory rate limiting for sensitive operations
+
+### Current State
+
+The current version of the project is stronger than the pre-Phase 1 baseline in four major ways:
+
+- the authorization lifecycle is now durable and transaction-aware
+- retries and replay protection are better aligned
+- offline sync follows the same stored-authorization trust model as direct execution
+- the HTTP layer is more modular and easier to navigate due to the server refactor
+
+The project is still not the same as a production-deployed fintech system, but it is now far more internally consistent, easier to reason about, and much stronger as a showcase backend project.
 
 ## Project Summary
 
@@ -82,6 +189,154 @@ The repository is small and focused. The major code areas are:
   JWT generation and verification.
 - `src/domain/`
   Core domain types.
+
+## Detailed File Structure
+
+This section describes the current TypeScript source layout and the responsibility of each file.
+
+### Root Entry Files
+
+- `src/index.ts`
+  Minimal package entry file for the project. It exists as the top-level exported entry point but the main operational HTTP runtime is driven by `src/server/server.ts`.
+
+- `src/demo/runPayment.ts`
+  Demo-oriented script for exercising the payment flow outside the HTTP server. This file is useful for local experimentation, although earlier review showed that the demo flow can drift from the live server contract if it is not kept updated.
+
+### Authentication
+
+- `src/auth/jwt.ts`
+  Handles JWT generation and verification for login-based user access. This is the main token-issuing and token-validation utility used by the server auth routes.
+
+### Crypto
+
+- `src/crypto/authorizationSigning.ts`
+  Defines how payment authorizations are signed and verified. This supports the signed authorization model used between authorization issuance and payment execution.
+
+- `src/crypto/hsm.ts`
+  Provides the HSM integration boundary and abstraction hooks. It represents the place where stronger key-management behavior could be integrated later.
+
+- `src/crypto/transactionSigning.ts`
+  Handles transaction signature helpers used during payment verification and integrity checks.
+
+### Domain Models
+
+- `src/domain/authorization.ts`
+  Defines the authorization domain model and related types. This file captures the shape of the authorization object that moves through the project.
+
+- `src/domain/types.ts`
+  Defines core project domain types such as payment transactions and pipeline result structures used across the engine, stages, and server.
+
+### Persistence
+
+- `src/persistence/migrate.ts`
+  Contains PostgreSQL schema creation and migration logic. This includes the wallet, ledger, authorization, idempotency, and related persistence setup that the live server depends on.
+
+- `src/persistence/postgresIdempotency.ts`
+  Implements PostgreSQL-backed idempotency using database state and advisory locking. This is the durable replay-safety implementation for multi-request execution.
+
+- `src/persistence/postgresOfflineTokenStore.ts`
+  Implements PostgreSQL-backed storage for offline spend tokens and token headroom tracking.
+
+- `src/persistence/postgresPool.ts`
+  Creates and configures the PostgreSQL connection pool used by the server.
+
+- `src/persistence/postgresWalletStore.ts`
+  An older Postgres wallet-store abstraction that has been identified as inconsistent with the live schema and is not the main source of truth for the current server path.
+
+- `src/persistence/walletStore.ts`
+  Defines the wallet-store interface abstraction used by wallet-related logic.
+
+### Pipeline Infrastructure
+
+- `src/pipeline/backpressure.ts`
+  Contains pipeline backpressure-related support logic for controlling execution pressure and protecting processing flow.
+
+- `src/pipeline/context.ts`
+  Defines the execution context object passed through pipeline stages.
+
+- `src/pipeline/dlq.ts`
+  Defines the dead-letter queue support used for failed pipeline runs.
+
+- `src/pipeline/engine.ts`
+  The core payment pipeline engine. It coordinates idempotency, tracing, pipeline execution, DLQ behavior, and result handling.
+
+- `src/pipeline/errors.ts`
+  Contains pipeline-level error definitions and shared error structures for engine and stage failures.
+
+- `src/pipeline/idempotency.ts`
+  Defines the in-memory idempotency implementation and the shared idempotency store contract.
+
+- `src/pipeline/middleware.ts`
+  Defines middleware support that can wrap pipeline execution behavior.
+
+- `src/pipeline/outbox.ts`
+  Defines the in-memory outbox abstraction used to collect pipeline events before they are relayed outward.
+
+- `src/pipeline/parallel.ts`
+  Provides helpers for parallelized pipeline work, such as running independent prechecks concurrently.
+
+- `src/pipeline/retry.ts`
+  Defines retry-related helpers for pipeline tasks.
+
+- `src/pipeline/saga.ts`
+  Contains the saga orchestration abstraction used by the payment execution flow to structure compensatable multi-step work.
+
+- `src/pipeline/stage.ts`
+  Defines the stage abstraction and contracts for pipeline stage execution.
+
+- `src/pipeline/tracing.ts`
+  Defines tracing helpers used for pipeline visibility and debug logging.
+
+### Rail Offline Flow
+
+- `src/rail/mutex.ts`
+  Contains a simple mutex utility used to protect shared mutable state in local or in-memory execution flows.
+
+- `src/rail/offlineTokenStore.ts`
+  Defines the in-memory offline token store and the common offline token store interface.
+
+- `src/rail/syncBatch.ts`
+  Implements sync-batch processing for replaying queued offline transactions through the main engine.
+
+### Server Layer
+
+- `src/server/server.ts`
+  Main HTTP bootstrap and composition file. It wires configuration, persistence, the engine, auth resolution, events, and route-family handlers.
+
+- `src/server/config.ts`
+  Loads and normalizes server runtime configuration from environment variables, including rate-limit settings and request limits.
+
+- `src/server/http.ts`
+  Shared HTTP-layer helpers including JSON responses, body parsing, error mapping, request errors, and in-memory rate-limiting utilities.
+
+- `src/server/authentication.ts`
+  Resolves authenticated wallets from JWTs or API keys and enforces API-key protection for restricted routes.
+
+- `src/server/events.ts`
+  Handles server-side event visibility, SSE fanout, outbox event persistence, and relay behavior for frontend-consumable event streams.
+
+- `src/server/types.ts`
+  Defines the server-layer interfaces and shared TypeScript types used to compose the HTTP runtime.
+
+- `src/server/validation.ts`
+  Holds input validation helpers for transactions, sync payloads, token issuance requests, and other server-facing data structures.
+
+- `src/server/routes/authRoutes.ts`
+  Contains registration and login route handling.
+
+- `src/server/routes/paymentRoutes.ts`
+  Contains payment authorization, offline token issuance, payment execution, and sync route handling.
+
+- `src/server/routes/eventRoutes.ts`
+  Contains the event listing and SSE stream endpoints.
+
+### Business Stages
+
+- `src/stages/authorizationStage.ts`
+  Implements authorization creation, authorization lookup, reservation release, and wallet-authorization setup logic.
+
+- `src/stages/paymentPipeline.ts`
+  Implements the hardened payment pipeline, validation stage, prechecks, ledger logic, authorization claim behavior, and saga-driven money movement.
 
 ## Build and Runtime State
 
@@ -404,7 +659,25 @@ At the moment, Rail should be understood as:
 
 It is not just a mock pipeline anymore. It already has enough structure to become a robust platform, but it now needs alignment and hardening work more than it needs brand-new feature sprawl.
 
-## Phase 1 Delivered
+## Phase Delivery Record
+
+This section is the simplest project-history checkpoint view. It is useful when someone wants to quickly understand what has already been completed without reading the full narrative sections above.
+
+### Pre-Phase 1
+
+Before formal hardening work began, the project already had:
+
+- a payment pipeline engine
+- JWT and API-key-based access paths
+- offline token issuance
+- transaction execution with validation and ledger posting
+- sync-batch processing
+- partial PostgreSQL-backed persistence
+- basic event visibility and outbox concepts
+
+But it still had major consistency and money-safety gaps around authorization state, retries, sync behavior, and server structure.
+
+### Phase 1 Delivered
 
 The following Phase 1 items are now completed:
 

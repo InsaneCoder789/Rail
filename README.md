@@ -1,196 +1,222 @@
 # Rail
 
-**Rail** is an **offline-capable payment orchestration service**: it issues **spend tokens** while the client is online, validates **offline channel** payments (NFC / BLE / QR) against those tokens, runs an **idempotent execution pipeline** (risk, saga, ledger events, outbox), and accepts **batched sync** when devices reconnect. It is designed to sit **next to** bank / UPI / PSP systems—Rail does **not** replace NPCI or licensed settlement rails; it coordinates **authorization headroom**, **audit**, and **replay-safe** processing.
+Rail is an offline-capable payment orchestration service built to explore how a fintech backend can safely handle authorization, offline headroom, replay-safe execution, and reconnect-time synchronization.
 
+The project is intentionally positioned as a control and execution layer, not as a bank settlement rail. It does not replace UPI, card networks, or PSP settlement systems. Instead, it focuses on the part of the problem where a backend must:
 
-<img width="1774" height="887" alt="image" src="https://github.com/user-attachments/assets/c9401ae1-30cf-446b-99cf-873ec81a5cf1" />
+- issue bounded authorization to spend
+- reserve funds before final execution
+- support offline-capable payment initiation
+- process retries safely
+- replay queued offline transactions consistently
+- record ledger activity and emit operational events
 
-
-
+This repository is PostgreSQL-first for serious runs, with limited in-memory fallback support for local development.
 
 **Repository:** [github.com/InsaneCoder789/Rail](https://github.com/InsaneCoder789/Rail)
 
+<img width="1774" height="887" alt="Rail architecture overview" src="https://github.com/user-attachments/assets/c9401ae1-30cf-446b-99cf-873ec81a5cf1" />
 
 ---
 
-## Why Rail exists
+## What Rail Does
 
-- **Offline-first UX:** Payers and payees can exchange payment intents without continuous internet; the device **queues** signed or token-bound payloads and **syncs** later.
-- **No double-spend of headroom:** Server-issued **offline tokens** cap spend, expire, and bind to **wallet + device** (configurable).
-- **Exactly-once semantics (logical):** **Idempotency keys** deduplicate retries; PostgreSQL mode uses **advisory locks** + durable rows.
-- **Operational clarity:** Structured **outbox events** (e.g. `payments.ledger_posted`) feed Kafka/webhooks in a full deployment.
+At a high level, Rail supports the following flow:
+
+1. A user authenticates and is mapped to a wallet.
+2. The sender requests a payment authorization.
+3. Rail reserves the sender’s funds and persists an authorization record.
+4. For offline use cases, Rail can issue a device-bound offline token with limited spend headroom.
+5. A payment is executed through a pipeline with validation, prechecks, idempotency, and a ledger-writing saga.
+6. If the device was offline, queued transactions can later be replayed through the sync endpoint using the same stored authorization model.
+7. The backend emits wallet-visible events for dashboards and operational visibility.
 
 ---
 
-## Architecture (Real Time Analysis)
+## Why This Project Exists
 
-> This diagram shows the full Rail execution architecture — from API entry to pipeline orchestration, storage, and security layers. It is intentionally expanded for clarity.
+Most payment demos stop at a simple request-response transfer. Rail goes further and models the harder problems that show up in real financial systems:
+
+- offline-capable payment initiation
+- bounded spend headroom
+- authorization lifecycle tracking
+- retry safety and anti-replay controls
+- transaction-aware ledger posting
+- event-driven visibility into execution state
+
+The goal of the project is not to claim production readiness. The goal is to build a system that demonstrates real fintech backend thinking in a way that is technically serious, explainable, and extensible.
+
+---
+
+## Current Architecture
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 80}} }%%
 flowchart LR
+  Client["Client / Frontend / Device"]
+  Auth["Auth Routes\nregister / login"]
+  Authorize["Authorize Route\nreserve funds + persist authorization"]
+  Token["Offline Token Route\nissue device-bound headroom"]
+  Execute["Execute Route\nvalidate + idempotent pipeline run"]
+  Sync["Sync Route\nreplay queued offline transactions"]
+  Events["Event Routes\nrecent events + SSE stream"]
 
-subgraph group_runtime["Runtime & API"]
-  node_src_index["Entry<br/>bootstrap<br/>[index.ts]"]
-  node_src_server_serve["HTTP Server<br/>api server<br/>[serve.ts]"]
-end
+  Engine["PaymentPipelineEngine"]
+  Validation["Validation Stage"]
+  Prechecks["Parallel Prechecks\nsignature + risk"]
+  Saga["Funds and Ledger Saga"]
 
-subgraph group_core["Core Flow"]
-  node_domain_model["Payment Txn<br/>domain model<br/>[types.ts]"]
-  node_domain_authz["Authorization<br/>domain model<br/>[authorization.ts]"]
-  node_payment_pipeline["Payment Flow<br/>stage composition<br/>[paymentPipeline.ts]"]
-  node_authorization_stage["Auth Stage<br/>pipeline stage"]
-  node_sync_batch["Sync Batch<br/>replay flow<br/>[syncBatch.ts]"]
-  node_offline_tokens[("Token Store<br/>offline headroom")]
-end
+  Wallets[("wallets")]
+  Authorizations[("authorizations")]
+  Tokens[("rail_offline_tokens")]
+  Idempotency[("rail_idempotency")]
+  Ledger[("ledger_entries")]
+  Outbox[("outbox")]
 
-subgraph group_platform["Pipeline & Storage"]
-  node_pipeline_engine["Engine<br/>pipeline runtime<br/>[engine.ts]"]
-  node_pipeline_middle["Middleware<br/>pipeline infra<br/>[middleware.ts]"]
-  node_pipeline_saga["Saga<br/>workflow coordination<br/>[saga.ts]"]
-  node_pipeline_outbox["Outbox<br/>event delivery<br/>[outbox.ts]"]
-  node_pipeline_resilience["Resilience<br/>infra bundle<br/>[backpressure.ts]"]
-  node_pipeline_idem["Idempotency<br/>dedupe<br/>[idempotency.ts]"]
-  node_pipeline_errors["Errors<br/>error model<br/>[errors.ts]"]
-  node_persist_pool[("Postgres Pool<br/>db access<br/>[postgresPool.ts]")]
-  node_persist_stores[("Postgres Stores<br/>durable stores")]
-  node_wallet_store[("Wallet Store<br/>store abstraction<br/>[walletStore.ts]")]
-end
+  Client --> Auth
+  Client --> Authorize
+  Client --> Token
+  Client --> Execute
+  Client --> Sync
+  Client --> Events
 
-subgraph group_security["Security"]
-  node_tx_signing{{"Tx Signing<br/>integrity crypto"}}
-  node_authz_signing{{"Auth Signing<br/>integrity crypto"}}
-  node_hsm_hooks{{"HSM Hooks<br/>kms integration<br/>[hsm.ts]"}}
-  node_mutex["Mutex<br/>concurrency control<br/>[mutex.ts]"]
-end
+  Authorize --> Authorizations
+  Authorize --> Wallets
+  Token --> Tokens
 
-node_src_index -->|"starts"| node_src_server_serve
-node_src_server_serve -->|"routes"| node_payment_pipeline
-node_src_server_serve -->|"uses"| node_authorization_stage
-node_src_server_serve -->|"accepts"| node_sync_batch
-node_src_server_serve -->|"issues"| node_offline_tokens
-node_src_server_serve -->|"configures"| node_persist_pool
-node_payment_pipeline -->|"composes"| node_pipeline_engine
-node_payment_pipeline -->|"uses"| node_pipeline_middle
-node_payment_pipeline -->|"orchestrates"| node_pipeline_saga
-node_payment_pipeline -->|"emits"| node_pipeline_outbox
-node_payment_pipeline -->|"relies on"| node_pipeline_resilience
-node_payment_pipeline -->|"dedupes"| node_pipeline_idem
-node_payment_pipeline -->|"signals"| node_pipeline_errors
-node_authorization_stage -->|"models"| node_domain_authz
-node_authorization_stage -->|"verifies"| node_authz_signing
-node_sync_batch -->|"serializes"| node_mutex
-node_sync_batch -->|"reuses"| node_pipeline_idem
-node_offline_tokens -->|"persists"| node_persist_stores
-node_offline_tokens -->|"binds"| node_domain_model
-node_persist_stores -->|"uses"| node_persist_pool
-node_persist_stores -->|"implements"| node_wallet_store
-node_persist_stores -->|"backs"| node_pipeline_idem
-node_domain_model -->|"protected by"| node_tx_signing
-node_domain_model -->|"integrates"| node_hsm_hooks
-node_authz_signing -->|"integrates"| node_hsm_hooks
-node_mutex -->|"coordinates"| node_pipeline_idem
+  Execute --> Engine
+  Sync --> Engine
 
-classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
-classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
-classDef toneAmber fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
-classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
-classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
-class node_src_index,node_src_server_serve toneBlue
-class node_domain_model,node_domain_authz,node_payment_pipeline,node_authorization_stage,node_sync_batch,node_offline_tokens toneAmber
-class node_pipeline_engine,node_pipeline_middle,node_pipeline_saga,node_pipeline_outbox,node_pipeline_resilience,node_pipeline_idem,node_pipeline_errors,node_persist_pool,node_persist_stores,node_wallet_store toneMint
-class node_tx_signing,node_authz_signing,node_hsm_hooks,node_mutex toneRose
+  Engine --> Idempotency
+  Engine --> Validation
+  Engine --> Prechecks
+  Engine --> Saga
+
+  Saga --> Wallets
+  Saga --> Authorizations
+  Saga --> Tokens
+  Saga --> Ledger
+  Saga --> Outbox
 ```
 
 ---
 
-## Runtime Pipeline & Observability 
+## Payment Flow
 
-> This diagram represents the live execution flow — including SSE streaming, pipeline stages, error propagation, and the frontend dashboard visualization.
+The most important design decision in the current system is that payment execution is authorization-first.
+
+### Authorization flow
+
+When a sender requests authorization:
+
+- identity is checked using JWT or API key
+- sender and receiver details are validated
+- sender funds are reserved
+- an authorization record is persisted
+- a signed authorization object is returned
+
+The key improvement here is that authorization is no longer just a client-carried signed blob. The server keeps a durable source of truth in PostgreSQL and tracks authorization status over time.
+
+### Execute flow
+
+When a payment is executed:
+
+- the request is authenticated
+- the transaction is validated
+- the stored `authorizationId` is loaded and matched against the transaction
+- the idempotency layer protects retries
+- the pipeline runs validation, prechecks, and the funds-and-ledger saga
+- the authorization is claimed inside the payment transaction
+- the sender reservation is consumed
+- the receiver balance is credited
+- ledger rows are written
+- events are emitted
+
+### Sync flow
+
+When offline transactions reconnect:
+
+- sync accepts offline transactions only
+- each transaction must include `authorizationId`
+- each transaction must use the same outer `deviceId`
+- transactions are validated against stored authorization state before execution
+- the same engine path is reused instead of inventing a separate replay system
+
+That keeps offline replay consistent with direct execution instead of making it a weaker side path.
+
+---
+
+## Runtime Flow
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 50, "rankSpacing": 70}} }%%
-flowchart LR
+flowchart TD
+  A["POST /v1/payments/authorize"] --> B["Reserve sender funds"]
+  B --> C["Persist authorization record"]
+  C --> D["Return signed authorization"]
 
-subgraph backend["Backend Execution"]
-  A["HTTP Request\n/payment/execute"]
-  B["Pipeline Engine\n(validate → risk → wallet → ledger)"]
-  C["Outbox Events\npipeline.stage / errors"]
-  D["SSE Stream\n/v1/events/stream"]
-end
-
-subgraph frontend["Dashboard UI"]
-  E["Event Listener\n(EventSource)"]
-  F["State Engine\n(progressMap + sequence)"]
-  G["Pipeline UI\n(animated nodes + flow)"]
-  H["Logs Panel\n(rail logs)"]
-  I["Fault Buffer\n(system errors)"]
-end
-
-subgraph dataflow["Event Types"]
-  T1["pipeline.stage"]
-  T2["pipeline.error"]
-  T3["system.error"]
-  T4["payments.ledger_posted"]
-end
-
-A --> B
-B --> C
-C --> D
-D --> E
-
-E --> F
-F --> G
-F --> H
-F --> I
-
-C --> T1
-C --> T2
-C --> T3
-C --> T4
-
-T1 --> F
-T2 --> I
-T3 --> I
-T4 --> H
-
-classDef backend fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
-classDef frontend fill:#f0fdf4,stroke:#16a34a,color:#14532d
-classDef dataflow fill:#fef3c7,stroke:#d97706,color:#78350f
-
-class A,B,C,D backend
-class E,F,G,H,I frontend
-class T1,T2,T3,T4 dataflow
+  D --> E["POST /v1/payments/execute"]
+  E --> F["Load stored authorization"]
+  F --> G["Idempotency check"]
+  G --> H["Pipeline validation"]
+  H --> I["Parallel prechecks"]
+  I --> J["Claim authorization in DB transaction"]
+  J --> K["Consume reserved funds"]
+  K --> L["Credit receiver"]
+  L --> M["Write ledger entries"]
+  M --> N["Emit events / outbox"]
 ```
 
 ---
 
-**Settlement** (money movement on bank/UPI rails) is **out of scope** for this repository; your PSP or bank integration consumes outbox/webhook events or mirrors the ledger in your core banking system.
+## Main Features
+
+| Area | Current behavior |
+|---|---|
+| Authentication | User registration, password hashing, JWT login, wallet resolution |
+| Authorization | Durable authorization lifecycle with reserve-before-execute behavior |
+| Offline tokens | Device-bound spend headroom with expiry and remaining balance tracking |
+| Execution pipeline | Validation, parallel prechecks, idempotency, saga, ledger posting |
+| Sync replay | Offline-only batch replay with stored `authorizationId` enforcement |
+| Idempotency | In-memory for local fallback, PostgreSQL-backed for durable runs |
+| Event visibility | Authenticated wallet-scoped events via REST and SSE |
+| Rate limiting | Route-specific limits for login, authorize, execute, sync, and token issue |
 
 ---
 
-## Features
+## Project Status
 
-| Area | Behavior |
-|------|----------|
-| **Offline tokens** | Capped, expiring, device-bound envelopes (`POST /v1/offline/tokens/issue`). |
-| **Pipeline** | Validation, parallel risk + crypto hooks, **saga** with compensate on failure. |
-| **Idempotency** | Memory (dev) or **PostgreSQL** with `pg_advisory_lock` per key. |
-| **Sync API** | FIFO batch replay for queued offline transactions that carry stored `authorizationId` references. |
-| **Integrity (optional)** | HMAC over a **canonical payload** (`paymentSignature`); production path documented for **HSM / KMS** (`src/crypto/hsm.ts`). |
+The project has already gone through several important improvements:
+
+- Phase 1 introduced persisted authorization lifecycle management and transactional reserve-plus-issue behavior.
+- Phase 2 aligned sync replay with the same stored-authorization model used by direct execution.
+- Security hardening added stricter JWT behavior, protected event access, fail-closed API-key routes, cleaner auth responses, and route-specific rate limiting.
+- The HTTP layer was refactored so `src/server/server.ts` remains the bootstrap entrypoint while route families and shared concerns live in focused modules.
+
+For the full technical history, architecture notes, and file-by-file source map, see [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS_REPORT.md).
+
+---
+
+## Tech Stack
+
+- Node.js
+- TypeScript
+- PostgreSQL
+- `pg`
+- `bcryptjs`
+- `jsonwebtoken`
+- Server-Sent Events for live event streaming
 
 ---
 
 ## Requirements
 
-- **Node.js** ≥ 20  
-- **npm**  
-- **PostgreSQL** ≥ 14 (optional; required for durable production mode)  
-- **Docker** (optional, for local Postgres via `docker-compose.yml`)
+- Node.js 20 or newer
+- npm
+- PostgreSQL 14 or newer for durable mode
+- Docker is optional if you want a local Postgres container
 
 ---
 
-## Quick start (development)
+## Getting Started
 
 ### 1. Clone and install
 
@@ -200,15 +226,35 @@ cd Rail
 npm install
 ```
 
-### 2. Run without Postgres (fastest)
+### 2. Configure environment
 
-Uses **in-memory** idempotency and offline tokens (single process only).
+Create a `.env` file from the project example and fill in the values you want to use.
+
+At minimum, a serious local run should define:
 
 ```bash
-npm run serve
+PORT=8787
+DATABASE_URL=postgres://rail:rail_dev_password@127.0.0.1:5432/rail
+JWT_SECRET=replace_this_with_a_real_secret
+RAIL_SIGNING_SECRET=replace_this_with_a_real_secret
+RAIL_API_KEY=replace_this_with_a_real_secret
 ```
 
-Health check:
+### 3. Start PostgreSQL
+
+If you are using Docker:
+
+```bash
+docker compose up -d
+```
+
+### 4. Start the server
+
+```bash
+npm run server
+```
+
+### 5. Check health
 
 ```bash
 curl -s http://127.0.0.1:8787/health
@@ -220,7 +266,7 @@ Example response:
 {
   "ok": true,
   "service": "rail",
-  "persistence": "memory",
+  "persistence": "postgresql",
   "offline": {
     "tokenIssue": "POST /v1/offline/tokens/issue",
     "execute": "POST /v1/payments/execute",
@@ -229,209 +275,246 @@ Example response:
 }
 ```
 
-### 3. Run with PostgreSQL (recommended)
+### Limited in-memory fallback
 
-Start Postgres:
+If `DATABASE_URL` is not set, Rail falls back to in-memory idempotency and offline-token storage for lightweight development.
 
-```bash
-docker compose up -d
-```
-
-Connection string (default from `docker-compose.yml`):
-
-```bash
-export DATABASE_URL='postgres://rail:rail_dev_password@127.0.0.1:5432/rail'
-npm run serve
-```
-
-On startup, Rail runs **migrations** (`src/persistence/migrate.ts`) and creates:
-
-- **`rail_idempotency`** — completed/failed idempotent results + JSON payload.  
-- **`rail_offline_tokens`** — issued tokens, remaining headroom, expiry.
-
-`GET /health` will report `"persistence": "postgresql"`.
+That mode is useful for local experimentation, but it is not the main supported runtime story anymore because authentication, wallet identity, and durable execution are fundamentally PostgreSQL-centric in the current codebase.
 
 ---
 
-## Environment variables
+## Environment Variables
 
 | Variable | Purpose |
-|----------|---------|
-| `PORT` | HTTP port (default `8787`). |
-| `DATABASE_URL` | If set, enables **PostgreSQL** idempotency + offline token store. |
-| `RAIL_API_KEY` | Shared secret for offline-token and sync routes. Those routes now fail closed when it is unset. |
-| `KYLR_API_KEY` | **Legacy** alias read if `RAIL_API_KEY` is unset. |
-| `JWT_SECRET` | Secret for login JWT issuance and verification. If unset, Rail falls back to `RAIL_SIGNING_SECRET` for backward compatibility, but a dedicated secret is recommended. |
-| `RAIL_SIGNING_SECRET` | Secret for **HMAC-SHA256** verification of `paymentSignature`. |
-| `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, every `execute` / sync item **must** include valid `paymentSignature`. |
-| `RAIL_PKCS11_MODULE_PATH` | Documented hook for PKCS#11 HSM (see `src/crypto/hsm.ts`). |
-| `RAIL_KMS_KEY_ID` | Documented hook for cloud KMS signing. |
-| `RAIL_RATE_LIMIT_LOGIN_MAX` | Max login attempts per IP+user in the login window. Default `5`. |
-| `RAIL_RATE_LIMIT_AUTHORIZE_MAX` | Max authorization requests per IP+wallet per minute. Default `12`. |
-| `RAIL_RATE_LIMIT_EXECUTE_MAX` | Max execute requests per IP+wallet per minute. Default `20`. |
-| `RAIL_RATE_LIMIT_SYNC_MAX` | Max sync requests per IP+device per 10 minutes. Default `6`. |
-| `RAIL_RATE_LIMIT_TOKEN_ISSUE_MAX` | Max offline-token issuance requests per IP+wallet+device per 10 minutes. Default `6`. |
-
-**Production checklist:** TLS termination (reverse proxy), strong `RAIL_API_KEY`, managed Postgres, **no** cleartext credentials, rotate `RAIL_SIGNING_SECRET`, rate limiting, and fraud monitoring outside this repo.
+|---|---|
+| `PORT` | HTTP port. Default `8787`. |
+| `DATABASE_URL` | Enables PostgreSQL-backed persistence. |
+| `RAIL_API_KEY` | Shared secret for restricted routes such as offline token issue and sync. |
+| `KYLR_API_KEY` | Legacy alias if `RAIL_API_KEY` is not set. |
+| `JWT_SECRET` | JWT signing and verification secret. |
+| `RAIL_SIGNING_SECRET` | HMAC signing secret for transaction and authorization integrity helpers. |
+| `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
+| `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
+| `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
+| `RAIL_RATE_LIMIT_LOGIN_MAX` | Login attempts allowed in the configured login window. |
+| `RAIL_RATE_LIMIT_LOGIN_WINDOW_MS` | Login rate-limit window in milliseconds. |
+| `RAIL_RATE_LIMIT_AUTHORIZE_MAX` | Authorization requests allowed in the configured authorize window. |
+| `RAIL_RATE_LIMIT_AUTHORIZE_WINDOW_MS` | Authorization rate-limit window in milliseconds. |
+| `RAIL_RATE_LIMIT_EXECUTE_MAX` | Execute requests allowed in the configured execute window. |
+| `RAIL_RATE_LIMIT_EXECUTE_WINDOW_MS` | Execute rate-limit window in milliseconds. |
+| `RAIL_RATE_LIMIT_SYNC_MAX` | Sync requests allowed in the configured sync window. |
+| `RAIL_RATE_LIMIT_SYNC_WINDOW_MS` | Sync rate-limit window in milliseconds. |
+| `RAIL_RATE_LIMIT_TOKEN_ISSUE_MAX` | Offline-token issue requests allowed in the configured token window. |
+| `RAIL_RATE_LIMIT_TOKEN_ISSUE_WINDOW_MS` | Offline-token issue rate-limit window in milliseconds. |
+| `RAIL_AUTH_SWEEP_INTERVAL_MS` | Interval for expired authorization cleanup. |
+| `RAIL_PKCS11_MODULE_PATH` | Hook for PKCS#11-based HSM integration. |
+| `RAIL_KMS_KEY_ID` | Hook for cloud KMS-backed signing integration. |
 
 ---
 
-## HTTP API
+## API Overview
 
-All `POST` routes accept optional authentication via **`X-RAIL-API-KEY`** when `RAIL_API_KEY` is set.
+### `POST /auth/register`
 
-### `GET /health`
+Creates a user and a matching wallet identity.
 
-Liveness + offline route index + persistence mode.
+Notes:
+
+- passwords are hashed with `bcryptjs`
+- registration is transactional
+- duplicate users return a conflict-style error instead of a generic server failure
+
+### `POST /auth/login`
+
+Authenticates a user and returns a JWT.
+
+Notes:
+
+- login failures return a generic invalid-credentials response
+- login is rate limited
+
+### `POST /v1/payments/authorize`
+
+Creates a payment authorization and reserves sender funds.
+
+Expected fields:
+
+- `txId`
+- `senderWalletId`
+- `receiverWalletId`
+- `amountMinor`
+- `currency`
+
+Important behavior:
+
+- caller identity must match `senderWalletId`
+- authorization is persisted server-side
+- the authorization returned to the client corresponds to stored state
 
 ### `POST /v1/offline/tokens/issue`
 
-Issue spend headroom while **online**.
+Issues device-bound offline spend headroom while the client is online.
 
-**Body (JSON):**
+Expected fields:
 
-```json
-{
-  "walletId": "wallet_user_1",
-  "deviceId": "device_pixel_9",
-  "amountCapMinor": 50000,
-  "currency": "INR",
-  "ttlSeconds": 345600
-}
-```
-
-**Response:** `token.tokenId`, `remainingMinor`, `expiresAtMs`, etc.
+- `walletId`
+- `deviceId`
+- `amountCapMinor`
+- optional `currency`
+- optional `ttlSeconds`
 
 ### `POST /v1/payments/execute`
 
-Execute one payment through the pipeline.
+Executes a single payment through the hardened pipeline.
 
-**Body:** `PaymentTransaction` — required fields include `txId`, `idempotencyKey`, `authorizationId`, `senderWalletId`, `receiverWalletId`, `amountMinor`, `currency`, `channel` (`nfc` | `ble` | `qr` | `online`), `createdAt`.  
-For offline channels, include `offlineTokenId` and `deviceId`.  
-`authorizationId` must reference a stored server-issued authorization whose amount, sender, receiver, and currency match the transaction.
-Optional `paymentSignature` (base64 HMAC) when `RAIL_REQUIRE_TX_SIGNATURE=true`.
+Required transaction fields include:
+
+- `txId`
+- `idempotencyKey`
+- `authorizationId`
+- `senderWalletId`
+- `receiverWalletId`
+- `amountMinor`
+- `currency`
+- `channel`
+- `createdAt`
+
+Offline transactions must also include:
+
+- `offlineTokenId`
+- `deviceId`
+
+Important behavior:
+
+- `authorizationId` must reference a stored server-issued authorization
+- transaction data must match the stored authorization
+- same-key completed retries are allowed safely
+- reused authorizations with a different request identity are blocked
 
 ### `POST /v1/sync/transactions`
 
-Replay a **batch** of queued offline transactions (FIFO).
+Replays queued offline transactions in FIFO order.
 
 Rules:
 
 - sync accepts offline transactions only
-- every transaction must include `authorizationId`
-- every transaction `deviceId` must match the outer sync `deviceId`
-- each `authorizationId` must reference a stored server-issued authorization
-
-**Body:**
-
-```json
-{
-  "deviceId": "device_pixel_9",
-  "transactions": [
-    {
-      "txId": "txn_offline_001",
-      "idempotencyKey": "idem_offline_001",
-      "authorizationId": "auth_123",
-      "senderWalletId": "wallet_user_1",
-      "receiverWalletId": "wallet_shop_1",
-      "amountMinor": 2500,
-      "currency": "INR",
-      "channel": "qr",
-      "offlineTokenId": "otk_123",
-      "deviceId": "device_pixel_9",
-      "createdAt": "2026-05-08T16:00:00.000Z"
-    }
-  ]
-}
-```
+- every item must include `authorizationId`
+- every transaction `deviceId` must match the outer request `deviceId`
+- the route is API-key protected
 
 ### `GET /v1/events`
 
 Returns recent wallet-visible events for the authenticated caller.
 
-- JWT callers only see events where their wallet appears as sender or receiver
-- API-key callers are filtered to the wallet bound to that key
-- `system.error` events are not exposed through the client event feed
-
 ### `GET /v1/events/stream`
 
-Server-Sent Events stream for the authenticated caller.
+Streams wallet-visible events over SSE.
 
-- same wallet filtering rules as `GET /v1/events`
-- frontend dashboards can authenticate with standard `Authorization: Bearer ...`
-- browser `EventSource` clients may also use `?access_token=<jwt>` or `?api_key=<key>` when custom headers are unavailable
+Frontend note:
 
----
-
-## Transaction signing (HMAC → HSM)
-
-- **Canonical string** (`canonicalTransactionPayload` in `src/crypto/transactionSigning.ts`) concatenates stable fields with `|` separators.  
-- **HMAC-SHA256**, base64-encoded, passed as **`paymentSignature`**.  
-- **Development:** set `RAIL_SIGNING_SECRET` and optionally `RAIL_REQUIRE_TX_SIGNATURE=true`.  
-- **Production:** replace the comparison step with **KMS sign/verify** or **PKCS#11** using the **same canonical bytes**—see `src/crypto/hsm.ts` and `resolveHsmMode()`.
-
-**Important:** Never embed the server signing secret in mobile apps for **request** signing in production; use **device-bound keys attested** via your security architecture and verify server-side (this repo gives you the **hook** and **format**, not a full PKI).
+- regular clients can use `Authorization: Bearer <token>`
+- browser `EventSource` clients can also use `?access_token=<jwt>` or `?api_key=<key>` when custom headers are unavailable
 
 ---
 
-## Android client (KYLR)
+## Event Model
 
-The KYLR app talks to Rail over HTTP. Configure **`local.properties`**:
+The backend emits operational and business events that can be used for dashboards, observability, or future integrations.
 
-```properties
-rail.api.baseUrl=http://10.0.2.2:8787/
-rail.api.key=your-secret
+Examples include:
+
+- pipeline stage progression
+- pipeline failures
+- ledger-posted events
+- other wallet-relevant execution activity
+
+Current event visibility rules:
+
+- event routes require authentication
+- users only see events relevant to their wallet
+- API-key callers only see events relevant to the wallet bound to that key
+- raw `system.error` events are not exposed through the client-visible event feed
+
+---
+
+## Selected Source Layout
+
+```text
+src/
+  auth/
+    jwt.ts
+  crypto/
+    authorizationSigning.ts
+    hsm.ts
+    transactionSigning.ts
+  domain/
+    authorization.ts
+    types.ts
+  persistence/
+    migrate.ts
+    postgresIdempotency.ts
+    postgresOfflineTokenStore.ts
+    postgresPool.ts
+  pipeline/
+    engine.ts
+    idempotency.ts
+    outbox.ts
+    saga.ts
+    tracing.ts
+  rail/
+    offlineTokenStore.ts
+    syncBatch.ts
+  server/
+    server.ts
+    authentication.ts
+    config.ts
+    events.ts
+    http.ts
+    types.ts
+    validation.ts
+    routes/
+      authRoutes.ts
+      eventRoutes.ts
+      paymentRoutes.ts
+  stages/
+    authorizationStage.ts
+    paymentPipeline.ts
 ```
-
-(`kylr.api.*` is still supported as a fallback.)  
-The app sends **`X-RAIL-API-KEY`** (`RetrofitClient.kt`).
 
 ---
 
 ## Scripts
 
 | Script | Command |
-|--------|---------|
+|---|---|
 | Build | `npm run build` |
-| Run API | `npm run serve` |
-| Demo pipeline (flaky verifier) | `npm run demo` |
+| Run server | `npm run server` |
+| Demo script | `npm run demo` |
 
 ---
 
-## Project layout (selected)
+## Current Limitations
 
-```
-src/
-  server/serve.ts          # HTTP entry; wires Postgres or memory stores
-  persistence/             # Postgres pool, migrations, idempotency, offline tokens
-  rail/                    # Offline token interface + memory impl, sync batch
-  pipeline/                  # Engine, saga, idempotency interface, outbox, DLQ
-  stages/paymentPipeline.ts  # Composed stages + offline saga steps
-  crypto/                    # HMAC signing + HSM integration notes
-```
+This project is much stronger than a toy payment demo, but it is still honest to call out what is not finished yet.
 
----
+Current limitations include:
 
-## Pushing to GitHub
+- the event relay path still uses temporary bridging mechanics internally
+- API keys are still an area that can be hardened further
+- in-memory mode is best understood as a local fallback, not a full alternative runtime
+- the risk stage is still placeholder logic rather than a real fraud engine
+- documentation and demo flows need to be kept aligned as the project evolves
 
-If this directory is already a git repo:
-
-```bash
-git remote add origin https://github.com/InsaneCoder789/Rail.git
-git branch -M main
-git push -u origin main
-```
-
-If the remote exists with unrelated history, resolve with a **force-with-lease** only if you intend to overwrite the empty GitHub repo (consult GitHub docs first).
+These gaps are tracked more fully in [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS_REPORT.md).
 
 ---
 
 ## License
 
-Specify your license in a `LICENSE` file (e.g. MIT, Apache-2.0) before publishing widely.
+Add a `LICENSE` file before publishing the project more widely.
 
 ---
 
 ## Disclaimer
 
-Rail is **infrastructure software**. It does **not** by itself satisfy NPCI, RBI, PCI-DSS, or bank certification. You are responsible for licensing, KYC/AML, settlement, reconciliation, and security audits for your jurisdiction and product.
+Rail is infrastructure software for learning, architectural exploration, and controlled backend experimentation. It does not by itself satisfy regulatory, settlement, reconciliation, or compliance requirements for real-money production deployment.
