@@ -15,7 +15,13 @@ This repository is PostgreSQL-first for serious runs, with limited in-memory fal
 
 **Repository:** [github.com/InsaneCoder789/Rail](https://github.com/InsaneCoder789/Rail)
 
-<img width="1774" height="887" alt="Rail architecture overview" src="https://github.com/user-attachments/assets/c9401ae1-30cf-446b-99cf-873ec81a5cf1" />
+
+
+Generated image 1
+
+
+
+
 
 ---
 
