@@ -9,7 +9,7 @@ import { defaultRetryPolicy } from "../pipeline/retry.js";
 import type { Tracer } from "../pipeline/tracing.js";
 import { verifyTransactionSignatureIfRequired } from "../crypto/transactionSigning.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
-import { consumeReservation, releaseReservation, creditWallet } from "./authorizationStage.js";
+import { claimAuthorizationForExecution, consumeReservation, creditWallet } from "./authorizationStage.js";
 import { Pool, PoolClient } from "pg";
 
 let ledgerPool: Pool | null = null;
@@ -31,26 +31,6 @@ async function recordLedgerEntry(
     [txId, walletId, type, amount]
   );
 }
-
-// 🔐 Replay protection helper
-async function ensureAuthNotUsed(
-  client: any,
-  authId: string,
-  txId: string
-) {
-  const res = await client.query(
-    `INSERT INTO authorization_usage (auth_id, tx_id)
-     VALUES ($1, $2)
-     ON CONFLICT (auth_id) DO NOTHING`,
-    [authId, txId]
-  );
-
-  if (res.rowCount === 0) {
-    throw new Error("AUTH_ALREADY_USED");
-  }
-}
-
-const WALLET_RESERVE_KEY = "wallet.reserveId";
 
 // Sequence counter for strict event ordering
 function nextSeq(ctx: PaymentContext): number {
@@ -180,15 +160,22 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
           await client.query("BEGIN");
 
           // 🔐 Replay protection
-          const auth = (ctx as any).authorization ?? (ctx.txn as any).authorization;
-          if (!auth?.authId) {
+          const authId = ctx.txn.authorizationId;
+          if (!authId) {
             throw new Error("MISSING_AUTH_ID");
           }
 
-          await ensureAuthNotUsed(
+          await claimAuthorizationForExecution(
             client,
-            auth.authId,
-            ctx.txn.txId
+            authId,
+            ctx.txn.txId,
+          );
+
+          await client.query(
+            `INSERT INTO authorization_usage (auth_id, tx_id)
+             VALUES ($1, $2)
+             ON CONFLICT (auth_id) DO NOTHING`,
+            [authId, ctx.txn.txId],
           );
 
           // 1. Debit sender

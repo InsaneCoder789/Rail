@@ -5,6 +5,7 @@ export type PaymentChannel = "nfc" | "ble" | "qr" | "online";
 export interface PaymentTransaction {
   readonly txId: string;
   readonly idempotencyKey: string;
+  readonly authorizationId?: string;
   readonly senderWalletId: string;
   readonly receiverWalletId: string;
   readonly amountMinor: MoneyMinor;

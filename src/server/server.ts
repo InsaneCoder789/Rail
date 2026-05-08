@@ -12,6 +12,7 @@ import http from "node:http";
 import process from "node:process";
 
 import * as bcrypt from "bcryptjs";
+import type { PaymentAuthorization } from "../domain/authorization.js";
 import { generateToken, verifyToken } from "../auth/jwt.js";
 import type { PaymentTransaction } from "../domain/types.js";
 import { PaymentPipelineEngine } from "../pipeline/engine.js";
@@ -27,9 +28,7 @@ import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
 import { initLedger } from "../stages/paymentPipeline.js";
 import { OfflineTokenStore, type IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { processSyncBatch } from "../rail/syncBatch.js";
-import { createAuthorization } from "../stages/authorizationStage.js";
-import { initAuthorizationWallet } from "../stages/authorizationStage.js";
-import { verifyAuthorization } from "../crypto/authorizationSigning.js";
+import { createAuthorization, getAuthorizationById, initAuthorizationWallet, releaseExpiredAuthorizations } from "../stages/authorizationStage.js";
 
 const tracer = consoleTracer("[rail]");
 const PORT = Number(process.env.PORT ?? 8787);
@@ -46,6 +45,7 @@ const MAX_AMOUNT_MINOR = 1_000_000_000_000;
 const MIN_TTL_SECONDS = 60;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
 const OFFLINE_CHANNELS = new Set<PaymentTransaction["channel"]>(["nfc", "ble", "qr"]);
+const AUTHORIZATION_SWEEP_INTERVAL_MS = resolvePositiveIntEnv("RAIL_AUTH_SWEEP_INTERVAL_MS", 60_000);
 
 class RequestError extends Error {
   readonly status: number;
@@ -361,6 +361,7 @@ function isPaymentTransaction(x: unknown): x is PaymentTransaction {
   const o = x as Record<string, unknown>;
   if (!isSafeText(o.txId, 8, 128)) return false;
   if (!isSafeText(o.idempotencyKey, 8, 128)) return false;
+  if (o.authorizationId !== undefined && !isSafeText(o.authorizationId, 8, 128)) return false;
   if (!isSafeText(o.senderWalletId, 3, 128)) return false;
   if (!isSafeText(o.receiverWalletId, 3, 128)) return false;
   if (!isValidAmountMinor(o.amountMinor)) return false;
@@ -387,11 +388,63 @@ function isPaymentTransaction(x: unknown): x is PaymentTransaction {
 function toPaymentTransaction(parsed: PaymentTransaction): PaymentTransaction {
   return {
     ...parsed,
+    authorizationId: typeof parsed.authorizationId === "string" ? parsed.authorizationId : undefined,
     offlineTokenId:
       parsed.channel === "online" ? undefined : typeof parsed.offlineTokenId === "string" ? parsed.offlineTokenId : undefined,
     deviceId: typeof parsed.deviceId === "string" ? parsed.deviceId : undefined,
     paymentSignature: typeof parsed.paymentSignature === "string" ? parsed.paymentSignature : undefined,
   };
+}
+
+function resolveAuthorizationReference(body: Record<string, unknown>): {
+  authorizationId?: string;
+  providedAuthorization?: PaymentAuthorization;
+} {
+  const explicitId = typeof body.authorizationId === "string" ? body.authorizationId : undefined;
+  const rawAuthorization = body.authorization;
+  const providedAuthorization =
+    rawAuthorization && typeof rawAuthorization === "object"
+      ? (rawAuthorization as PaymentAuthorization)
+      : undefined;
+  const embeddedId = providedAuthorization?.authId;
+
+  if (explicitId && embeddedId && explicitId !== embeddedId) {
+    throw new RequestError(
+      422,
+      "authorization_reference_mismatch",
+      "authorizationId does not match authorization.authId",
+    );
+  }
+
+  return {
+    authorizationId: explicitId ?? embeddedId,
+    providedAuthorization,
+  };
+}
+
+function assertAuthorizationMatchesTransaction(auth: PaymentAuthorization, txn: PaymentTransaction): void {
+  if (
+    auth.txId !== txn.txId ||
+    auth.amountMinor !== txn.amountMinor ||
+    auth.currency !== txn.currency ||
+    auth.senderWalletId !== txn.senderWalletId ||
+    auth.receiverWalletId !== txn.receiverWalletId
+  ) {
+    throw new RequestError(
+      401,
+      "auth_txn_mismatch",
+      "authorization does not match transaction",
+    );
+  }
+}
+
+function assertStoredAuthorizationUsable(auth: { status: string; expiresAt: string }): void {
+  if (auth.status !== "issued") {
+    throw new RequestError(409, "authorization_not_issued", `authorization status is ${auth.status}`);
+  }
+  if (Date.parse(auth.expiresAt) <= Date.now()) {
+    throw new RequestError(409, "authorization_expired", "authorization has expired");
+  }
 }
 
 function isIssueTokenRequest(x: unknown): x is {
@@ -479,6 +532,18 @@ async function bootstrap(): Promise<void> {
 
     // initialize wallet + ledger systems
     initAuthorizationWallet(pool);
+    const releasedCount = await releaseExpiredAuthorizations().catch((err) => {
+      console.error("authorization_sweep_failed", err);
+      return 0;
+    });
+    if (releasedCount > 0) {
+      console.log(`Rail: released ${releasedCount} expired authorization reservations`);
+    }
+    setInterval(() => {
+      void releaseExpiredAuthorizations().catch((err) => {
+        console.error("authorization_sweep_failed", err);
+      });
+    }, AUTHORIZATION_SWEEP_INTERVAL_MS).unref();
 
     // initialize ledger (new)
     initLedger(pool);
@@ -749,18 +814,16 @@ async function bootstrap(): Promise<void> {
         }
 
         const body = parsed as Record<string, unknown>;
-        const auth = body.authorization as any;
-        if (!auth || typeof auth !== "object") {
+        const { authorizationId, providedAuthorization } = resolveAuthorizationReference(body);
+        if (!authorizationId) {
           throw new RequestError(401, "authorization_required", "missing authorization");
         }
-        const secret = process.env.RAIL_SIGNING_SECRET ?? "";
-        if (!secret) {
-          throw new RequestError(500, "server_misconfig", "missing signing secret", undefined, false);
+
+        const storedAuthorization = await getAuthorizationById(authorizationId);
+        if (!storedAuthorization) {
+          throw new RequestError(404, "authorization_not_found", "authorization not found");
         }
-        const isValid = verifyAuthorization(auth, secret);
-        if (!isValid) {
-          throw new RequestError(401, "invalid_authorization", "authorization verification failed");
-        }
+        assertStoredAuthorizationUsable(storedAuthorization);
 
         const { authorization: _auth, ...txnRaw } = body;
 
@@ -769,32 +832,29 @@ async function bootstrap(): Promise<void> {
           return;
         }
 
-        const txn = toPaymentTransaction(txnRaw as PaymentTransaction);
+        const txn = toPaymentTransaction({
+          ...(txnRaw as PaymentTransaction),
+          authorizationId,
+        });
 
         // --- Enforce identity binding ---
         if (txn.senderWalletId !== walletFromKey) {
           throw new RequestError(403, "identity_mismatch", "sender does not match auth");
         }
 
-        // --- 🔐 CRITICAL: Authorization ↔ Transaction Binding ---
-        if (
-          auth.txId !== txn.txId ||
-          auth.amountMinor !== txn.amountMinor ||
-          auth.currency !== txn.currency ||
-          auth.senderWalletId !== txn.senderWalletId ||
-          auth.receiverWalletId !== txn.receiverWalletId
-        ) {
-          throw new RequestError(
-            401,
-            "auth_txn_mismatch",
-            "authorization does not match transaction"
-          );
+        assertAuthorizationMatchesTransaction(storedAuthorization, txn);
+        if (providedAuthorization) {
+          assertAuthorizationMatchesTransaction(providedAuthorization, txn);
+          if (providedAuthorization.signature !== storedAuthorization.signature) {
+            throw new RequestError(
+              401,
+              "authorization_signature_mismatch",
+              "authorization signature does not match stored authorization",
+            );
+          }
         }
 
-        // attach authorization in a new object (important for idempotency layer)
-        const txnWithAuth = { ...(txn as any), authorization: auth };
-
-        const result = await engine.execute(txnWithAuth);
+        const result = await engine.execute(txn);
 
         json(res, 200, { result });
         return;

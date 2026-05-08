@@ -46,6 +46,24 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_tx ON ledger_entries(tx_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_wallet ON ledger_entries(wallet_id);
 
+CREATE TABLE IF NOT EXISTS authorizations (
+  auth_id TEXT PRIMARY KEY,
+  tx_id TEXT NOT NULL UNIQUE,
+  sender_wallet_id TEXT NOT NULL,
+  receiver_wallet_id TEXT NOT NULL,
+  amount_minor BIGINT NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'INR',
+  status TEXT NOT NULL CHECK (status IN ('issued', 'used', 'expired', 'revoked')),
+  signature TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  released_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_authorizations_sender ON authorizations(sender_wallet_id);
+CREATE INDEX IF NOT EXISTS idx_authorizations_status_expires ON authorizations(status, expires_at);
+
 CREATE TABLE IF NOT EXISTS authorization_usage (
   auth_id TEXT PRIMARY KEY,
   tx_id TEXT NOT NULL,

@@ -16,3 +16,11 @@ export interface PaymentAuthorization {
    */
   readonly signature: string;
 }
+
+export type AuthorizationStatus = "issued" | "used" | "expired" | "revoked";
+
+export interface StoredPaymentAuthorization extends PaymentAuthorization {
+  readonly status: AuthorizationStatus;
+  readonly usedAt?: string;
+  readonly releasedAt?: string;
+}
