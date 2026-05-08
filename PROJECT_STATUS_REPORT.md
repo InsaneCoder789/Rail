@@ -35,6 +35,17 @@ Security hardening work has also started. The current focus is:
 - introducing strict route-specific rate limits on sensitive endpoints
 - tightening authentication defaults and error behavior
 
+An architecture cleanup pass has also now been completed for the HTTP layer. The original monolithic `src/server/server.ts` has been split into focused modules for:
+
+- configuration loading
+- request, response, error, and rate-limit helpers
+- authentication and wallet resolution
+- validation
+- event and SSE handling
+- route-family handlers
+
+`server.ts` now acts as the main bootstrap and composition file rather than holding all infrastructure and route logic inline.
+
 ## Project Summary
 
 Rail is an offline-capable payment orchestration service. Its core goal is to support payment execution in environments where devices may not always be connected to the internet, while still preserving replay safety, authorization control, and ledger visibility.
@@ -56,7 +67,7 @@ The system is not a settlement rail by itself. It is closer to a payment control
 The repository is small and focused. The major code areas are:
 
 - `src/server/`
-  Main HTTP server and route wiring.
+  Main HTTP server bootstrap, route-family handlers, auth helpers, validation, rate limiting, and event wiring.
 - `src/stages/`
   Business flow logic for authorization and payment execution.
 - `src/pipeline/`
