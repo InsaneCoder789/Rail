@@ -17,9 +17,7 @@ This repository is PostgreSQL-first for serious runs, with limited in-memory fal
 
 
 
-Generated image 1
-
-
+<img width="1752" height="897" alt="image" src="https://github.com/user-attachments/assets/343a760c-a171-4fa7-b06c-35b03984ee89" />
 
 
 
