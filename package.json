@@ -2,6 +2,7 @@
   "name": "rail",
   "version": "0.1.0",
   "private": true,
+  "license": "AGPL-3.0-only",
   "description": "Rail — offline-first payment orchestration (PostgreSQL, HMAC/HSM hooks, sync API)",
   "type": "module",
   "scripts": {
