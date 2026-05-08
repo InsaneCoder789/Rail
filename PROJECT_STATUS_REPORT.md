@@ -29,6 +29,12 @@ An important follow-up fix was also applied after live verification: the API bou
 
 Phase 2 contract-alignment work has now started as well. The first completed Phase 2 improvement is that the sync path has been aligned with stored authorizations instead of accepting bare replay transactions with insufficient execution context.
 
+Security hardening work has also started. The current focus is:
+
+- protecting event visibility without breaking the frontend dashboard flow
+- introducing strict route-specific rate limits on sensitive endpoints
+- tightening authentication defaults and error behavior
+
 ## Project Summary
 
 Rail is an offline-capable payment orchestration service. Its core goal is to support payment execution in environments where devices may not always be connected to the internet, while still preserving replay safety, authorization control, and ledger visibility.
@@ -298,6 +304,13 @@ This is useful for demos and operator visibility, and it gives the project a mor
 
 That said, the current implementation relies on temporary bridging mechanisms rather than on a clean first-class event delivery abstraction.
 
+The security model for events has now improved:
+
+- event endpoints require authentication
+- event visibility is filtered by wallet
+- raw `system.error` events are no longer part of the frontend-visible event stream
+- browser SSE clients can authenticate using query-based tokens when headers are unavailable
+
 ## Strong Parts of the Current Project
 
 Several parts of the codebase are already strong and worth preserving:
@@ -353,10 +366,17 @@ This works as a temporary bridge but should not be treated as final infrastructu
 
 Current concerns include:
 
-- JWT secret falls back to a dev default
 - API keys appear to be stored in raw form
-- client-visible errors may expose too much detail
+- rate limiting is still in-memory rather than distributed
+- event plumbing still uses temporary relay mechanics
 - risk scoring is still placeholder logic
+
+Security improvements now implemented:
+
+- JWTs no longer fall back to a hardcoded dev secret
+- duplicate registration handling has been partially improved at the HTTP layer
+- login now returns a generic invalid-credentials response
+- strict route-specific rate limits have been introduced for login, authorize, execute, sync, and token issue
 
 ### 5. Demo and documentation drift
 
@@ -402,6 +422,17 @@ The first Phase 2 contract-alignment improvement is now in place:
 2. sync replay is restricted to offline transactions
 3. sync transactions are prevalidated against stored authorization state before engine execution
 4. sync uses the same authorization-readiness rules as the main execute path
+
+## Security Hardening Delivered So Far
+
+The current security hardening slice includes:
+
+1. authenticated and wallet-filtered event endpoints
+2. frontend-compatible SSE access using authenticated query credentials when needed
+3. strict in-memory rate limiting on the highest-risk routes
+4. safer JWT secret handling
+5. generic login failure responses
+6. offline token and sync routes now fail closed when `RAIL_API_KEY` is not configured
 
 ## Recommended Improvement Roadmap
 

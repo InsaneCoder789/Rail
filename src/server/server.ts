@@ -37,6 +37,16 @@ const MAX_REQUEST_BODY_BYTES = resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTE
 const MAX_SYNC_BATCH_SIZE = resolvePositiveIntEnv("RAIL_MAX_SYNC_BATCH_SIZE", 100);
 const EXPOSE_INTERNAL_ERRORS = process.env.RAIL_EXPOSE_INTERNAL_ERRORS === "true";
 const REQUIRE_JSON_CONTENT_TYPE = process.env.RAIL_REQUIRE_JSON_CONTENT_TYPE !== "false";
+const RATE_LIMIT_LOGIN_MAX = resolvePositiveIntEnv("RAIL_RATE_LIMIT_LOGIN_MAX", 5);
+const RATE_LIMIT_LOGIN_WINDOW_MS = resolvePositiveIntEnv("RAIL_RATE_LIMIT_LOGIN_WINDOW_MS", 15 * 60 * 1000);
+const RATE_LIMIT_AUTHORIZE_MAX = resolvePositiveIntEnv("RAIL_RATE_LIMIT_AUTHORIZE_MAX", 12);
+const RATE_LIMIT_AUTHORIZE_WINDOW_MS = resolvePositiveIntEnv("RAIL_RATE_LIMIT_AUTHORIZE_WINDOW_MS", 60 * 1000);
+const RATE_LIMIT_EXECUTE_MAX = resolvePositiveIntEnv("RAIL_RATE_LIMIT_EXECUTE_MAX", 20);
+const RATE_LIMIT_EXECUTE_WINDOW_MS = resolvePositiveIntEnv("RAIL_RATE_LIMIT_EXECUTE_WINDOW_MS", 60 * 1000);
+const RATE_LIMIT_SYNC_MAX = resolvePositiveIntEnv("RAIL_RATE_LIMIT_SYNC_MAX", 6);
+const RATE_LIMIT_SYNC_WINDOW_MS = resolvePositiveIntEnv("RAIL_RATE_LIMIT_SYNC_WINDOW_MS", 10 * 60 * 1000);
+const RATE_LIMIT_TOKEN_ISSUE_MAX = resolvePositiveIntEnv("RAIL_RATE_LIMIT_TOKEN_ISSUE_MAX", 6);
+const RATE_LIMIT_TOKEN_ISSUE_WINDOW_MS = resolvePositiveIntEnv("RAIL_RATE_LIMIT_TOKEN_ISSUE_WINDOW_MS", 10 * 60 * 1000);
 
 const CONTROL_CHARS_RE = /[\u0000-\u001F\u007F]/;
 const CURRENCY_RE = /^[A-Z]{3}$/;
@@ -61,6 +71,65 @@ class RequestError extends Error {
     this.hint = hint;
     this.exposeMessage = exposeMessage;
   }
+}
+
+class RateLimitError extends RequestError {
+  readonly retryAfterSeconds: number;
+  readonly limit: number;
+  readonly remaining: number;
+
+  constructor(message: string, retryAfterSeconds: number, limit: number, remaining: number) {
+    super(429, "rate_limited", message, `retry after ${retryAfterSeconds}s`);
+    this.retryAfterSeconds = retryAfterSeconds;
+    this.limit = limit;
+    this.remaining = remaining;
+  }
+}
+
+class SlidingWindowRateLimiter {
+  private readonly hits = new Map<string, number[]>();
+
+  consume(key: string, limit: number, windowMs: number): { limit: number; remaining: number; retryAfterSeconds: number } {
+    const now = Date.now();
+    const earliest = now - windowMs;
+    const current = (this.hits.get(key) ?? []).filter((ts) => ts > earliest);
+
+    if (current.length >= limit) {
+      const retryAfterMs = Math.max(1_000, windowMs - (now - current[0]));
+      this.hits.set(key, current);
+      return {
+        limit,
+        remaining: 0,
+        retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
+      };
+    }
+
+    current.push(now);
+    this.hits.set(key, current);
+
+    if (this.hits.size > 20_000) {
+      for (const [existingKey, timestamps] of this.hits) {
+        if (timestamps.length === 0 || timestamps[timestamps.length - 1] <= earliest) {
+          this.hits.delete(existingKey);
+        }
+      }
+    }
+
+    return {
+      limit,
+      remaining: Math.max(0, limit - current.length),
+      retryAfterSeconds: 0,
+    };
+  }
+}
+
+interface AuthenticatedViewer {
+  readonly walletId: string;
+}
+
+interface SseClient {
+  readonly res: http.ServerResponse;
+  readonly viewer: AuthenticatedViewer;
 }
 
 function resolvePositiveIntEnv(name: string, fallback: number): number {
@@ -107,12 +176,32 @@ function resolveBearerToken(req: http.IncomingMessage): string | undefined {
   return undefined;
 }
 
+function resolveBearerTokenFromUrl(url: URL): string | undefined {
+  const token = url.searchParams.get("access_token");
+  return token && token.length > 0 ? token : undefined;
+}
+
+function resolveApiKeyFromUrl(url: URL): string | undefined {
+  const key = url.searchParams.get("api_key");
+  return key && key.length > 0 ? key : undefined;
+}
+
+function getClientIp(req: http.IncomingMessage): string {
+  const forwarded = normalizeHeaderValue(req.headers["x-forwarded-for"]);
+  if (forwarded) {
+    return forwarded.split(",")[0].trim();
+  }
+  const remote = req.socket.remoteAddress;
+  return remote && remote.length > 0 ? remote : "unknown";
+}
+
 // --- API key to wallet binding helper ---
 let globalPool: any = null;
+const rateLimiter = new SlidingWindowRateLimiter();
 
 // 🔥 Simple in-memory outbox (used if DB not initialized)
 const outboxEvents: any[] = [];
-const sseClients = new Set<http.ServerResponse>();
+const sseClients = new Set<SseClient>();
 
 // 🔥 TEMP FIX: capture pipeline logs and forward to SSE + DB
 const originalConsoleLog = console.log;
@@ -138,12 +227,28 @@ console.log = (...args: any[]) => {
   }
 };
 
+function isEventVisibleToWallet(event: { type?: string; payload?: Record<string, unknown> }, walletId: string): boolean {
+  if (event.type === "system.error") {
+    return false;
+  }
+
+  const payload = event.payload ?? {};
+  const senderWalletId = typeof payload.senderWalletId === "string" ? payload.senderWalletId : undefined;
+  const receiverWalletId = typeof payload.receiverWalletId === "string" ? payload.receiverWalletId : undefined;
+  const walletPayloadId = typeof payload.walletId === "string" ? payload.walletId : undefined;
+
+  return senderWalletId === walletId || receiverWalletId === walletId || walletPayloadId === walletId;
+}
+
 function broadcastEvent(event: any) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
 
   for (const client of sseClients) {
     try {
-      client.write(payload);
+      if (!isEventVisibleToWallet(event, client.viewer.walletId)) {
+        continue;
+      }
+      client.res.write(payload);
     } catch {
       sseClients.delete(client);
     }
@@ -250,6 +355,54 @@ async function getWalletFromUser(userId: string): Promise<string> {
   return res.rows[0].wallet_id;
 }
 
+async function resolveAuthenticatedWallet(
+  req: http.IncomingMessage,
+  url?: URL,
+  options?: { allowQueryCredentials?: boolean },
+): Promise<string> {
+  const bearer = resolveBearerToken(req) ?? (options?.allowQueryCredentials ? resolveBearerTokenFromUrl(url!) : undefined);
+  if (bearer) {
+    const decoded = verifyToken(bearer);
+    return getWalletFromUser(decoded.userId);
+  }
+
+  const apiKey = resolveApiKeyHeader(req) ?? (options?.allowQueryCredentials ? resolveApiKeyFromUrl(url!) : undefined);
+  if (apiKey) {
+    return getWalletFromApiKey(apiKey);
+  }
+
+  throw new RequestError(401, "unauthorized", "missing auth");
+}
+
+function applyRateLimit(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  scope: string,
+  limit: number,
+  windowMs: number,
+  discriminator?: string,
+): void {
+  const key = `${scope}:${getClientIp(req)}:${discriminator ?? "anon"}`;
+  const decision = rateLimiter.consume(key, limit, windowMs);
+
+  res.setHeader("X-RateLimit-Limit", String(decision.limit));
+  res.setHeader("X-RateLimit-Remaining", String(decision.remaining));
+  if (decision.retryAfterSeconds > 0) {
+    res.setHeader("Retry-After", String(decision.retryAfterSeconds));
+    throw new RateLimitError(
+      `${scope} rate limit exceeded`,
+      decision.retryAfterSeconds,
+      decision.limit,
+      decision.remaining,
+    );
+  }
+}
+
+async function listVisibleEvents(viewer: AuthenticatedViewer, limit = 20): Promise<any[]> {
+  const events = await listOutboxEvents(Math.max(limit * 5, 50));
+  return events.filter((evt) => isEventVisibleToWallet(evt, viewer.walletId)).slice(0, limit);
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -302,7 +455,13 @@ function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promise<stri
 }
 
 function requireApiKey(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-  if (!API_KEY) return true;
+  if (!API_KEY) {
+    json(res, 503, {
+      error: "server_misconfig",
+      message: "RAIL_API_KEY is required for this route",
+    });
+    return false;
+  }
   const provided = resolveApiKeyHeader(req);
   if (!provided || !secureEquals(provided, API_KEY)) {
     json(res, 401, { error: "unauthorized" });
@@ -635,7 +794,7 @@ async function bootstrap(): Promise<void> {
       // --- CORS ---
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RAIL-API-KEY, X-KYLR-API-KEY");
 
       if (req.method === "OPTIONS") {
         res.writeHead(200);
@@ -669,26 +828,43 @@ async function bootstrap(): Promise<void> {
         if (!requireJsonContentType(req, res)) return;
         const parsed = await readAndParseJson(req);
         const body = parsed as any;
+        applyRateLimit(req, res, "register", RATE_LIMIT_LOGIN_MAX, RATE_LIMIT_LOGIN_WINDOW_MS, String(body?.userId ?? ""));
 
         if (!body.userId || !body.password) {
           throw new RequestError(422, "invalid_body", "userId and password required");
         }
+        if (!isSafeText(body.userId, 3, 128)) {
+          throw new RequestError(422, "invalid_body", "userId is invalid");
+        }
+        if (typeof body.password !== "string" || body.password.length < 8 || body.password.length > 128) {
+          throw new RequestError(422, "weak_password", "password must be 8-128 characters");
+        }
 
         const hash = await bcrypt.hash(body.password, 10);
-
-        // create wallet if not exists
-        await globalPool.query(
-          `INSERT INTO wallets (wallet_id, balance, reserved)
-           VALUES ($1, 0, 0)
-           ON CONFLICT (wallet_id) DO NOTHING`,
-          [body.userId]
-        );
-
-        await globalPool.query(
-          `INSERT INTO users (user_id, password_hash, wallet_id)
-           VALUES ($1, $2, $1)`,
-          [body.userId, hash]
-        );
+        const client = await globalPool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO wallets (wallet_id, balance, reserved)
+             VALUES ($1, 0, 0)
+             ON CONFLICT (wallet_id) DO NOTHING`,
+            [body.userId],
+          );
+          await client.query(
+            `INSERT INTO users (user_id, password_hash, wallet_id)
+             VALUES ($1, $2, $1)`,
+            [body.userId, hash],
+          );
+          await client.query("COMMIT");
+        } catch (err: any) {
+          await client.query("ROLLBACK");
+          if (err?.code === "23505") {
+            throw new RequestError(409, "user_exists", "user already exists");
+          }
+          throw err;
+        } finally {
+          client.release();
+        }
 
         json(res, 200, { ok: true });
         return;
@@ -699,6 +875,7 @@ async function bootstrap(): Promise<void> {
         if (!requireJsonContentType(req, res)) return;
         const parsed = await readAndParseJson(req);
         const body = parsed as any;
+        applyRateLimit(req, res, "login", RATE_LIMIT_LOGIN_MAX, RATE_LIMIT_LOGIN_WINDOW_MS, String(body?.userId ?? ""));
 
         const resDb = await globalPool.query(
           `SELECT password_hash FROM users WHERE user_id = $1`,
@@ -706,12 +883,12 @@ async function bootstrap(): Promise<void> {
         );
 
         if (resDb.rowCount === 0) {
-          throw new RequestError(401, "invalid_credentials", "user not found");
+          throw new RequestError(401, "invalid_credentials", "invalid credentials");
         }
 
         const valid = await bcrypt.compare(body.password, resDb.rows[0].password_hash);
         if (!valid) {
-          throw new RequestError(401, "invalid_credentials", "wrong password");
+          throw new RequestError(401, "invalid_credentials", "invalid credentials");
         }
 
         const token = generateToken(body.userId);
@@ -726,22 +903,11 @@ async function bootstrap(): Promise<void> {
 
         // --- Enforce API key or JWT → wallet binding ---
         let walletFromKey: string | null = null;
-        const bearer = resolveBearerToken(req);
-        if (bearer) {
-          let decoded;
-          try {
-            decoded = verifyToken(bearer);
-          } catch (err: any) {
-            emitSystemError(err, "auth.verify");
-            throw err;
-          }
-          walletFromKey = await getWalletFromUser(decoded.userId);
-        } else {
-          const apiKey = resolveApiKeyHeader(req);
-          if (!apiKey) {
-            throw new RequestError(401, "unauthorized", "missing auth");
-          }
-          walletFromKey = await getWalletFromApiKey(apiKey);
+        try {
+          walletFromKey = await resolveAuthenticatedWallet(req, url);
+        } catch (err: any) {
+          emitSystemError(err, "auth.verify");
+          throw err;
         }
 
         if (!parsed || typeof parsed !== "object") {
@@ -769,6 +935,7 @@ async function bootstrap(): Promise<void> {
         if (o.senderWalletId !== walletFromKey) {
           throw new RequestError(403, "identity_mismatch", "sender does not match auth");
         }
+        applyRateLimit(req, res, "authorize", RATE_LIMIT_AUTHORIZE_MAX, RATE_LIMIT_AUTHORIZE_WINDOW_MS, walletFromKey);
 
         const auth = await createAuthorization({
           txId: o.txId as string,
@@ -795,6 +962,14 @@ async function bootstrap(): Promise<void> {
           });
           return;
         }
+        applyRateLimit(
+          req,
+          res,
+          "offline_token_issue",
+          RATE_LIMIT_TOKEN_ISSUE_MAX,
+          RATE_LIMIT_TOKEN_ISSUE_WINDOW_MS,
+          `${parsed.walletId}:${parsed.deviceId}`,
+        );
 
         const row = await offlineTokenStore.issue({
           walletId: parsed.walletId,
@@ -826,22 +1001,11 @@ async function bootstrap(): Promise<void> {
 
         // --- Enforce API key or JWT → wallet binding ---
         let walletFromKey: string | null = null;
-        const bearer = resolveBearerToken(req);
-        if (bearer) {
-          let decoded;
-          try {
-            decoded = verifyToken(bearer);
-          } catch (err: any) {
-            emitSystemError(err, "auth.verify");
-            throw err;
-          }
-          walletFromKey = await getWalletFromUser(decoded.userId);
-        } else {
-          const apiKey = resolveApiKeyHeader(req);
-          if (!apiKey) {
-            throw new RequestError(401, "unauthorized", "missing auth");
-          }
-          walletFromKey = await getWalletFromApiKey(apiKey);
+        try {
+          walletFromKey = await resolveAuthenticatedWallet(req, url);
+        } catch (err: any) {
+          emitSystemError(err, "auth.verify");
+          throw err;
         }
 
         const body = parsed as Record<string, unknown>;
@@ -863,6 +1027,7 @@ async function bootstrap(): Promise<void> {
         if (txn.senderWalletId !== walletFromKey) {
           throw new RequestError(403, "identity_mismatch", "sender does not match auth");
         }
+        applyRateLimit(req, res, "execute", RATE_LIMIT_EXECUTE_MAX, RATE_LIMIT_EXECUTE_WINDOW_MS, walletFromKey);
 
         await prepareAuthorizedTransaction(txn, idempotency);
         if (providedAuthorization) {
@@ -898,6 +1063,14 @@ async function bootstrap(): Promise<void> {
           });
           return;
         }
+        applyRateLimit(
+          req,
+          res,
+          "sync",
+          RATE_LIMIT_SYNC_MAX,
+          RATE_LIMIT_SYNC_WINDOW_MS,
+          parsed.deviceId,
+        );
 
         const txns: PaymentTransaction[] = [];
         for (const item of parsed.transactions) {
@@ -946,50 +1119,59 @@ async function bootstrap(): Promise<void> {
       }
 
       // 📡 Live event stream (SSE)
-if (req.method === "GET" && url.pathname === "/v1/events/stream") {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*",
-  });
+      if (req.method === "GET" && url.pathname === "/v1/events/stream") {
+        const viewer = {
+          walletId: await resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
+        };
 
-  res.write(": connected\n\n");
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        });
 
-  sseClients.add(res);
-  (async () => {
-    const recent = await listOutboxEvents(50);
-    for (const evt of recent.reverse()) {
-      res.write(`data: ${JSON.stringify(evt)}\n\n`);
-    }
-  })();
+        res.write(": connected\n\n");
 
-  const interval = setInterval(() => {
-    try {
-      res.write(": keep-alive\n\n");
-    } catch {
-      clearInterval(interval);
-      sseClients.delete(res);
-    }
-  }, 15000);
+        const client: SseClient = { res, viewer };
+        sseClients.add(client);
+        (async () => {
+          const recent = await listVisibleEvents(viewer, 50);
+          for (const evt of recent.reverse()) {
+            res.write(`data: ${JSON.stringify(evt)}\n\n`);
+          }
+        })();
 
-  req.on("close", () => {
-    clearInterval(interval);
-    sseClients.delete(res);
-  });
+        const interval = setInterval(() => {
+          try {
+            res.write(": keep-alive\n\n");
+          } catch {
+            clearInterval(interval);
+            sseClients.delete(client);
+          }
+        }, 15000);
 
-  return;
-}
+        req.on("close", () => {
+          clearInterval(interval);
+          sseClients.delete(client);
+        });
+
+        return;
+      }
 
       
 
       // 📡 Events endpoint (Postgres-backed outbox)
       if (req.method === "GET" && url.pathname === "/v1/events") {
         try {
-          const events = await listOutboxEvents(20);
+          const viewer = {
+            walletId: await resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
+          };
+          const events = await listVisibleEvents(viewer, 20);
           json(res, 200, { events });
         } catch (e) {
-          json(res, 500, { error: "internal_error" });
+          const mapped = toErrorResponse(e);
+          json(res, mapped.status, mapped.body);
         }
         return;
       }
@@ -1009,6 +1191,11 @@ if (req.method === "GET" && url.pathname === "/v1/events/stream") {
       }
 
       const mapped = toErrorResponse(err);
+      if (err instanceof RateLimitError) {
+        res.setHeader("Retry-After", String(err.retryAfterSeconds));
+        res.setHeader("X-RateLimit-Limit", String(err.limit));
+        res.setHeader("X-RateLimit-Remaining", String(err.remaining));
+      }
       json(res, mapped.status, mapped.body);
     }
   });
@@ -1021,7 +1208,7 @@ if (req.method === "GET" && url.pathname === "/v1/events/stream") {
       console.log("API key authentication: enabled (RAIL_API_KEY or KYLR_API_KEY)");
     } else {
       // eslint-disable-next-line no-console
-      console.warn("API key authentication: disabled (set RAIL_API_KEY in production)");
+      console.warn("API key authentication: not configured; offline token and sync routes will fail closed");
     }
     // eslint-disable-next-line no-console
     console.log(`Request body limit: ${MAX_REQUEST_BODY_BYTES} bytes`);

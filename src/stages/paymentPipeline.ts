@@ -51,12 +51,14 @@ function emitStage(
 
   ctx.outbox?.append?.({
     type: "pipeline.stage",
-    payload: {
-      stage,
-      status,
-      txId: ctx.txn.txId,
-      sequence: seq,
-    },
+      payload: {
+        stage,
+        status,
+        txId: ctx.txn.txId,
+        senderWalletId: ctx.txn.senderWalletId,
+        receiverWalletId: ctx.txn.receiverWalletId,
+        sequence: seq,
+      },
     occurredAt: new Date(Date.now() + seq).toISOString(),
   } as any);
 }
@@ -227,7 +229,12 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         if (ctx.risk?.decision === "challenge") {
           ctx.outbox?.append?.({
             type: "payments.step_up_required",
-            payload: { txId: ctx.txn.txId, correlationId: ctx.correlationId },
+            payload: {
+              txId: ctx.txn.txId,
+              correlationId: ctx.correlationId,
+              senderWalletId: ctx.txn.senderWalletId,
+              receiverWalletId: ctx.txn.receiverWalletId,
+            },
             occurredAt: new Date().toISOString(),
           } as any);
         }
@@ -257,6 +264,8 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
             amountMinor: ctx.txn.amountMinor,
             channel: ctx.txn.channel,
             offline: ctx.txn.channel !== "online",
+            senderWalletId: ctx.txn.senderWalletId,
+            receiverWalletId: ctx.txn.receiverWalletId,
           },
           occurredAt: new Date().toISOString(),
         } as any);
@@ -291,7 +300,11 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         }
         ctx.outbox?.append?.({
           type: "payments.ledger_reversed",
-          payload: { txId: ctx.txn.txId },
+          payload: {
+            txId: ctx.txn.txId,
+            senderWalletId: ctx.txn.senderWalletId,
+            receiverWalletId: ctx.txn.receiverWalletId,
+          },
           occurredAt: new Date().toISOString(),
         } as any);
         ctx.result = { status: "rejected", reason: "compensated" };

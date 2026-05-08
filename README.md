@@ -259,12 +259,18 @@ On startup, Rail runs **migrations** (`src/persistence/migrate.ts`) and creates:
 |----------|---------|
 | `PORT` | HTTP port (default `8787`). |
 | `DATABASE_URL` | If set, enables **PostgreSQL** idempotency + offline token store. |
-| `RAIL_API_KEY` | Shared secret; required header **`X-RAIL-API-KEY`** on mutating routes when set. |
+| `RAIL_API_KEY` | Shared secret for offline-token and sync routes. Those routes now fail closed when it is unset. |
 | `KYLR_API_KEY` | **Legacy** alias read if `RAIL_API_KEY` is unset. |
+| `JWT_SECRET` | Secret for login JWT issuance and verification. If unset, Rail falls back to `RAIL_SIGNING_SECRET` for backward compatibility, but a dedicated secret is recommended. |
 | `RAIL_SIGNING_SECRET` | Secret for **HMAC-SHA256** verification of `paymentSignature`. |
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, every `execute` / sync item **must** include valid `paymentSignature`. |
 | `RAIL_PKCS11_MODULE_PATH` | Documented hook for PKCS#11 HSM (see `src/crypto/hsm.ts`). |
 | `RAIL_KMS_KEY_ID` | Documented hook for cloud KMS signing. |
+| `RAIL_RATE_LIMIT_LOGIN_MAX` | Max login attempts per IP+user in the login window. Default `5`. |
+| `RAIL_RATE_LIMIT_AUTHORIZE_MAX` | Max authorization requests per IP+wallet per minute. Default `12`. |
+| `RAIL_RATE_LIMIT_EXECUTE_MAX` | Max execute requests per IP+wallet per minute. Default `20`. |
+| `RAIL_RATE_LIMIT_SYNC_MAX` | Max sync requests per IP+device per 10 minutes. Default `6`. |
+| `RAIL_RATE_LIMIT_TOKEN_ISSUE_MAX` | Max offline-token issuance requests per IP+wallet+device per 10 minutes. Default `6`. |
 
 **Production checklist:** TLS termination (reverse proxy), strong `RAIL_API_KEY`, managed Postgres, **no** cleartext credentials, rotate `RAIL_SIGNING_SECRET`, rate limiting, and fraud monitoring outside this repo.
 
@@ -338,6 +344,22 @@ Rules:
   ]
 }
 ```
+
+### `GET /v1/events`
+
+Returns recent wallet-visible events for the authenticated caller.
+
+- JWT callers only see events where their wallet appears as sender or receiver
+- API-key callers are filtered to the wallet bound to that key
+- `system.error` events are not exposed through the client event feed
+
+### `GET /v1/events/stream`
+
+Server-Sent Events stream for the authenticated caller.
+
+- same wallet filtering rules as `GET /v1/events`
+- frontend dashboards can authenticate with standard `Authorization: Bearer ...`
+- browser `EventSource` clients may also use `?access_token=<jwt>` or `?api_key=<key>` when custom headers are unavailable
 
 ---
 
