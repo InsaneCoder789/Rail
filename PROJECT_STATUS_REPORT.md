@@ -615,27 +615,28 @@ The README describes a no-Postgres path, but the current server behavior relies 
 
 This means memory mode is currently more of a partial development fallback than a complete supported runtime mode.
 
-### 2. Eventing uses temporary patches
+### 2. Eventing still needs fuller infrastructure maturity
 
-The current SSE/outbox flow depends on:
+The event path is stronger than before because it now uses an explicit engine relay callback instead of relying on `console.log` interception and runtime outbox monkey-patching.
 
-- intercepting `console.log`
-- mutating the outbox append function at runtime
+However, it is still not a full production-grade event delivery subsystem. It remains a lightweight in-process relay and persistence bridge rather than a dedicated delivery service.
 
-This works as a temporary bridge but should not be treated as final infrastructure.
+### 3. Some infrastructure is still intentionally lightweight
 
-### 3. Some abstractions have drifted from the live schema
+The codebase is now more internally consistent than before, but some operational pieces are still intentionally lightweight for project scope reasons.
 
-`PostgresWalletStore` uses column names that do not match the actual migrated wallet table, suggesting that this abstraction is stale or unused.
+Examples include:
+
+- in-memory rate limiting rather than distributed throttling
+- in-process event relay rather than a dedicated broker-backed publisher
 
 ### 4. Security hardening is incomplete
 
 Current concerns include:
 
-- API keys appear to be stored in raw form
 - rate limiting is still in-memory rather than distributed
-- event plumbing still uses temporary relay mechanics
 - risk scoring is still placeholder logic
+- API key provisioning and rotation flows are still minimal even though wallet-bound keys are now resolved via hashed-at-rest lookup
 
 Security improvements now implemented:
 
@@ -643,6 +644,8 @@ Security improvements now implemented:
 - duplicate registration handling has been partially improved at the HTTP layer
 - login now returns a generic invalid-credentials response
 - strict route-specific rate limits have been introduced for login, authorize, execute, sync, and token issue
+- wallet-bound API keys are now looked up via hashed-at-rest storage rather than plaintext database comparison
+- the event relay path now uses explicit engine-to-event-store forwarding instead of log interception and outbox mutation
 
 ### 5. Demo and documentation drift
 
@@ -717,6 +720,8 @@ The current security hardening slice includes:
 4. safer JWT secret handling
 5. generic login failure responses
 6. offline token and sync routes now fail closed when `RAIL_API_KEY` is not configured
+7. hashed-at-rest wallet API key lookup for database-backed API credentials
+8. explicit outbox relay wiring instead of temporary console-based forwarding
 
 ## Recommended Improvement Roadmap
 
@@ -739,7 +744,6 @@ The improvement roadmap currently recommended is:
 
 ### Phase 3: Security Hardening
 
-- hash API keys
 - harden JWT configuration
 - remove unsafe default secrets in non-dev mode
 - reduce public error exposure
@@ -747,8 +751,6 @@ The improvement roadmap currently recommended is:
 
 ### Phase 4: Infrastructure Cleanup
 
-- replace console monkey-patching
-- introduce explicit outbox relay interfaces
 - remove or fix stale persistence abstractions
 - split `server.ts` into focused modules
 - validate configuration at startup

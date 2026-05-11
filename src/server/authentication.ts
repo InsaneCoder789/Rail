@@ -1,5 +1,5 @@
 import http from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { Pool } from "pg";
 import { verifyToken } from "../auth/jwt.js";
 import { RequestError, json, normalizeHeaderValue } from "./http.js";
@@ -45,9 +45,10 @@ function resolveApiKeyFromUrl(url: URL): string | undefined {
 }
 
 async function getWalletFromApiKey(pool: Pool, apiKey: string): Promise<string> {
+  const apiKeyHash = createHash("sha256").update(apiKey, "utf8").digest("hex");
   const res = await pool.query(
-    `SELECT wallet_id FROM api_keys WHERE api_key = $1`,
-    [apiKey],
+    `SELECT wallet_id FROM api_keys WHERE api_key_hash = $1`,
+    [apiKeyHash],
   );
 
   if (res.rowCount === 0) {

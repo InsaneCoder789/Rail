@@ -25,7 +25,7 @@ import {
 } from "../stages/authorizationStage.js";
 import { createAuthResolver } from "./authentication.js";
 import { loadServerConfig } from "./config.js";
-import { attachEngineOutboxForwarding, createEventStore, installConsoleRelay } from "./events.js";
+import { createEventStore } from "./events.js";
 import { RateLimitError, RequestError, SlidingWindowRateLimiter, json, toErrorResponse } from "./http.js";
 import { handleAuthRoutes } from "./routes/authRoutes.js";
 import { handleEventRoutes } from "./routes/eventRoutes.js";
@@ -82,17 +82,16 @@ async function bootstrap(): Promise<void> {
     console.warn("Rail: DATABASE_URL not set — using in-memory idempotency + offline tokens (dev only)");
   }
 
+  const eventStore = createEventStore(() => pool);
+
   const engine = new PaymentPipelineEngine({
     idempotency,
     outbox: new MemoryOutbox(),
     tracer,
     dlq: new MemoryDeadLetterQueue(),
     pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore),
+    relay: (event) => eventStore.insertOutboxEvent(event),
   });
-
-  const eventStore = createEventStore(() => pool);
-  installConsoleRelay(eventStore);
-  attachEngineOutboxForwarding(engine, eventStore);
 
   const context: ServerContext = {
     config,

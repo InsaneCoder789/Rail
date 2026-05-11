@@ -2,7 +2,7 @@ import type { PaymentTransaction, PipelineResult } from "../domain/types.js";
 import { createPaymentContext } from "./context.js";
 import type { DeadLetterQueue } from "./dlq.js";
 import type { IdempotencyStore } from "./idempotency.js";
-import type { OutboxWriter } from "./outbox.js";
+import type { OutboxRelay, OutboxWriter } from "./outbox.js";
 import type { Tracer } from "./tracing.js";
 import { withSpan } from "./middleware.js";
 import type { Stage } from "./stage.js";
@@ -17,6 +17,7 @@ export interface PaymentPipelineEngineOptions {
   readonly tracer: Tracer;
   readonly dlq: DeadLetterQueue;
   readonly pipeline: Stage;
+  readonly relay?: OutboxRelay;
 }
 
 /**
@@ -38,7 +39,7 @@ export class PaymentPipelineEngine {
         if (!ctx.result) {
           throw new Error("invariant_broken:missing_result");
         }
-        this.flushOutboxRelay();
+        this.flushOutboxRelay(this.opts.relay);
         return ctx.result;
       });
       span.end("ok", { status: result.status });
@@ -55,9 +56,9 @@ export class PaymentPipelineEngine {
   }
 
   /** Simulate Kafka relay / bridge worker that publishes drained outbox events. */
-  flushOutboxRelay(log = console.log): void {
+  flushOutboxRelay(relay?: OutboxRelay): void {
     for (const evt of this.opts.outbox.drain()) {
-      log("outbox_relay", evt);
+      void relay?.(evt);
     }
   }
 }

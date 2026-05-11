@@ -1,5 +1,4 @@
 import type { Pool } from "pg";
-import type { PaymentPipelineEngine } from "../pipeline/engine.js";
 import type { AuthenticatedViewer, EventStore, ServerEvent, SseClient } from "./types.js";
 
 function isEventVisibleToWallet(event: { type?: string; payload?: Record<string, unknown> }, walletId: string): boolean {
@@ -122,44 +121,4 @@ export function createEventStore(getPool: () => Pool | null): EventStore {
       sseClients.delete(client);
     },
   };
-}
-
-export function installConsoleRelay(eventStore: EventStore): void {
-  const originalConsoleLog = console.log;
-  console.log = (...args: unknown[]) => {
-    originalConsoleLog(...args);
-
-    try {
-      if (args[0] === "outbox_relay" && args[1] && typeof args[1] === "object") {
-        const evt = args[1] as ServerEvent;
-        const normalizedEvent = normalizeEvent(evt);
-        eventStore.broadcastEvent(normalizedEvent);
-        void eventStore.insertOutboxEvent(normalizedEvent);
-      }
-    } catch (e) {
-      originalConsoleLog("log_intercept_error", e);
-    }
-  };
-}
-
-export function attachEngineOutboxForwarding(engine: PaymentPipelineEngine, eventStore: EventStore): void {
-  const outboxAny = (engine as unknown as { outbox?: { append?: (event: ServerEvent) => void; __forwardingEnabled?: boolean } }).outbox;
-
-  if (outboxAny && typeof outboxAny.append === "function" && !outboxAny.__forwardingEnabled) {
-    const originalAppend = outboxAny.append.bind(outboxAny);
-
-    outboxAny.append = (event: ServerEvent) => {
-      try {
-        originalAppend(event);
-        const normalizedEvent = normalizeEvent(event);
-        eventStore.broadcastEvent(normalizedEvent);
-        void eventStore.insertOutboxEvent(normalizedEvent).catch((err) =>
-          console.error("outbox_forward_error", err),
-        );
-      } catch (err) {
-        console.error("outbox_patch_error", err);
-      }
-    };
-    outboxAny.__forwardingEnabled = true;
-  }
 }

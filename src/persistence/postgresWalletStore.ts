@@ -11,7 +11,7 @@ export class PostgresWalletStore {
 
   async getBalance(walletId: string): Promise<number> {
     const res = await this.pool.query(
-      `SELECT balance_minor FROM wallets WHERE wallet_id = $1`,
+      `SELECT balance FROM wallets WHERE wallet_id = $1`,
       [walletId]
     );
 
@@ -19,15 +19,15 @@ export class PostgresWalletStore {
       throw new Error("wallet_not_found");
     }
 
-    return Number(res.rows[0].balance_minor);
+    return Number(res.rows[0].balance);
   }
 
   async reserve(walletId: string, amount: number): Promise<void> {
     const res = await this.pool.query(
       `UPDATE wallets
-       SET reserved_minor = reserved_minor + $2
+       SET reserved = reserved + $2
        WHERE wallet_id = $1
-       AND (balance_minor - reserved_minor) >= $2`,
+       AND (balance - reserved) >= $2`,
       [walletId, amount]
     );
 
@@ -39,7 +39,7 @@ export class PostgresWalletStore {
   async release(walletId: string, amount: number): Promise<void> {
     await this.pool.query(
       `UPDATE wallets
-       SET reserved_minor = GREATEST(reserved_minor - $2, 0)
+       SET reserved = GREATEST(reserved - $2, 0)
        WHERE wallet_id = $1`,
       [walletId, amount]
     );
@@ -52,7 +52,7 @@ export class PostgresWalletStore {
       await client.query("BEGIN");
 
       const res = await client.query(
-        `SELECT reserved_minor FROM wallets WHERE wallet_id = $1 FOR UPDATE`,
+        `SELECT reserved FROM wallets WHERE wallet_id = $1 FOR UPDATE`,
         [walletId]
       );
 
@@ -60,7 +60,7 @@ export class PostgresWalletStore {
         throw new Error("wallet_not_found");
       }
 
-      const reserved = Number(res.rows[0].reserved_minor);
+      const reserved = Number(res.rows[0].reserved);
 
       if (reserved < amount) {
         throw new Error("reservation_mismatch");
@@ -69,8 +69,8 @@ export class PostgresWalletStore {
       await client.query(
         `UPDATE wallets
          SET
-           reserved_minor = reserved_minor - $2,
-           balance_minor = balance_minor - $2
+           reserved = reserved - $2,
+           balance = balance - $2
          WHERE wallet_id = $1`,
         [walletId, amount]
       );
@@ -87,7 +87,7 @@ export class PostgresWalletStore {
   async credit(walletId: string, amount: number): Promise<void> {
     await this.pool.query(
       `UPDATE wallets
-       SET balance_minor = balance_minor + $2
+       SET balance = balance + $2
        WHERE wallet_id = $1`,
       [walletId, amount]
     );

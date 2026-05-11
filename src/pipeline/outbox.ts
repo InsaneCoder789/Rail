@@ -4,6 +4,8 @@ export interface OutboxEvent {
   readonly occurredAt: string;
 }
 
+export type OutboxRelay = (event: OutboxEvent) => void | Promise<void>;
+
 /**
  * Transactional outbox: producers append during the business transaction;
  * a relay publishes to Kafka later. This interface keeps the pipeline decoupled.

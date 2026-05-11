@@ -1,6 +1,8 @@
 import type { Pool } from "pg";
 
 const SCHEMA = `
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 CREATE TABLE IF NOT EXISTS rail_idempotency (
   idempotency_key TEXT PRIMARY KEY,
   status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
@@ -70,10 +72,43 @@ CREATE TABLE IF NOT EXISTS authorization_usage (
   used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = 'api_keys' AND column_name = 'api_key'
+  ) THEN
+    ALTER TABLE api_keys RENAME TO api_keys_legacy;
+  END IF;
+EXCEPTION
+  WHEN duplicate_table THEN NULL;
+END $$;
+
 CREATE TABLE IF NOT EXISTS api_keys (
-  api_key TEXT PRIMARY KEY,
+  key_id TEXT PRIMARY KEY,
+  api_key_hash TEXT NOT NULL UNIQUE,
   wallet_id TEXT NOT NULL
 );
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_name = 'api_keys_legacy'
+  ) THEN
+    INSERT INTO api_keys (key_id, api_key_hash, wallet_id)
+    SELECT
+      'key_' || substr(encode(digest(api_key, 'sha256'), 'hex'), 1, 16),
+      encode(digest(api_key, 'sha256'), 'hex'),
+      wallet_id
+    FROM api_keys_legacy
+    ON CONFLICT (api_key_hash) DO NOTHING;
+
+    DROP TABLE api_keys_legacy;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_wallet ON api_keys(wallet_id);
 
