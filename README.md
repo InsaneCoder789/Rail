@@ -2,6 +2,8 @@
 
 Rail is an offline-capable payment orchestration service built to explore how a fintech backend can safely handle authorization, offline headroom, replay-safe execution, and reconnect-time synchronization.
 
+In practical terms, Rail is a payment control and execution backend. It is designed to sit between an application experience and the underlying money-movement rails, where it can enforce authorization rules, protect retries, coordinate offline-capable flows, and keep payment state observable.
+
 The project is intentionally positioned as a control and execution layer, not as a bank settlement rail. It does not replace UPI, card networks, or PSP settlement systems. Instead, it focuses on the part of the problem where a backend must:
 
 - issue bounded authorization to spend
@@ -12,6 +14,8 @@ The project is intentionally positioned as a control and execution layer, not as
 - record ledger activity and emit operational events
 
 This repository is PostgreSQL-first for serious runs, with limited in-memory fallback support for local development.
+
+The current `main` branch is the polished, resume-grade version of the project: it focuses on transaction safety, explainable architecture, security-conscious design, and a backend structure that reflects how a real fintech execution layer should be modeled.
 
 **Repository:** [github.com/InsaneCoder789/Rail](https://github.com/InsaneCoder789/Rail)
 
@@ -34,6 +38,8 @@ At a high level, Rail supports the following flow:
 5. A payment is executed through a pipeline with validation, prechecks, idempotency, and a ledger-writing saga.
 6. If the device was offline, queued transactions can later be replayed through the sync endpoint using the same stored authorization model.
 7. The backend emits wallet-visible events for dashboards and operational visibility.
+
+That makes Rail more than a simple transfer API. It behaves like a controlled payment runtime with explicit lifecycle state, replay protection, offline-aware constraints, and ledger-visible execution.
 
 ---
 
