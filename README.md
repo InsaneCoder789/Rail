@@ -501,6 +501,8 @@ src/
 | Run server | `npm run server` |
 | Demo script | `npm run demo` |
 
+`npm run demo` follows the current authorization-first flow. It requires `DATABASE_URL` and `RAIL_SIGNING_SECRET`, creates a real authorization, executes an online payment through the hardened pipeline, and then replays the same request to demonstrate idempotent retry behavior.
+
 ---
 
 ## Current Limitations
