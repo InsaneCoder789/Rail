@@ -303,6 +303,7 @@ That mode is useful for local experimentation, but it is not the main supported 
 | `KYLR_API_KEY` | Legacy alias if `RAIL_API_KEY` is not set. |
 | `JWT_SECRET` | JWT signing and verification secret. |
 | `RAIL_SIGNING_SECRET` | HMAC signing secret for transaction and authorization integrity helpers. |
+| `RAIL_ALLOWED_ORIGINS` | Comma-separated frontend origins allowed by CORS. Localhost development origins are used by default when unset. |
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
 | `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
 | `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
@@ -444,6 +445,7 @@ Current event visibility rules:
 - users only see events relevant to their wallet
 - API-key callers only see events relevant to the wallet bound to that key
 - raw `system.error` events are not exposed through the client-visible event feed
+- browser access is restricted by explicit allowed origins instead of wildcard CORS
 
 ---
 

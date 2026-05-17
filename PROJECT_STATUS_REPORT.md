@@ -722,6 +722,7 @@ The current security hardening slice includes:
 6. offline token and sync routes now fail closed when `RAIL_API_KEY` is not configured
 7. hashed-at-rest wallet API key lookup for database-backed API credentials
 8. explicit outbox relay wiring instead of temporary console-based forwarding
+9. explicit allowed-origin CORS handling instead of wildcard browser access
 
 ## Recommended Improvement Roadmap
 

@@ -35,6 +35,33 @@ export function normalizeHeaderValue(value: string | string[] | undefined): stri
   return undefined;
 }
 
+export function resolveAllowedOrigin(
+  req: http.IncomingMessage,
+  allowedOrigins: readonly string[],
+): string | undefined {
+  const origin = normalizeHeaderValue(req.headers.origin);
+  if (!origin) return undefined;
+  if (allowedOrigins.includes(origin)) {
+    return origin;
+  }
+  return undefined;
+}
+
+export function applyCors(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  allowedOrigins: readonly string[],
+): void {
+  const allowedOrigin = resolveAllowedOrigin(req, allowedOrigins);
+  if (allowedOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RAIL-API-KEY, X-KYLR-API-KEY");
+}
+
 export function json(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {

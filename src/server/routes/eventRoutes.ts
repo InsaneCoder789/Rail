@@ -1,5 +1,5 @@
 import http from "node:http";
-import { json, toErrorResponse } from "../http.js";
+import { applyCors, json, resolveAllowedOrigin, toErrorResponse } from "../http.js";
 import type { ServerContext } from "../types.js";
 
 export async function handleEventRoutes(
@@ -13,11 +13,13 @@ export async function handleEventRoutes(
       walletId: await context.authResolver.resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
     };
 
+    const allowedOrigin = resolveAllowedOrigin(req, context.config.allowedOrigins);
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
-      "Access-Control-Allow-Origin": "*",
+      ...(allowedOrigin ? { "Access-Control-Allow-Origin": allowedOrigin, Vary: "Origin" } : {}),
     });
 
     res.write(": connected\n\n");
@@ -50,6 +52,7 @@ export async function handleEventRoutes(
 
   if (req.method === "GET" && url.pathname === "/v1/events") {
     try {
+      applyCors(req, res, context.config.allowedOrigins);
       const viewer = {
         walletId: await context.authResolver.resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
       };

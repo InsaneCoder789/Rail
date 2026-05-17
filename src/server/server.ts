@@ -26,7 +26,7 @@ import {
 import { createAuthResolver } from "./authentication.js";
 import { loadServerConfig } from "./config.js";
 import { createEventStore } from "./events.js";
-import { RateLimitError, RequestError, SlidingWindowRateLimiter, json, toErrorResponse } from "./http.js";
+import { RateLimitError, RequestError, SlidingWindowRateLimiter, applyCors, json, toErrorResponse } from "./http.js";
 import { handleAuthRoutes } from "./routes/authRoutes.js";
 import { handleEventRoutes } from "./routes/eventRoutes.js";
 import { handlePaymentRoutes } from "./routes/paymentRoutes.js";
@@ -110,9 +110,7 @@ async function bootstrap(): Promise<void> {
 
   const server = http.createServer(async (req, res) => {
     try {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RAIL-API-KEY, X-KYLR-API-KEY");
+      applyCors(req, res, config.allowedOrigins);
 
       if (req.method === "OPTIONS") {
         res.writeHead(200);

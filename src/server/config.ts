@@ -11,6 +11,7 @@ function resolvePositiveIntEnv(name: string, fallback: number): number {
 export interface ServerConfig {
   readonly port: number;
   readonly apiKey: string;
+  readonly allowedOrigins: readonly string[];
   readonly maxRequestBodyBytes: number;
   readonly maxSyncBatchSize: number;
   readonly exposeInternalErrors: boolean;
@@ -30,10 +31,28 @@ export interface ServerConfig {
   };
 }
 
+function resolveAllowedOrigins(): string[] {
+  const raw = process.env.RAIL_ALLOWED_ORIGINS?.trim();
+  if (!raw) {
+    return [
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://localhost:5173",
+      "http://127.0.0.1:5173",
+    ];
+  }
+
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0 && value !== "*");
+}
+
 export function loadServerConfig(): ServerConfig {
   return {
     port: Number(process.env.PORT ?? 8787),
     apiKey: process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "",
+    allowedOrigins: resolveAllowedOrigins(),
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),
     maxSyncBatchSize: resolvePositiveIntEnv("RAIL_MAX_SYNC_BATCH_SIZE", 100),
     exposeInternalErrors: process.env.RAIL_EXPOSE_INTERNAL_ERRORS === "true",
