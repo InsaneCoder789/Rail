@@ -48,13 +48,16 @@ export async function consumeReservation(client: any, walletId: string, amount: 
 
 // 🔄 Release reserved money (rollback case)
 export async function releaseReservation(client: any, walletId: string, amount: number, currency: string): Promise<void> {
-  await client.query(
+  const res = await client.query(
     `UPDATE wallets
      SET balance = balance + $2,
          reserved = reserved - $2
      WHERE wallet_id = $1 AND currency = $3`,
     [walletId, amount, currency]
   );
+  if (res.rowCount === 0) {
+    throw new Error("RESERVATION_WALLET_NOT_FOUND");
+  }
 }
 
 // 💰 Credit the receiver's wallet

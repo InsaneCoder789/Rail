@@ -835,3 +835,9 @@ Verification completed for this category:
 On 2026-08-30, the next security category removed credentials from event query strings and made JWT claim validation explicit. Event access now requires request headers, reducing exposure through browser history, access logs, referrer data, and monitoring systems. JWT verification now rejects validly signed tokens whose payload does not contain a non-empty string `userId`.
 
 Production configuration now fails closed when PostgreSQL, the server API key, sufficiently strong JWT/signing secrets, or deployed frontend origins are missing. Local development keeps its documented localhost defaults, while production cannot silently fall back to development origins.
+
+## Ledger and Authorization Integrity Hardening
+
+On 2026-08-30, database-level integrity protections were added for the ledger and authorization state. Wallet balances and reservations must remain non-negative, ledger amounts and authorization amounts must be positive, and an authorization cannot transfer to the same wallet. Ledger entries remain unique per transaction and entry type, while foreign keys connect ledger entries, authorizations, users, API keys, and authorization usage to existing wallets or authorizations.
+
+Reservation release now verifies that the wallet update actually matched a wallet in the expected currency. Ledger writes persist the transaction currency, so multi-currency records do not silently fall back to the database default. A read-only reconciliation utility is available through `findReconciliationIssues` to detect incomplete or unbalanced ledger transactions and invalid wallet reservations without modifying financial state. It also reports orphaned authorization-usage records discovered during migration validation; those legacy records are preserved for explicit review instead of being deleted automatically.

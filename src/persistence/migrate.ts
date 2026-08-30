@@ -23,6 +23,13 @@ CREATE TABLE IF NOT EXISTS rail_offline_tokens (
   expires_at_ms BIGINT NOT NULL
 );
 
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rail_offline_tokens_amounts_non_negative') THEN
+    ALTER TABLE rail_offline_tokens ADD CONSTRAINT rail_offline_tokens_amounts_non_negative
+      CHECK (amount_cap_minor > 0 AND remaining_minor >= 0 AND remaining_minor <= amount_cap_minor);
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_rail_offline_tokens_wallet ON rail_offline_tokens(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_rail_offline_tokens_expires ON rail_offline_tokens(expires_at_ms);
 
@@ -33,6 +40,13 @@ CREATE TABLE IF NOT EXISTS wallets (
   currency TEXT NOT NULL DEFAULT 'INR',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'wallets_amounts_non_negative') THEN
+    ALTER TABLE wallets ADD CONSTRAINT wallets_amounts_non_negative
+      CHECK (balance >= 0 AND reserved >= 0);
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_wallets_updated_at ON wallets(updated_at);
 
@@ -45,6 +59,13 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   currency TEXT NOT NULL DEFAULT 'INR',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_amount_positive') THEN
+    ALTER TABLE ledger_entries ADD CONSTRAINT ledger_entries_amount_positive
+      CHECK (amount_minor > 0);
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_tx ON ledger_entries(tx_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_wallet ON ledger_entries(wallet_id);
@@ -64,6 +85,17 @@ CREATE TABLE IF NOT EXISTS authorizations (
   released_at TIMESTAMPTZ
 );
 
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_amount_positive') THEN
+    ALTER TABLE authorizations ADD CONSTRAINT authorizations_amount_positive
+      CHECK (amount_minor > 0);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_distinct_wallets') THEN
+    ALTER TABLE authorizations ADD CONSTRAINT authorizations_distinct_wallets
+      CHECK (sender_wallet_id <> receiver_wallet_id);
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_authorizations_sender ON authorizations(sender_wallet_id);
 CREATE INDEX IF NOT EXISTS idx_authorizations_status_expires ON authorizations(status, expires_at);
 
@@ -78,6 +110,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_authorization_usage_tx
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_tx_type
   ON ledger_entries(tx_id, entry_type);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_wallet_fk') THEN
+    ALTER TABLE ledger_entries
+      ADD CONSTRAINT ledger_entries_wallet_fk FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_sender_wallet_fk') THEN
+    ALTER TABLE authorizations
+      ADD CONSTRAINT authorizations_sender_wallet_fk FOREIGN KEY (sender_wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_receiver_wallet_fk') THEN
+    ALTER TABLE authorizations
+      ADD CONSTRAINT authorizations_receiver_wallet_fk FOREIGN KEY (receiver_wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorization_usage_auth_fk') THEN
+    ALTER TABLE authorization_usage
+      ADD CONSTRAINT authorization_usage_auth_fk FOREIGN KEY (auth_id) REFERENCES authorizations(auth_id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_keys_wallet_fk') THEN
+    ALTER TABLE api_keys
+      ADD CONSTRAINT api_keys_wallet_fk FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_wallet_fk') THEN
+    ALTER TABLE users
+      ADD CONSTRAINT users_wallet_fk FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
+  END IF;
+END $$;
 
 DO $$
 BEGIN
