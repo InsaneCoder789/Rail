@@ -15,7 +15,7 @@ export async function handleAuthRoutes(
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
     const body = parsed as Record<string, unknown>;
-    applyRateLimit({
+    await applyRateLimit({
       req,
       res,
       rateLimiter: context.rateLimiter,
@@ -73,7 +73,7 @@ export async function handleAuthRoutes(
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
     const body = parsed as Record<string, unknown>;
-    applyRateLimit({
+    await applyRateLimit({
       req,
       res,
       rateLimiter: context.rateLimiter,

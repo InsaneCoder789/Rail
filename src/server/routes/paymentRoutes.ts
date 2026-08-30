@@ -136,7 +136,7 @@ export async function handlePaymentRoutes(
     if (body.senderWalletId !== authenticatedWallet) {
       throw new RequestError(403, "identity_mismatch", "sender does not match auth");
     }
-    applyRateLimit({
+    await applyRateLimit({
       req,
       res,
       rateLimiter: context.rateLimiter,
@@ -171,7 +171,7 @@ export async function handlePaymentRoutes(
       return true;
     }
 
-    applyRateLimit({
+    await applyRateLimit({
       req,
       res,
       rateLimiter: context.rateLimiter,
@@ -234,7 +234,7 @@ export async function handlePaymentRoutes(
     if (txn.senderWalletId !== authenticatedWallet) {
       throw new RequestError(403, "identity_mismatch", "sender does not match auth");
     }
-    applyRateLimit({
+    await applyRateLimit({
       req,
       res,
       rateLimiter: context.rateLimiter,
@@ -278,7 +278,7 @@ export async function handlePaymentRoutes(
       return true;
     }
 
-    applyRateLimit({
+    await applyRateLimit({
       req,
       res,
       rateLimiter: context.rateLimiter,

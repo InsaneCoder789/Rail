@@ -848,6 +848,10 @@ On 2026-08-30, application-level correctness and regression coverage were improv
 
 The repository now includes a built-in Node test command with focused tests for idempotent replay, fingerprint mismatch rejection, retry after temporary failure, amount validation, and offline device-token requirements. These tests are intentionally small and explainable so they can grow alongside the payment guarantees.
 
+## Shared Rate-Limit Hardening
+
+On 2026-08-30, durable PostgreSQL-backed rate limiting was added for database-backed deployments. Login, authorization, execution, token issuance, and synchronization now use a database bucket protected by row-level locking, so the quota is shared across warm instances instead of being limited to one process. Memory rate limiting remains available only for local development without PostgreSQL.
+
 ## Privileged API Scope Hardening
 
 On 2026-08-30, privileged offline routes were separated by explicit API-key scopes. Offline-token issuance requires `offline_tokens:issue`, while reconnect synchronization requires `sync:write`. The scopes are configured through `RAIL_API_KEY_SCOPES`, documented in the environment example and deployment guide, and denied with `403` when the configured key is not authorized for a route.

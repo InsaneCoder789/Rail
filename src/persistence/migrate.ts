@@ -3,6 +3,12 @@ import type { Pool } from "pg";
 const SCHEMA = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+CREATE TABLE IF NOT EXISTS rail_rate_limit_buckets (
+  bucket_key TEXT PRIMARY KEY,
+  window_started_at TIMESTAMPTZ NOT NULL,
+  hit_count INTEGER NOT NULL CHECK (hit_count >= 0)
+);
+
 CREATE TABLE IF NOT EXISTS rail_idempotency (
   idempotency_key TEXT PRIMARY KEY,
   status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),

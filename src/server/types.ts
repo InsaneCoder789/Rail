@@ -5,7 +5,7 @@ import type { MemoryIdempotencyStore } from "../pipeline/idempotency.js";
 import type { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import type { ServerConfig } from "./config.js";
-import type { SlidingWindowRateLimiter } from "./http.js";
+import type { RateLimiter } from "./http.js";
 
 export interface AuthenticatedViewer {
   readonly walletId: string;
@@ -49,7 +49,7 @@ export interface ServerContext {
   readonly offlineTokenStore: IOfflineTokenStore;
   readonly idempotency: ServerIdempotencyStore;
   readonly engine: PaymentPipelineEngine;
-  readonly rateLimiter: SlidingWindowRateLimiter;
+  readonly rateLimiter: RateLimiter;
   readonly authResolver: AuthResolver;
   readonly eventStore: EventStore;
 }

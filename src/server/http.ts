@@ -1,4 +1,5 @@
 import http from "node:http";
+import type { Pool } from "pg";
 
 export class RequestError extends Error {
   readonly status: number;
@@ -186,17 +187,23 @@ export class SlidingWindowRateLimiter {
   }
 }
 
-export function applyRateLimit(args: {
+export interface RateLimiter {
+  consume(key: string, limit: number, windowMs: number):
+    | { limit: number; remaining: number; retryAfterSeconds: number }
+    | Promise<{ limit: number; remaining: number; retryAfterSeconds: number }>;
+}
+
+export async function applyRateLimit(args: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
-  rateLimiter: SlidingWindowRateLimiter;
+  rateLimiter: RateLimiter;
   scope: string;
   limit: number;
   windowMs: number;
   discriminator?: string;
-}): void {
+}): Promise<void> {
   const key = `${args.scope}:${getClientIp(args.req)}:${args.discriminator ?? "anon"}`;
-  const decision = args.rateLimiter.consume(key, args.limit, args.windowMs);
+  const decision = await args.rateLimiter.consume(key, args.limit, args.windowMs);
 
   args.res.setHeader("X-RateLimit-Limit", String(decision.limit));
   args.res.setHeader("X-RateLimit-Remaining", String(decision.remaining));

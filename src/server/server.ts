@@ -12,6 +12,7 @@ import { MemoryOutbox } from "../pipeline/outbox.js";
 import { consoleTracer } from "../pipeline/tracing.js";
 import { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import { PostgresOfflineTokenStore } from "../persistence/postgresOfflineTokenStore.js";
+import { PostgresRateLimiter } from "../persistence/postgresRateLimiter.js";
 import { ensureOutboxSchema, runMigrations } from "../persistence/migrate.js";
 import { createPool } from "../persistence/postgresPool.js";
 import { OfflineTokenStore } from "../rail/offlineTokenStore.js";
@@ -95,7 +96,7 @@ export async function createServerContext(options: {
     offlineTokenStore,
     idempotency,
     engine,
-    rateLimiter: new SlidingWindowRateLimiter(),
+    rateLimiter: pool ? new PostgresRateLimiter(pool) : new SlidingWindowRateLimiter(),
     authResolver: createAuthResolver({
       getPool: () => pool,
       apiKey: config.apiKey,
