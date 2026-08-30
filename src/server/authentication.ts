@@ -64,6 +64,7 @@ async function getWalletFromUser(pool: Pool, userId: string): Promise<string> {
 export function createAuthResolver(args: {
   getPool: () => Pool | null;
   apiKey: string;
+  apiKeyScopes: readonly string[];
 }): AuthResolver {
   return {
     async resolveAuthenticatedWallet(req, url, options) {
@@ -86,12 +87,16 @@ export function createAuthResolver(args: {
       throw new RequestError(401, "unauthorized", "missing auth");
     },
 
-    requireApiKey(req, res) {
+    requireApiKey(req, res, scope) {
       if (!args.apiKey) {
         json(res, 503, {
           error: "server_misconfig",
           message: "RAIL_API_KEY is required for this route",
         });
+        return false;
+      }
+      if (scope && !args.apiKeyScopes.includes(scope)) {
+        json(res, 403, { error: "api_key_scope_denied" });
         return false;
       }
       const provided = resolveApiKeyHeader(req);

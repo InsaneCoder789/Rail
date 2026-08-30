@@ -847,3 +847,7 @@ Reservation release now verifies that the wallet update actually matched a walle
 On 2026-08-30, application-level correctness and regression coverage were improved. Unknown routes now return a `404 not_found` response instead of a misleading success response. Ordinary client-facing request errors are no longer duplicated into the system-error event stream, reducing noisy operational records. Outbox relay callbacks are awaited so the request execution path observes relay failures and can rely on idempotent recovery instead of silently discarding asynchronous work.
 
 The repository now includes a built-in Node test command with focused tests for idempotent replay, fingerprint mismatch rejection, retry after temporary failure, amount validation, and offline device-token requirements. These tests are intentionally small and explainable so they can grow alongside the payment guarantees.
+
+## Privileged API Scope Hardening
+
+On 2026-08-30, privileged offline routes were separated by explicit API-key scopes. Offline-token issuance requires `offline_tokens:issue`, while reconnect synchronization requires `sync:write`. The scopes are configured through `RAIL_API_KEY_SCOPES`, documented in the environment example and deployment guide, and denied with `403` when the configured key is not authorized for a route.

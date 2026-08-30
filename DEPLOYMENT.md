@@ -15,6 +15,7 @@ Configure these for the **Production** environment:
 ```text
 DATABASE_URL=postgresql://...
 RAIL_API_KEY=<long-random-server-key>
+RAIL_API_KEY_SCOPES=offline_tokens:issue,sync:write
 RAIL_SIGNING_SECRET=<long-random-signing-secret>
 JWT_SECRET=<long-random-jwt-secret>
 RAIL_ALLOWED_ORIGINS=https://your-frontend.example
@@ -59,6 +60,7 @@ The authorization expiry sweep uses an interval in a warm process. Hosted produc
 - Use a managed PostgreSQL instance with TLS enabled.
 - Keep the Vercel project private and restrict project collaborators.
 - Use a random API key and separate secrets for each environment.
+- Configure only the scopes required by the deployment; token issuance and synchronization are checked independently.
 - Set `RAIL_ALLOWED_ORIGINS` to exact frontend origins; do not use `*`.
 - Keep `RAIL_EXPOSE_INTERNAL_ERRORS=false` in production.
 - Do not use API keys in query strings for ordinary API calls.

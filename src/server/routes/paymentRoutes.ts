@@ -159,7 +159,7 @@ export async function handlePaymentRoutes(
   }
 
   if (req.method === "POST" && url.pathname === "/v1/offline/tokens/issue") {
-    if (!context.authResolver.requireApiKey(req, res)) return true;
+    if (!context.authResolver.requireApiKey(req, res, "offline_tokens:issue")) return true;
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
@@ -266,7 +266,7 @@ export async function handlePaymentRoutes(
   }
 
   if (req.method === "POST" && url.pathname === "/v1/sync/transactions") {
-    if (!context.authResolver.requireApiKey(req, res)) return true;
+    if (!context.authResolver.requireApiKey(req, res, "sync:write")) return true;
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);

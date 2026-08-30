@@ -99,6 +99,7 @@ export async function createServerContext(options: {
     authResolver: createAuthResolver({
       getPool: () => pool,
       apiKey: config.apiKey,
+      apiKeyScopes: config.apiKeyScopes,
     }),
     eventStore,
   };

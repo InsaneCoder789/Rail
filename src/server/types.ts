@@ -30,7 +30,7 @@ export interface AuthResolver {
     url?: URL,
     options?: { allowQueryCredentials?: boolean },
   ): Promise<string>;
-  requireApiKey(req: http.IncomingMessage, res: http.ServerResponse): boolean;
+  requireApiKey(req: http.IncomingMessage, res: http.ServerResponse, scope?: string): boolean;
 }
 
 export interface EventStore {

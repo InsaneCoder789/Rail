@@ -14,6 +14,7 @@ export interface ServerConfig {
   readonly dbPoolMax: number;
   readonly disableSse: boolean;
   readonly apiKey: string;
+  readonly apiKeyScopes: readonly string[];
   readonly allowedOrigins: readonly string[];
   readonly maxRequestBodyBytes: number;
   readonly maxSyncBatchSize: number;
@@ -51,6 +52,12 @@ function resolveAllowedOrigins(): string[] {
     .filter((value) => value.length > 0 && value !== "*");
 }
 
+function resolveApiKeyScopes(): string[] {
+  const raw = process.env.RAIL_API_KEY_SCOPES?.trim();
+  if (!raw) return ["offline_tokens:issue", "sync:write"];
+  return raw.split(",").map((scope) => scope.trim()).filter(Boolean);
+}
+
 export function loadServerConfig(): ServerConfig {
   const serverless = process.env.VERCEL === "1" || process.env.RAIL_RUNTIME === "serverless";
   const isProduction = process.env.NODE_ENV === "production";
@@ -75,6 +82,7 @@ export function loadServerConfig(): ServerConfig {
     dbPoolMax: resolvePositiveIntEnv("RAIL_DB_POOL_MAX", serverless ? 5 : 20),
     disableSse: process.env.RAIL_DISABLE_SSE === "true" || serverless,
     apiKey: process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "",
+    apiKeyScopes: resolveApiKeyScopes(),
     allowedOrigins,
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),
     maxSyncBatchSize: resolvePositiveIntEnv("RAIL_MAX_SYNC_BATCH_SIZE", 100),
