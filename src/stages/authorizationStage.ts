@@ -1,10 +1,7 @@
 import { Pool, type PoolClient } from "pg";
+import { randomUUID } from "node:crypto";
 import type { PaymentAuthorization, StoredPaymentAuthorization } from "../domain/authorization.js";
 import { signAuthorization } from "../crypto/authorizationSigning.js";
-
-function randomId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
 
 let pool: Pool | undefined;
 const DEFAULT_AUTH_TTL_MS = 5 * 60 * 1000;
@@ -21,13 +18,13 @@ function requirePool(): Pool {
 }
 
 // 🔒 Reserve money (authorization step)
-export async function reserveFunds(client: any, walletId: string, amount: number): Promise<void> {
+export async function reserveFunds(client: any, walletId: string, amount: number, currency: string): Promise<void> {
   const res = await client.query(
     `UPDATE wallets
      SET balance = balance - $2,
          reserved = reserved + $2
-     WHERE wallet_id = $1 AND balance >= $2`,
-    [walletId, amount]
+     WHERE wallet_id = $1 AND currency = $3 AND balance >= $2`,
+    [walletId, amount, currency]
   );
 
   if (res.rowCount === 0) {
@@ -36,12 +33,12 @@ export async function reserveFunds(client: any, walletId: string, amount: number
 }
 
 // 💸 Consume reserved money (final debit)
-export async function consumeReservation(client: any, walletId: string, amount: number): Promise<void> {
+export async function consumeReservation(client: any, walletId: string, amount: number, currency: string): Promise<void> {
   const res = await client.query(
     `UPDATE wallets
      SET reserved = reserved - $2
-     WHERE wallet_id = $1 AND reserved >= $2`,
-    [walletId, amount]
+     WHERE wallet_id = $1 AND currency = $3 AND reserved >= $2`,
+    [walletId, amount, currency]
   );
 
   if (res.rowCount === 0) {
@@ -50,23 +47,23 @@ export async function consumeReservation(client: any, walletId: string, amount: 
 }
 
 // 🔄 Release reserved money (rollback case)
-export async function releaseReservation(client: any, walletId: string, amount: number): Promise<void> {
+export async function releaseReservation(client: any, walletId: string, amount: number, currency: string): Promise<void> {
   await client.query(
     `UPDATE wallets
      SET balance = balance + $2,
          reserved = reserved - $2
-     WHERE wallet_id = $1`,
-    [walletId, amount]
+     WHERE wallet_id = $1 AND currency = $3`,
+    [walletId, amount, currency]
   );
 }
 
 // 💰 Credit the receiver's wallet
-export async function creditWallet(client: any, walletId: string, amount: number): Promise<void> {
+export async function creditWallet(client: any, walletId: string, amount: number, currency: string): Promise<void> {
   const res = await client.query(
     `UPDATE wallets
      SET balance = balance + $2
-     WHERE wallet_id = $1`,
-    [walletId, amount]
+     WHERE wallet_id = $1 AND currency = $3`,
+    [walletId, amount, currency]
   );
 
   if (res.rowCount === 0) {
@@ -147,7 +144,7 @@ export async function releaseExpiredAuthorizations(limit = 100): Promise<number>
     await client.query("BEGIN");
 
     const expired = await client.query(
-      `SELECT auth_id, sender_wallet_id, amount_minor
+      `SELECT auth_id, sender_wallet_id, amount_minor, currency
        FROM authorizations
        WHERE status = 'issued'
          AND expires_at <= NOW()
@@ -162,6 +159,7 @@ export async function releaseExpiredAuthorizations(limit = 100): Promise<number>
         client,
         String(row.sender_wallet_id),
         Number(row.amount_minor),
+        String(row.currency),
       );
 
       await client.query(
@@ -202,10 +200,32 @@ export async function createAuthorization(input: {
   try {
     await client.query("BEGIN");
 
-    await reserveFunds(client, input.senderWalletId, input.amountMinor);
+    const existing = await client.query(
+      `SELECT auth_id, tx_id, sender_wallet_id, receiver_wallet_id, amount_minor,
+              currency, status, signature, created_at, expires_at, used_at, released_at
+       FROM authorizations
+       WHERE tx_id = $1
+       FOR UPDATE`,
+      [input.txId],
+    );
+    if (existing.rowCount && existing.rowCount > 0) {
+      const current = mapStoredAuthorization(existing.rows[0] as Record<string, unknown>);
+      if (
+        current.senderWalletId !== input.senderWalletId ||
+        current.receiverWalletId !== input.receiverWalletId ||
+        current.amountMinor !== input.amountMinor ||
+        current.currency !== input.currency
+      ) {
+        throw new Error("AUTHORIZATION_TX_CONFLICT");
+      }
+      await client.query("COMMIT");
+      return current;
+    }
+
+    await reserveFunds(client, input.senderWalletId, input.amountMinor, input.currency);
 
     const unsignedAuth = {
-      authId: `auth_${randomId()}`,
+      authId: `auth_${randomUUID()}`,
       txId: input.txId,
       senderWalletId: input.senderWalletId,
       receiverWalletId: input.receiverWalletId,

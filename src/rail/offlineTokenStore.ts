@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { PaymentTransaction } from "../domain/types.js";
 import { AsyncMutex } from "./mutex.js";
+import type { PoolClient } from "pg";
 
 export interface IssuedOfflineToken {
   readonly tokenId: string;
@@ -26,9 +27,9 @@ export interface IssueOfflineTokenInput {
 /** Common contract for in-memory and PostgreSQL offline token backends. */
 export interface IOfflineTokenStore {
   issue(input: IssueOfflineTokenInput): Promise<IssuedOfflineToken>;
-  beginOfflineSpend(txn: PaymentTransaction): Promise<{ ok: true } | { ok: false; reason: string }>;
-  finalizeOfflineSpend(txn: PaymentTransaction): Promise<void>;
-  rollbackOfflineSpend(txn: PaymentTransaction): Promise<void>;
+  beginOfflineSpend(txn: PaymentTransaction, client?: PoolClient): Promise<{ ok: true } | { ok: false; reason: string }>;
+  finalizeOfflineSpend(txn: PaymentTransaction, client?: PoolClient): Promise<void>;
+  rollbackOfflineSpend(txn: PaymentTransaction, client?: PoolClient): Promise<void>;
   getToken(tokenId: string): Promise<IssuedOfflineToken | undefined>;
 }
 
@@ -66,7 +67,7 @@ export class OfflineTokenStore implements IOfflineTokenStore {
   /**
    * Validates and reserves headroom for an offline transaction (call before pipeline).
    */
-  async beginOfflineSpend(txn: PaymentTransaction): Promise<{ ok: true } | { ok: false; reason: string }> {
+  async beginOfflineSpend(txn: PaymentTransaction, _client?: PoolClient): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (txn.channel === "online") {
       return { ok: true };
     }
@@ -106,7 +107,7 @@ export class OfflineTokenStore implements IOfflineTokenStore {
   }
 
   /** Call after pipeline accepts the transaction. Removes token when fully spent. */
-  async finalizeOfflineSpend(txn: PaymentTransaction): Promise<void> {
+  async finalizeOfflineSpend(txn: PaymentTransaction, _client?: PoolClient): Promise<void> {
     if (txn.channel === "online" || !txn.offlineTokenId) return;
     const tid = txn.offlineTokenId;
 
@@ -120,7 +121,7 @@ export class OfflineTokenStore implements IOfflineTokenStore {
   }
 
   /** Restores reserved headroom if pipeline rejects or errors after beginOfflineSpend. */
-  async rollbackOfflineSpend(txn: PaymentTransaction): Promise<void> {
+  async rollbackOfflineSpend(txn: PaymentTransaction, _client?: PoolClient): Promise<void> {
     if (txn.channel === "online" || !txn.offlineTokenId) return;
     const tid = txn.offlineTokenId;
 

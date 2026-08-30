@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS rail_idempotency (
   status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
   result_json JSONB,
   error_message TEXT,
+  request_fingerprint TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -72,6 +73,12 @@ CREATE TABLE IF NOT EXISTS authorization_usage (
   used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_authorization_usage_tx
+  ON authorization_usage(tx_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_tx_type
+  ON ledger_entries(tx_id, entry_type);
+
 DO $$
 BEGIN
   IF EXISTS (
@@ -119,6 +126,9 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_id);
+
+ALTER TABLE rail_idempotency
+  ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

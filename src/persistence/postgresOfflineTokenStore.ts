@@ -5,7 +5,7 @@ import type {
   IssueOfflineTokenInput,
   IOfflineTokenStore,
 } from "../rail/offlineTokenStore.js";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 function mapRow(row: Record<string, unknown>): IssuedOfflineToken {
   return {
@@ -66,7 +66,7 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
     };
   }
 
-  async beginOfflineSpend(txn: PaymentTransaction): Promise<{ ok: true } | { ok: false; reason: string }> {
+  async beginOfflineSpend(txn: PaymentTransaction, transactionClient?: PoolClient): Promise<{ ok: true } | { ok: false; reason: string }> {
     if (txn.channel === "online") {
       return { ok: true };
     }
@@ -78,39 +78,40 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
     }
     const tid = txn.offlineTokenId;
 
-    const client = await this.pool.connect();
+    const client = transactionClient ?? await this.pool.connect();
+    const ownsTransaction = !transactionClient;
     try {
-      await client.query("BEGIN");
+      if (ownsTransaction) await client.query("BEGIN");
       const sel = await client.query(
         `SELECT * FROM rail_offline_tokens WHERE token_id = $1 FOR UPDATE`,
         [tid],
       );
       if (sel.rows.length === 0) {
-        await client.query("ROLLBACK");
+        if (ownsTransaction) await client.query("ROLLBACK");
         return { ok: false, reason: "unknown_or_expired_token" };
       }
       const row = sel.rows[0] as Record<string, unknown>;
 
       if (Date.now() > Number(row.expires_at_ms)) {
         await client.query(`DELETE FROM rail_offline_tokens WHERE token_id = $1`, [tid]);
-        await client.query("COMMIT");
+        if (ownsTransaction) await client.query("COMMIT");
         return { ok: false, reason: "token_expired" };
       }
       if (String(row.wallet_id) !== txn.senderWalletId) {
-        await client.query("ROLLBACK");
+        if (ownsTransaction) await client.query("ROLLBACK");
         return { ok: false, reason: "wallet_mismatch" };
       }
       if (txn.deviceId !== String(row.device_id)) {
-        await client.query("ROLLBACK");
+        if (ownsTransaction) await client.query("ROLLBACK");
         return { ok: false, reason: "device_mismatch" };
       }
       if (txn.currency !== String(row.currency)) {
-        await client.query("ROLLBACK");
+        if (ownsTransaction) await client.query("ROLLBACK");
         return { ok: false, reason: "currency_mismatch" };
       }
       const remaining = Number(row.remaining_minor);
       if (txn.amountMinor > remaining) {
-        await client.query("ROLLBACK");
+        if (ownsTransaction) await client.query("ROLLBACK");
         return { ok: false, reason: "insufficient_token_headroom" };
       }
 
@@ -118,31 +119,31 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
         `UPDATE rail_offline_tokens SET remaining_minor = remaining_minor - $2 WHERE token_id = $1`,
         [tid, txn.amountMinor],
       );
-      await client.query("COMMIT");
+      if (ownsTransaction) await client.query("COMMIT");
       return { ok: true };
     } catch (e) {
       try {
-        await client.query("ROLLBACK");
+        if (ownsTransaction) await client.query("ROLLBACK");
       } catch {
         /* ignore */
       }
       throw e;
     } finally {
-      client.release();
+      if (ownsTransaction) client.release();
     }
   }
 
-  async finalizeOfflineSpend(txn: PaymentTransaction): Promise<void> {
+  async finalizeOfflineSpend(txn: PaymentTransaction, transactionClient?: PoolClient): Promise<void> {
     if (txn.channel === "online" || !txn.offlineTokenId) return;
-    await this.pool.query(
+    await (transactionClient ?? this.pool).query(
       `DELETE FROM rail_offline_tokens WHERE token_id = $1 AND remaining_minor <= 0`,
       [txn.offlineTokenId],
     );
   }
 
-  async rollbackOfflineSpend(txn: PaymentTransaction): Promise<void> {
+  async rollbackOfflineSpend(txn: PaymentTransaction, transactionClient?: PoolClient): Promise<void> {
     if (txn.channel === "online" || !txn.offlineTokenId) return;
-    await this.pool.query(
+    await (transactionClient ?? this.pool).query(
       `UPDATE rail_offline_tokens SET remaining_minor = remaining_minor + $2 WHERE token_id = $1`,
       [txn.offlineTokenId, txn.amountMinor],
     );

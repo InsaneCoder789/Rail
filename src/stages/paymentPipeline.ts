@@ -23,12 +23,13 @@ async function recordLedgerEntry(
   type: "debit" | "credit",
   walletId: string,
   amount: number,
-  txId: string
+  txId: string,
+  currency: string,
 ) {
   await client.query(
-    `INSERT INTO ledger_entries (tx_id, wallet_id, entry_type, amount_minor)
-     VALUES ($1, $2, $3, $4)`,
-    [txId, walletId, type, amount]
+    `INSERT INTO ledger_entries (tx_id, wallet_id, entry_type, amount_minor, currency)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [txId, walletId, type, amount, currency]
   );
 }
 
@@ -133,22 +134,6 @@ function riskScoreStage(): Stage {
 
 function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
   const steps: SagaStep[] = [
-    ...(tokenStore
-      ? [
-          {
-            name: "offline.token_reserve",
-            forward: async (ctx) => {
-              const gate = await tokenStore.beginOfflineSpend(ctx.txn);
-              if (!gate.ok) {
-                throw new PipelineError(gate.reason, gate.reason, false);
-              }
-            },
-            compensate: async (ctx) => {
-              await tokenStore.rollbackOfflineSpend(ctx.txn);
-            },
-          } satisfies SagaStep,
-        ]
-      : []),
     {
       name: "wallet.transfer",
       forward: async (ctx) => {
@@ -160,6 +145,47 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
 
         try {
           await client.query("BEGIN");
+
+          const ledgerRows = await client.query(
+            `SELECT wallet_id, entry_type, amount_minor, currency
+             FROM ledger_entries
+             WHERE tx_id = $1
+             ORDER BY entry_type`,
+            [ctx.txn.txId],
+          );
+          const hasCompletedLedger =
+            ledgerRows.rowCount === 2 &&
+            ledgerRows.rows.some((row) =>
+              row.wallet_id === ctx.txn.senderWalletId &&
+              row.entry_type === "debit" &&
+              Number(row.amount_minor) === ctx.txn.amountMinor &&
+              row.currency === ctx.txn.currency,
+            ) &&
+            ledgerRows.rows.some((row) =>
+              row.wallet_id === ctx.txn.receiverWalletId &&
+              row.entry_type === "credit" &&
+              Number(row.amount_minor) === ctx.txn.amountMinor &&
+              row.currency === ctx.txn.currency,
+            );
+
+          if (hasCompletedLedger) {
+            await client.query("COMMIT");
+            client.release();
+            ctx.state.recoveredCommittedPayment = true;
+            emitStage(ctx, "wallet.transfer", "ok");
+            return;
+          }
+          if (ledgerRows.rowCount && ledgerRows.rowCount > 0) {
+            throw new Error("INCONSISTENT_LEDGER_STATE");
+          }
+
+          if (tokenStore) {
+            const gate = await tokenStore.beginOfflineSpend(ctx.txn, client);
+            if (!gate.ok) {
+              throw new PipelineError(gate.reason, gate.reason, false);
+            }
+            ctx.state.offlineTokenReserved = ctx.txn.channel !== "online";
+          }
 
           // 🔐 Replay protection
           const authId = ctx.txn.authorizationId;
@@ -184,14 +210,16 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
           await consumeReservation(
             client,
             ctx.txn.senderWalletId,
-            ctx.txn.amountMinor
+            ctx.txn.amountMinor,
+            ctx.txn.currency,
           );
 
           // 2. Credit receiver
           await creditWallet(
             client,
             ctx.txn.receiverWalletId,
-            ctx.txn.amountMinor
+            ctx.txn.amountMinor,
+            ctx.txn.currency,
           );
 
           emitStage(ctx, "wallet.transfer", "ok");
@@ -201,6 +229,11 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
 
         } catch (err) {
           emitStage(ctx, "wallet.transfer", "error");
+          if (ctx.state.offlineTokenReserved) {
+            try {
+              await tokenStore?.rollbackOfflineSpend(ctx.txn, client);
+            } catch {}
+          }
           try {
             await client.query("ROLLBACK");
           } catch {}
@@ -223,6 +256,15 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
       name: "ledger.post",
       forward: async (ctx) => {
         emitStage(ctx, "ledger.post", "start");
+        if (ctx.state.recoveredCommittedPayment) {
+          emitStage(ctx, "ledger.post", "ok");
+          emitStage(ctx, "payment.execute", "ok");
+          ctx.result = {
+            status: "accepted",
+            ledgerEntryId: `leg_${ctx.txn.txId}`,
+          };
+          return;
+        }
         const client = (ctx as any)._dbClient as PoolClient | undefined;
         if (!client) throw new Error("missing_db_client");
 
@@ -245,7 +287,8 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
           "debit",
           ctx.txn.senderWalletId,
           ctx.txn.amountMinor,
-          ctx.txn.txId
+          ctx.txn.txId,
+          ctx.txn.currency,
         );
 
         await recordLedgerEntry(
@@ -253,7 +296,8 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
           "credit",
           ctx.txn.receiverWalletId,
           ctx.txn.amountMinor,
-          ctx.txn.txId
+          ctx.txn.txId,
+          ctx.txn.currency,
         );
 
         // keep event system
@@ -271,7 +315,7 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         } as any);
 
         if (tokenStore) {
-          await tokenStore.finalizeOfflineSpend(ctx.txn);
+          await tokenStore.finalizeOfflineSpend(ctx.txn, client);
         }
 
         emitStage(ctx, "ledger.post", "ok");
@@ -291,6 +335,11 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
         emitStage(ctx, "ledger.post", "error");
         const client = (ctx as any)._dbClient as PoolClient | undefined;
         if (client) {
+          if (ctx.state.offlineTokenReserved) {
+            try {
+              await tokenStore?.rollbackOfflineSpend(ctx.txn, client);
+            } catch {}
+          }
           try {
             await client.query("ROLLBACK");
           } catch {}

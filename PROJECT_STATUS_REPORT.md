@@ -811,3 +811,21 @@ Verification completed for this category:
 - The local and Vercel entrypoints share the same request handler.
 - Importing the server module no longer automatically calls `bootstrap`.
 - Database migration execution is separated from hosted request initialization.
+
+## Money and Transaction Consistency Hardening
+
+On 2026-08-30, the second critical-risk category was implemented for money movement, offline-token accounting, and retry consistency.
+
+Payment idempotency now uses a SHA-256 fingerprint of the complete canonical transaction payload. Reusing an idempotency key with different transaction data is rejected, while failed attempts are not permanently recorded as successful business outcomes and can be retried. This prevents accidental key reuse from returning the wrong payment result and avoids permanently blocking recovery from temporary failures.
+
+PostgreSQL offline-token reservation and finalization now accept the payment transaction client. The hosted payment path performs token headroom changes inside the same database transaction as authorization claim, reserved-funds consumption, receiver credit, ledger writes, and commit. A crash before commit therefore rolls back the complete money state instead of losing token headroom independently.
+
+The payment pipeline can recover a response-loss case by recognizing a complete, matching pair of ledger entries for the transaction before attempting a second authorization claim. Database uniqueness protection was added for one debit and one credit per transaction and for one authorization-usage record per transaction.
+
+Authorization creation is now retry-safe for the same transaction details. A repeated request returns the existing authorization rather than reserving the sender's funds again; a reused transaction ID with different details is rejected. Authorization identifiers now use cryptographically secure UUIDs, and wallet reserve, consume, release, and credit operations verify currency as well as wallet identity.
+
+Verification completed for this category:
+
+- TypeScript build passes with `npm run build`.
+- Database migrations complete with `npm run migrate`.
+- Memory idempotency behavior was checked for same-key reuse, mismatched fingerprints, and retry after failure.

@@ -26,45 +26,37 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
     return row.result_json as PipelineResult;
   }
 
-  async dedupe(key: string, run: () => Promise<PipelineResult>): Promise<PipelineResult> {
+  async dedupe(key: string, fingerprint: string, run: () => Promise<PipelineResult>): Promise<PipelineResult> {
     const client = await this.pool.connect();
     try {
       await client.query("SELECT pg_advisory_lock(hashtext($1::text))", [key]);
       const r = await client.query(
-        "SELECT status, result_json, error_message FROM rail_idempotency WHERE idempotency_key = $1",
+        "SELECT status, result_json, request_fingerprint FROM rail_idempotency WHERE idempotency_key = $1",
         [key],
       );
       if (r.rows.length > 0) {
-        const row = r.rows[0] as { status: string; result_json: unknown; error_message: string | null };
+        const row = r.rows[0] as { status: string; result_json: unknown; request_fingerprint: string | null };
+        if (row.request_fingerprint && row.request_fingerprint !== fingerprint) {
+          throw new Error("IDEMPOTENCY_KEY_REUSED");
+        }
         if (row.status === "completed") {
           return row.result_json as PipelineResult;
-        }
-        if (row.status === "failed") {
-          throw new Error(row.error_message ?? "previous_failed");
         }
       }
 
       try {
         const result = await run();
         await client.query(
-          `INSERT INTO rail_idempotency (idempotency_key, status, result_json)
-           VALUES ($1, 'completed', $2::jsonb)
+          `INSERT INTO rail_idempotency (idempotency_key, status, result_json, request_fingerprint)
+           VALUES ($1, 'completed', $2::jsonb, $3)
            ON CONFLICT (idempotency_key) DO UPDATE SET
              status = 'completed',
-             result_json = EXCLUDED.result_json`,
-          [key, JSON.stringify(result)],
+             result_json = EXCLUDED.result_json,
+             request_fingerprint = EXCLUDED.request_fingerprint`,
+          [key, JSON.stringify(result), fingerprint],
         );
         return result;
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        await client.query(
-          `INSERT INTO rail_idempotency (idempotency_key, status, error_message)
-           VALUES ($1, 'failed', $2)
-           ON CONFLICT (idempotency_key) DO UPDATE SET
-             status = 'failed',
-             error_message = EXCLUDED.error_message`,
-          [key, message],
-        );
         throw err;
       }
     } finally {

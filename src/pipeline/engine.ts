@@ -6,6 +6,8 @@ import type { OutboxRelay, OutboxWriter } from "./outbox.js";
 import type { Tracer } from "./tracing.js";
 import { withSpan } from "./middleware.js";
 import type { Stage } from "./stage.js";
+import { createHash } from "node:crypto";
+import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
 
 function randomId(): string {
   return `${Date.now().toString(16)}_${Math.random().toString(16).slice(2)}`;
@@ -32,7 +34,10 @@ export class PaymentPipelineEngine {
       idempotencyKey: txn.idempotencyKey,
     });
     try {
-      const result = await this.opts.idempotency.dedupe(txn.idempotencyKey, async () => {
+      const fingerprint = createHash("sha256")
+        .update(canonicalTransactionPayload(txn), "utf8")
+        .digest("hex");
+      const result = await this.opts.idempotency.dedupe(txn.idempotencyKey, fingerprint, async () => {
         const ctx = createPaymentContext(randomId(), randomId(), txn, this.opts.outbox);
         const root = withSpan(this.opts.tracer, "payment_pipeline", this.opts.pipeline);
         await root(ctx);
