@@ -852,6 +852,8 @@ The repository now includes a built-in Node test command with focused tests for 
 
 On 2026-08-30, GitHub Actions CI was added with a PostgreSQL 16 service container. Every push to `main` and every pull request now runs dependency installation, TypeScript compilation, unit tests, migration checks, shared PostgreSQL rate-limit checks, and durable PostgreSQL idempotency checks. CI uses isolated test keys and database records and does not require project secrets.
 
+The first CI run also identified and corrected a clean-install migration ordering defect: foreign keys are now created only after every referenced table exists. This keeps upgrades safe for existing installations while ensuring a brand-new PostgreSQL database can initialize successfully.
+
 ## Shared Rate-Limit Hardening
 
 On 2026-08-30, durable PostgreSQL-backed rate limiting was added for database-backed deployments. Login, authorization, execution, token issuance, and synchronization now use a database bucket protected by row-level locking, so the quota is shared across warm instances instead of being limited to one process. Memory rate limiting remains available only for local development without PostgreSQL.
