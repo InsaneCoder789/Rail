@@ -141,10 +141,12 @@ export function requireJsonContentType(
   return false;
 }
 
-export function getClientIp(req: http.IncomingMessage): string {
-  const forwarded = normalizeHeaderValue(req.headers["x-forwarded-for"]);
-  if (forwarded) {
-    return forwarded.split(",")[0].trim();
+export function getClientIp(req: http.IncomingMessage, trustProxyHeaders = false): string {
+  if (trustProxyHeaders) {
+    const realIp = normalizeHeaderValue(req.headers["x-real-ip"]);
+    if (realIp) return realIp.trim();
+    const forwarded = normalizeHeaderValue(req.headers["x-forwarded-for"]);
+    if (forwarded) return forwarded.split(",")[0].trim();
   }
   const remote = req.socket.remoteAddress;
   return remote && remote.length > 0 ? remote : "unknown";
@@ -201,8 +203,9 @@ export async function applyRateLimit(args: {
   limit: number;
   windowMs: number;
   discriminator?: string;
+  trustProxyHeaders?: boolean;
 }): Promise<void> {
-  const key = `${args.scope}:${getClientIp(args.req)}:${args.discriminator ?? "anon"}`;
+  const key = `${args.scope}:${getClientIp(args.req, args.trustProxyHeaders)}:${args.discriminator ?? "anon"}`;
   const decision = await args.rateLimiter.consume(key, args.limit, args.windowMs);
 
   args.res.setHeader("X-RateLimit-Limit", String(decision.limit));

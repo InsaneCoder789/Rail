@@ -144,6 +144,7 @@ export async function handlePaymentRoutes(
       limit: context.config.rateLimits.authorizeMax,
       windowMs: context.config.rateLimits.authorizeWindowMs,
       discriminator: authenticatedWallet,
+      trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     const authorization = await createAuthorization({
@@ -179,6 +180,7 @@ export async function handlePaymentRoutes(
       limit: context.config.rateLimits.tokenIssueMax,
       windowMs: context.config.rateLimits.tokenIssueWindowMs,
       discriminator: `${parsed.walletId}:${parsed.deviceId}`,
+      trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     const row = await context.offlineTokenStore.issue({
@@ -242,6 +244,7 @@ export async function handlePaymentRoutes(
       limit: context.config.rateLimits.executeMax,
       windowMs: context.config.rateLimits.executeWindowMs,
       discriminator: authenticatedWallet,
+      trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     await prepareAuthorizedTransaction(txn, context);
@@ -286,6 +289,7 @@ export async function handlePaymentRoutes(
       limit: context.config.rateLimits.syncMax,
       windowMs: context.config.rateLimits.syncWindowMs,
       discriminator: parsed.deviceId,
+      trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     const txns: PaymentTransaction[] = [];

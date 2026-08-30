@@ -6,11 +6,11 @@ import type { OutboxRelay, OutboxWriter } from "./outbox.js";
 import type { Tracer } from "./tracing.js";
 import { withSpan } from "./middleware.js";
 import type { Stage } from "./stage.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
 
 function randomId(): string {
-  return `${Date.now().toString(16)}_${Math.random().toString(16).slice(2)}`;
+  return randomUUID();
 }
 
 export interface PaymentPipelineEngineOptions {

@@ -13,6 +13,7 @@ export interface ServerConfig {
   readonly serverless: boolean;
   readonly dbPoolMax: number;
   readonly disableSse: boolean;
+  readonly trustProxyHeaders: boolean;
   readonly apiKey: string;
   readonly apiKeyScopes: readonly string[];
   readonly allowedOrigins: readonly string[];
@@ -81,6 +82,7 @@ export function loadServerConfig(): ServerConfig {
     serverless,
     dbPoolMax: resolvePositiveIntEnv("RAIL_DB_POOL_MAX", serverless ? 5 : 20),
     disableSse: process.env.RAIL_DISABLE_SSE === "true" || serverless,
+    trustProxyHeaders: process.env.RAIL_TRUST_PROXY_HEADERS === "true" || serverless,
     apiKey: process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "",
     apiKeyScopes: resolveApiKeyScopes(),
     allowedOrigins,

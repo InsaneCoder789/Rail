@@ -23,6 +23,7 @@ export async function handleAuthRoutes(
       limit: context.config.rateLimits.loginMax,
       windowMs: context.config.rateLimits.loginWindowMs,
       discriminator: String(body?.userId ?? ""),
+      trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     if (!context.pool) {
@@ -81,6 +82,7 @@ export async function handleAuthRoutes(
       limit: context.config.rateLimits.loginMax,
       windowMs: context.config.rateLimits.loginWindowMs,
       discriminator: String(body?.userId ?? ""),
+      trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     if (!context.pool) {

@@ -855,3 +855,7 @@ On 2026-08-30, durable PostgreSQL-backed rate limiting was added for database-ba
 ## Privileged API Scope Hardening
 
 On 2026-08-30, privileged offline routes were separated by explicit API-key scopes. Offline-token issuance requires `offline_tokens:issue`, while reconnect synchronization requires `sync:write`. The scopes are configured through `RAIL_API_KEY_SCOPES`, documented in the environment example and deployment guide, and denied with `403` when the configured key is not authorized for a route.
+
+## Proxy Identity and Runtime Identifier Hardening
+
+On 2026-08-30, rate-limit client identity handling was made explicit. Forwarded IP headers are used only when the deployment is configured to trust a sanitizing proxy; local direct requests use the socket address, preventing arbitrary clients from choosing their own rate-limit identity. The engine also uses cryptographically secure UUIDs for trace and correlation identifiers instead of `Math.random()`.

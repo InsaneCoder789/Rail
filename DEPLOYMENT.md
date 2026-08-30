@@ -21,6 +21,7 @@ JWT_SECRET=<long-random-jwt-secret>
 RAIL_ALLOWED_ORIGINS=https://your-frontend.example
 RAIL_REQUIRE_JSON_CONTENT_TYPE=true
 RAIL_EXPOSE_INTERNAL_ERRORS=false
+RAIL_TRUST_PROXY_HEADERS=true
 ```
 
 Use separate values for Preview and Development. Never upload `.env` or copy real secrets into `.env_example`.
@@ -62,6 +63,7 @@ The authorization expiry sweep uses an interval in a warm process. Hosted produc
 - Use a random API key and separate secrets for each environment.
 - Configure only the scopes required by the deployment; token issuance and synchronization are checked independently.
 - Set `RAIL_ALLOWED_ORIGINS` to exact frontend origins; do not use `*`.
+- Trust forwarded client-IP headers only when the hosting proxy is known to sanitize them.
 - Keep `RAIL_EXPOSE_INTERNAL_ERRORS=false` in production.
 - Do not use API keys in query strings for ordinary API calls.
 - Rotate secrets if they are ever printed, committed, or shared.
