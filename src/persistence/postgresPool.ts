@@ -1,9 +1,9 @@
 import { Pool } from "pg";
 
-export function createPool(connectionString: string): Pool {
+export function createPool(connectionString: string, max = 20): Pool {
   const pool = new Pool({
     connectionString,
-    max: 20,
+    max,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
   });

@@ -794,3 +794,20 @@ The next stage of the project should not be random expansion. It should be conso
 - make the infrastructure less temporary
 
 Once those foundations are in place, the project will be in a much better position for demonstration, extension, and production-style hardening.
+
+## Deployment and Runtime Hardening
+
+On 2026-08-30, the first critical-risk hardening category was implemented for deployment and runtime safety.
+
+The server now exposes reusable `createServerContext` and `handleRequest` functions. Local execution still uses `src/server/server.ts` as the operating entrypoint, but importing the module no longer starts an HTTP listener. This makes the same routing system safe to load from the Vercel function at `api/index.ts`.
+
+Hosted serverless execution no longer runs schema migrations or the authorization expiry interval during request-context initialization. Database migrations and outbox schema creation are now available through the explicit `npm run migrate` release command. This makes database initialization a controlled deployment step instead of a competing cold-start operation.
+
+The PostgreSQL pool now supports a configurable maximum and defaults to a smaller pool in serverless mode. SSE is explicitly disabled in serverless mode because instance-local connections cannot provide a durable cross-instance stream; hosted consumers should use the authenticated event polling endpoint until shared event delivery is introduced.
+
+Verification completed for this category:
+
+- TypeScript build passes with `npm run build`.
+- The local and Vercel entrypoints share the same request handler.
+- Importing the server module no longer automatically calls `bootstrap`.
+- Database migration execution is separated from hosted request initialization.

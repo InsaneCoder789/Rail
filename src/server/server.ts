@@ -1,12 +1,9 @@
 import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 import http from "node:http";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-dotenv.config({ path: join(__dirname, "../../.env") });
+import process from "node:process";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+dotenv.config();
 
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
 import { PaymentPipelineEngine } from "../pipeline/engine.js";
@@ -15,7 +12,7 @@ import { MemoryOutbox } from "../pipeline/outbox.js";
 import { consoleTracer } from "../pipeline/tracing.js";
 import { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import { PostgresOfflineTokenStore } from "../persistence/postgresOfflineTokenStore.js";
-import { runMigrations } from "../persistence/migrate.js";
+import { ensureOutboxSchema, runMigrations } from "../persistence/migrate.js";
 import { createPool } from "../persistence/postgresPool.js";
 import { OfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { buildHardenedPaymentPipeline, initLedger } from "../stages/paymentPipeline.js";
@@ -34,7 +31,10 @@ import type { ServerContext, ServerIdempotencyStore } from "./types.js";
 
 const tracer = consoleTracer("[rail]");
 
-async function bootstrap(): Promise<void> {
+export async function createServerContext(options: {
+  initializeDatabase?: boolean;
+  startBackgroundJobs?: boolean;
+} = {}): Promise<ServerContext> {
   const config = loadServerConfig();
   const databaseUrl = process.env.DATABASE_URL;
   let pool = null;
@@ -42,40 +42,35 @@ async function bootstrap(): Promise<void> {
   let idempotency: ServerIdempotencyStore;
 
   if (databaseUrl) {
-    pool = createPool(databaseUrl);
-    await runMigrations(pool);
+    pool = createPool(databaseUrl, config.dbPoolMax);
+    const initializeDatabase = options.initializeDatabase ?? !config.serverless;
+    const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
 
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS outbox (
-        id BIGSERIAL PRIMARY KEY,
-        type TEXT NOT NULL,
-        payload JSONB NOT NULL,
-        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_outbox_occurred_at_desc
-      ON outbox (occurred_at DESC);
-    `);
+    if (initializeDatabase) {
+      await runMigrations(pool);
+      await ensureOutboxSchema(pool);
+    }
 
     initAuthorizationWallet(pool);
-    const releasedCount = await releaseExpiredAuthorizations().catch((err) => {
-      console.error("authorization_sweep_failed", err);
-      return 0;
-    });
-    if (releasedCount > 0) {
-      console.log(`Rail: released ${releasedCount} expired authorization reservations`);
-    }
-    setInterval(() => {
-      void releaseExpiredAuthorizations().catch((err) => {
+    if (startBackgroundJobs) {
+      const releasedCount = await releaseExpiredAuthorizations().catch((err) => {
         console.error("authorization_sweep_failed", err);
+        return 0;
       });
-    }, config.authSweepIntervalMs).unref();
+      if (releasedCount > 0) {
+        console.log(`Rail: released ${releasedCount} expired authorization reservations`);
+      }
+      setInterval(() => {
+        void releaseExpiredAuthorizations().catch((err) => {
+          console.error("authorization_sweep_failed", err);
+        });
+      }, config.authSweepIntervalMs).unref();
+    }
 
     initLedger(pool);
     offlineTokenStore = new PostgresOfflineTokenStore(pool);
     idempotency = new PostgresIdempotencyStore(pool);
-    console.log("Rail: PostgreSQL persistence enabled (DATABASE_URL)");
+    console.log(`Rail: PostgreSQL persistence enabled (pool max ${config.dbPoolMax})`);
   } else {
     offlineTokenStore = new OfflineTokenStore();
     idempotency = new MemoryIdempotencyStore();
@@ -93,7 +88,7 @@ async function bootstrap(): Promise<void> {
     relay: (event) => eventStore.insertOutboxEvent(event),
   });
 
-  const context: ServerContext = {
+  return {
     config,
     pool,
     databaseUrl,
@@ -108,9 +103,15 @@ async function bootstrap(): Promise<void> {
     eventStore,
   };
 
-  const server = http.createServer(async (req, res) => {
+}
+
+export async function handleRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  context: ServerContext,
+): Promise<void> {
     try {
-      applyCors(req, res, config.allowedOrigins);
+      applyCors(req, res, context.config.allowedOrigins);
 
       if (req.method === "OPTIONS") {
         res.writeHead(200);
@@ -123,13 +124,13 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
-      const url = new URL(req.url, `http://127.0.0.1:${config.port}`);
+      const url = new URL(req.url, `http://127.0.0.1:${context.config.port}`);
 
       if (req.method === "GET" && url.pathname === "/health") {
         json(res, 200, {
           ok: true,
           service: "rail",
-          persistence: databaseUrl ? "postgresql" : "memory",
+          persistence: context.databaseUrl ? "postgresql" : "memory",
           offline: {
             tokenIssue: "POST /v1/offline/tokens/issue",
             execute: "POST /v1/payments/execute",
@@ -161,7 +162,7 @@ async function bootstrap(): Promise<void> {
         });
       }
 
-      const mapped = toErrorResponse(err, config.exposeInternalErrors);
+      const mapped = toErrorResponse(err, context.config.exposeInternalErrors);
       if (err instanceof RateLimitError) {
         res.setHeader("Retry-After", String(err.retryAfterSeconds));
         res.setHeader("X-RateLimit-Limit", String(err.limit));
@@ -169,17 +170,25 @@ async function bootstrap(): Promise<void> {
       }
       json(res, mapped.status, mapped.body);
     }
+}
+
+async function bootstrap(): Promise<void> {
+  const context = await createServerContext();
+  const server = http.createServer((req, res) => {
+    void handleRequest(req, res, context);
   });
 
-  server.listen(config.port, () => {
-    console.log(`Rail listening on http://0.0.0.0:${config.port}`);
-    if (config.apiKey) {
+  server.listen(context.config.port, () => {
+    console.log(`Rail listening on http://0.0.0.0:${context.config.port}`);
+    if (context.config.apiKey) {
       console.log("API key authentication: enabled (RAIL_API_KEY or KYLR_API_KEY)");
     } else {
       console.warn("API key authentication: not configured; offline token and sync routes will fail closed");
     }
-    console.log(`Request body limit: ${config.maxRequestBodyBytes} bytes`);
+    console.log(`Request body limit: ${context.config.maxRequestBodyBytes} bytes`);
   });
 }
 
-void bootstrap();
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  void bootstrap();
+}

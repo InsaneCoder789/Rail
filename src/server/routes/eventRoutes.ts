@@ -9,6 +9,14 @@ export async function handleEventRoutes(
   context: ServerContext,
 ): Promise<boolean> {
   if (req.method === "GET" && url.pathname === "/v1/events/stream") {
+    if (context.config.disableSse) {
+      json(res, 501, {
+        error: "event_stream_unavailable",
+        hint: "use GET /v1/events for hosted serverless runtimes",
+      });
+      return true;
+    }
+
     const viewer = {
       walletId: await context.authResolver.resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
     };

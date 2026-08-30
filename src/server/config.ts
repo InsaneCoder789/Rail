@@ -10,6 +10,9 @@ function resolvePositiveIntEnv(name: string, fallback: number): number {
 
 export interface ServerConfig {
   readonly port: number;
+  readonly serverless: boolean;
+  readonly dbPoolMax: number;
+  readonly disableSse: boolean;
   readonly apiKey: string;
   readonly allowedOrigins: readonly string[];
   readonly maxRequestBodyBytes: number;
@@ -49,8 +52,13 @@ function resolveAllowedOrigins(): string[] {
 }
 
 export function loadServerConfig(): ServerConfig {
+  const serverless = process.env.VERCEL === "1" || process.env.RAIL_RUNTIME === "serverless";
+
   return {
     port: Number(process.env.PORT ?? 8787),
+    serverless,
+    dbPoolMax: resolvePositiveIntEnv("RAIL_DB_POOL_MAX", serverless ? 5 : 20),
+    disableSse: process.env.RAIL_DISABLE_SSE === "true" || serverless,
     apiKey: process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "",
     allowedOrigins: resolveAllowedOrigins(),
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),

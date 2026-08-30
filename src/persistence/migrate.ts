@@ -129,3 +129,18 @@ export async function runMigrations(pool: Pool): Promise<void> {
     client.release();
   }
 }
+
+export async function ensureOutboxSchema(pool: Pool): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS outbox (
+      id BIGSERIAL PRIMARY KEY,
+      type TEXT NOT NULL,
+      payload JSONB NOT NULL,
+      occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_outbox_occurred_at_desc
+    ON outbox (occurred_at DESC);
+  `);
+}
