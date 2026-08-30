@@ -41,6 +41,10 @@ export class OfflineTokenStore implements IOfflineTokenStore {
   private readonly tokens = new Map<string, IssuedOfflineToken>();
   private readonly mutex = new AsyncMutex();
 
+  private cloneToken(token: IssuedOfflineToken): IssuedOfflineToken {
+    return { ...token };
+  }
+
   async issue(input: IssueOfflineTokenInput): Promise<IssuedOfflineToken> {
     return this.mutex.runExclusive(async () => {
       if (input.amountCapMinor <= 0) {
@@ -60,7 +64,7 @@ export class OfflineTokenStore implements IOfflineTokenStore {
         expiresAtMs: issuedAtMs + ttlMs,
       };
       this.tokens.set(tokenId, row);
-      return row;
+      return this.cloneToken(row);
     });
   }
 
@@ -133,6 +137,7 @@ export class OfflineTokenStore implements IOfflineTokenStore {
   }
 
   async getToken(tokenId: string): Promise<IssuedOfflineToken | undefined> {
-    return this.tokens.get(tokenId);
+    const token = this.tokens.get(tokenId);
+    return token ? this.cloneToken(token) : undefined;
   }
 }

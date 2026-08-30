@@ -65,6 +65,20 @@ test("enforces offline token device binding and restores rolled-back headroom", 
   assert.equal((await store.getToken(token.tokenId)).remainingMinor, 5000);
 });
 
+test("does not expose mutable offline token state", async () => {
+  const store = new OfflineTokenStore();
+  const token = await store.issue({ walletId: "wallet_sender", deviceId: "device_a", amountCapMinor: 5000 });
+  token.remainingMinor = 0;
+  token.walletId = "attacker_wallet";
+
+  const stored = await store.getToken(token.tokenId);
+  assert.equal(stored?.remainingMinor, 5000);
+  assert.equal(stored?.walletId, "wallet_sender");
+
+  stored.remainingMinor = 1;
+  assert.equal((await store.getToken(token.tokenId)).remainingMinor, 5000);
+});
+
 test("uses trusted proxy headers only when explicitly enabled", () => {
   const request = { headers: { "x-forwarded-for": "203.0.113.10" }, socket: { remoteAddress: "127.0.0.1" } };
   assert.equal(getClientIp(request), "127.0.0.1");

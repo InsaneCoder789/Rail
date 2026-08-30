@@ -854,7 +854,9 @@ On 2026-08-30, GitHub Actions CI was added with a PostgreSQL 16 service containe
 
 The first CI run also identified and corrected a clean-install migration ordering defect: foreign keys are now created only after every referenced table exists. This keeps upgrades safe for existing installations while ensuring a brand-new PostgreSQL database can initialize successfully.
 
-Six additional hardening tests were added for authorization-signature tampering, transaction-HMAC tampering, offline device binding and rollback, trusted proxy identity, configured-origin CORS behavior, and retryable versus terminal failures. The GitHub workflow now executes these together with the existing seven tests.
+Six additional hardening tests were added for authorization-signature tampering, transaction-HMAC tampering, offline device binding and rollback, trusted proxy identity, configured-origin CORS behavior, and retryable versus terminal failures. A seventh regression test verifies that callers cannot mutate the in-memory offline-token state through returned objects. The GitHub workflow runs the full suite and invokes the hardening test file explicitly so this security coverage is visible as its own CI step.
+
+The in-memory offline-token store now returns defensive copies from token issuance and reads. This prevents accidental or malicious mutation of token headroom, wallet ownership, or device binding outside the store's validation and mutex-protected operations.
 
 ## Shared Rate-Limit Hardening
 
