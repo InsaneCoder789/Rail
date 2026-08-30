@@ -1,0 +1,50 @@
+name: Rail CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rail
+          POSTGRES_PASSWORD: rail_ci_password
+          POSTGRES_DB: rail
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rail -d rail"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://rail:rail_ci_password@localhost:5432/rail
+      JWT_SECRET: ci_jwt_secret_012345678901234567890123456789
+      RAIL_SIGNING_SECRET: ci_signing_secret_012345678901234567890123456789
+      RAIL_API_KEY: ci_api_key_012345678901234567890123456789
+      RAIL_API_KEY_SCOPES: offline_tokens:issue,sync:write
+      RAIL_ALLOWED_ORIGINS: http://localhost:3000
+      RAIL_RUNTIME: serverless
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build and run tests
+        run: npm test
