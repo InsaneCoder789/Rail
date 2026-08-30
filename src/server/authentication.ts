@@ -34,16 +34,6 @@ function resolveBearerToken(req: http.IncomingMessage): string | undefined {
   return undefined;
 }
 
-function resolveBearerTokenFromUrl(url: URL): string | undefined {
-  const token = url.searchParams.get("access_token");
-  return token && token.length > 0 ? token : undefined;
-}
-
-function resolveApiKeyFromUrl(url: URL): string | undefined {
-  const key = url.searchParams.get("api_key");
-  return key && key.length > 0 ? key : undefined;
-}
-
 async function getWalletFromApiKey(pool: Pool, apiKey: string): Promise<string> {
   const apiKeyHash = createHash("sha256").update(apiKey, "utf8").digest("hex");
   const res = await pool.query(
@@ -82,13 +72,13 @@ export function createAuthResolver(args: {
         throw new Error("DB_NOT_INITIALIZED");
       }
 
-      const bearer = resolveBearerToken(req) ?? (options?.allowQueryCredentials && url ? resolveBearerTokenFromUrl(url) : undefined);
+      const bearer = resolveBearerToken(req);
       if (bearer) {
         const decoded = verifyToken(bearer);
         return getWalletFromUser(pool, decoded.userId);
       }
 
-      const apiKey = resolveApiKeyHeader(req) ?? (options?.allowQueryCredentials && url ? resolveApiKeyFromUrl(url) : undefined);
+      const apiKey = resolveApiKeyHeader(req);
       if (apiKey) {
         return getWalletFromApiKey(pool, apiKey);
       }

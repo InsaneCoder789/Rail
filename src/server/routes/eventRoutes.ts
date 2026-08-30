@@ -18,7 +18,7 @@ export async function handleEventRoutes(
     }
 
     const viewer = {
-      walletId: await context.authResolver.resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
+      walletId: await context.authResolver.resolveAuthenticatedWallet(req, url),
     };
 
     const allowedOrigin = resolveAllowedOrigin(req, context.config.allowedOrigins);
@@ -62,7 +62,7 @@ export async function handleEventRoutes(
     try {
       applyCors(req, res, context.config.allowedOrigins);
       const viewer = {
-        walletId: await context.authResolver.resolveAuthenticatedWallet(req, url, { allowQueryCredentials: true }),
+        walletId: await context.authResolver.resolveAuthenticatedWallet(req, url),
       };
       const events = await context.eventStore.listVisibleEvents(viewer, 20);
       json(res, 200, { events });

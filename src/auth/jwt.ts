@@ -20,8 +20,12 @@ export function generateToken(userId: string) {
 }
 
 export function verifyToken(token: string): { userId: string } {
-  return jwt.verify(token, getJwtSecret(), {
+  const decoded = jwt.verify(token, getJwtSecret(), {
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
-  }) as { userId: string };
+  });
+  if (!decoded || typeof decoded !== "object" || typeof decoded.userId !== "string" || decoded.userId.length === 0) {
+    throw new Error("JWT_INVALID_CLAIMS");
+  }
+  return { userId: decoded.userId };
 }

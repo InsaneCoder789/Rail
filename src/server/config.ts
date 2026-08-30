@@ -53,6 +53,21 @@ function resolveAllowedOrigins(): string[] {
 
 export function loadServerConfig(): ServerConfig {
   const serverless = process.env.VERCEL === "1" || process.env.RAIL_RUNTIME === "serverless";
+  const isProduction = process.env.NODE_ENV === "production";
+  const allowedOrigins = resolveAllowedOrigins();
+  const jwtSecret = process.env.JWT_SECRET ?? "";
+  const signingSecret = process.env.RAIL_SIGNING_SECRET ?? "";
+
+  if (isProduction) {
+    if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_IN_PRODUCTION");
+    if (!process.env.RAIL_API_KEY && !process.env.KYLR_API_KEY) throw new Error("RAIL_API_KEY_REQUIRED_IN_PRODUCTION");
+    if (jwtSecret.length < 32 || signingSecret.length < 32) {
+      throw new Error("PRODUCTION_SECRETS_MUST_BE_AT_LEAST_32_CHARACTERS");
+    }
+    if (allowedOrigins.length === 0 || allowedOrigins.some((origin) => origin.includes("localhost") || origin.includes("127.0.0.1"))) {
+      throw new Error("PRODUCTION_ALLOWED_ORIGINS_MUST_USE_DEPLOYED_FRONTENDS");
+    }
+  }
 
   return {
     port: Number(process.env.PORT ?? 8787),
@@ -60,7 +75,7 @@ export function loadServerConfig(): ServerConfig {
     dbPoolMax: resolvePositiveIntEnv("RAIL_DB_POOL_MAX", serverless ? 5 : 20),
     disableSse: process.env.RAIL_DISABLE_SSE === "true" || serverless,
     apiKey: process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "",
-    allowedOrigins: resolveAllowedOrigins(),
+    allowedOrigins,
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),
     maxSyncBatchSize: resolvePositiveIntEnv("RAIL_MAX_SYNC_BATCH_SIZE", 100),
     exposeInternalErrors: process.env.RAIL_EXPOSE_INTERNAL_ERRORS === "true",

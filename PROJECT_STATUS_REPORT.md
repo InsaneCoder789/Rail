@@ -829,3 +829,9 @@ Verification completed for this category:
 - TypeScript build passes with `npm run build`.
 - Database migrations complete with `npm run migrate`.
 - Memory idempotency behavior was checked for same-key reuse, mismatched fingerprints, and retry after failure.
+
+## Security Hardening Follow-up
+
+On 2026-08-30, the next security category removed credentials from event query strings and made JWT claim validation explicit. Event access now requires request headers, reducing exposure through browser history, access logs, referrer data, and monitoring systems. JWT verification now rejects validly signed tokens whose payload does not contain a non-empty string `userId`.
+
+Production configuration now fails closed when PostgreSQL, the server API key, sufficiently strong JWT/signing secrets, or deployed frontend origins are missing. Local development keeps its documented localhost defaults, while production cannot silently fall back to development origins.
