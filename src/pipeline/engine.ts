@@ -44,7 +44,7 @@ export class PaymentPipelineEngine {
         if (!ctx.result) {
           throw new Error("invariant_broken:missing_result");
         }
-        this.flushOutboxRelay(this.opts.relay);
+        await this.flushOutboxRelay(this.opts.relay);
         return ctx.result;
       });
       span.end("ok", { status: result.status });
@@ -61,9 +61,9 @@ export class PaymentPipelineEngine {
   }
 
   /** Simulate Kafka relay / bridge worker that publishes drained outbox events. */
-  flushOutboxRelay(relay?: OutboxRelay): void {
+  async flushOutboxRelay(relay?: OutboxRelay): Promise<void> {
     for (const evt of this.opts.outbox.drain()) {
-      void relay?.(evt);
+      await relay?.(evt);
     }
   }
 }

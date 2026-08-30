@@ -150,16 +150,12 @@ export async function handleRequest(
         return;
       }
 
-      json(res, 200, { status: "success" });
+      throw new RequestError(404, "not_found", "route not found");
     } catch (err) {
       console.error("request_failed", err);
 
-      context.eventStore.emitSystemError(err);
-      if (err instanceof RequestError) {
-        context.eventStore.emitSystemError({
-          name: err.code,
-          message: err.message,
-        });
+      if (!(err instanceof RequestError)) {
+        context.eventStore.emitSystemError(err);
       }
 
       const mapped = toErrorResponse(err, context.config.exposeInternalErrors);
