@@ -38,6 +38,8 @@ Use it in the following ways:
 
 ## Latest Status
 
+Concurrency hardening reserves semaphore slots during FIFO handoff, makes release idempotent and bounds queued work. Retry cancellation now rejects already-aborted work, stops after abort and removes delay listeners on completion. Regression tests cover newcomer races, queue overflow, cancellation and listener cleanup. Timeout propagation across payment commits remains a separate open item.
+
 Authorization hardening now checks sender, receiver, amount and currency in the transactional claim used by the engine. Transaction-scoped locking also serializes concurrent issuance for a previously absent transaction ID. PostgreSQL regression coverage confirms eight simultaneous retries return the same authorization and reserve exactly once. Crash recovery and serverless expiry remain tracked separately until their tests pass.
 
 On 8 October 2026, upgrade work began. At the owner's direction, the initial commits were moved to `main` and the temporary Codex branch was removed. All subsequent fixes use small descriptive commits directly on `main`; additional ML development is deferred until the security and correctness backlog is resolved. The original offline-capable payment flow remains the foundation. Current findings, fixed issues and release gates are tracked in [SECURITY_REVIEW.md](./SECURITY_REVIEW.md). Earlier phase descriptions remain historical records, not a claim that every financial-system safeguard is complete.
