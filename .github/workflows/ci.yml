@@ -2,7 +2,7 @@ name: Rail CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/rail-v2-*']
   pull_request:
     branches: [main]
 
@@ -50,3 +50,5 @@ jobs:
         run: npm test
       - name: Run hardening tests explicitly
         run: node --test test/hardening.test.js
+      - name: Verify V2 security, ML and audit commitments
+        run: node --test test/authRoutes.test.js test/risk.test.js test/auditCommitment.test.js

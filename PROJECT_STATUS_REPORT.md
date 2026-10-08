@@ -44,6 +44,8 @@ The first V2 security pass prevents registration from claiming existing wallets,
 
 The V2 ML baseline now implements trainable logistic regression, artifact/provenance validation, held-out evaluation and optional shadow observations. The transaction-ID-based placeholder has been removed. No real fraud dataset or default model is supplied, and there is no enforced fraud policy. Observations cannot override authorization, wallet or token checks. See [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for dataset format, metrics and deployment instructions.
 
+V2 also adds salted SHA-256 transaction commitments, batch-count-bound Merkle roots and inclusion proof verification. Tampering tests cover changed amounts, proof indices, batch counts and malformed proofs. These are standalone audit primitives; durable audit records, an anchoring worker and blockchain deployment remain future phases. No private payment records are published on-chain. The complete suite passes 26 tests locally, including four PostgreSQL integration tests. CI covers the V2 branch and exposes the new security, ML and audit tests explicitly.
+
 Phase 1 transaction-safety changes have now been implemented in the codebase.
 
 The major improvements completed in this phase are:

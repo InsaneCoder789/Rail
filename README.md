@@ -196,6 +196,8 @@ flowchart TD
 
 Version 2 development is on `codex/rail-v2-foundation`. This branch includes security regression fixes and an optional, trainable ML baseline in shadow mode. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
 
+Salted Merkle commitments and inclusion proofs provide a tested foundation for future audit anchoring. Blockchain publication and durable audit storage are not yet implemented.
+
 The project has already gone through several important improvements:
 
 - Phase 1 introduced persisted authorization lifecycle management and transactional reserve-plus-issue behavior.
