@@ -1,6 +1,6 @@
 # Rail V2 Security Review
 
-Review date: 8 October 2026. Baseline: `80e09e4`. Upgrade branch: `codex/rail-v2-foundation`.
+Review date: 8 October 2026. Baseline: `80e09e4`. Active development branch: `main`.
 
 This is a source review and regression record, not a penetration-test certification. Runtime source, API entrypoint, persistence schema, workflow and tests were examined. Root documents and deliverables were inventoried; selected architecture documents were checked for drift. Archived ZIPs and rendered diagrams have not received a fresh visual review. No production deployment or provider sandbox was tested.
 

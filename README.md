@@ -194,7 +194,7 @@ flowchart TD
 
 ## Project Status
 
-Version 2 development is on `codex/rail-v2-foundation`. This branch includes security regression fixes and an optional, trainable ML baseline in shadow mode. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
+Security and correctness development continues directly on `main`. ML expansion is deferred; the existing optional baseline runs only in shadow mode when explicitly configured. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
 
 Salted Merkle commitments and inclusion proofs provide a tested foundation for future audit anchoring. Blockchain publication and durable audit storage are not yet implemented.
 

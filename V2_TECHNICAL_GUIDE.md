@@ -1,6 +1,6 @@
 # Rail V2 Foundation
 
-Implemented on `codex/rail-v2-foundation`, starting 8 October 2026. This document describes working modules and their limits. The complete platform roadmap remains in the ignored private scope file. [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) tracks the remaining defects.
+Development continues directly on `main`, starting 8 October 2026. Security and correctness fixes take priority; further ML development is deferred. This document describes existing modules and their limits. The complete platform roadmap remains in the ignored private scope file. [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) tracks the remaining defects.
 
 ## Payment behavior
 

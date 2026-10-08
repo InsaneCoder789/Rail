@@ -38,7 +38,7 @@ Use it in the following ways:
 
 ## Latest Status
 
-On 8 October 2026, version 2 began on `codex/rail-v2-foundation`. The original offline-capable payment flow remains the foundation. Current findings, fixed issues and release gates are tracked in [SECURITY_REVIEW.md](./SECURITY_REVIEW.md). Earlier phase descriptions below remain historical records, not a claim that every financial-system safeguard is complete.
+On 8 October 2026, upgrade work began. At the owner's direction, the initial commits were moved to `main` and the temporary Codex branch was removed. All subsequent fixes use small descriptive commits directly on `main`; additional ML development is deferred until the security and correctness backlog is resolved. The original offline-capable payment flow remains the foundation. Current findings, fixed issues and release gates are tracked in [SECURITY_REVIEW.md](./SECURITY_REVIEW.md). Earlier phase descriptions remain historical records, not a claim that every financial-system safeguard is complete.
 
 The first V2 security pass prevents registration from claiming existing wallets, applies login/registration limits across usernames per IP, validates JSON object boundaries and enforces bcrypt's 72-byte password limit. Existing oversized passwords need a reset policy rather than silently changing hashes. Tests exercise wallet ownership against PostgreSQL, rotating usernames and invalid/multibyte inputs.
 
