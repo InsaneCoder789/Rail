@@ -9,7 +9,7 @@ import { Readable } from "node:stream";
 import { handleAuthRoutes } from "../dist/server/routes/authRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { SlidingWindowRateLimiter } from "../dist/server/http.js";
-import { createAuthorization, claimAuthorizationForExecution, getAuthorizationById, releaseExpiredAuthorizations, reserveFunds, creditWallet, releaseReservation } from "../dist/stages/authorizationStage.js";
+import { createAuthorization, claimAuthorizationForExecution, getAuthorizationById, releaseExpiredAuthorizations, reserveFunds, consumeReservation, creditWallet, releaseReservation } from "../dist/stages/authorizationStage.js";
 import { buildHardenedPaymentPipeline } from "../dist/stages/paymentPipeline.js";
 import { PaymentPipelineEngine } from "../dist/pipeline/engine.js";
 import { MemoryDeadLetterQueue } from "../dist/pipeline/dlq.js";
@@ -195,14 +195,19 @@ test("concurrent authorization retries reserve once and reject mismatched engine
 
 async function paymentFixture(work) {
   // A single connection proves that execution never nests another checkout.
-  const pool = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 1000 });
   const suffix = crypto.randomUUID();
+  const schema = `ci_payment_${suffix.replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 1000, options: `-c search_path=${schema}` });
   const sender = `ci_sender_${suffix}`;
   const receiver = `ci_receiver_${suffix}`;
   const txId = `ci_payment_${suffix}`;
   const previousSecret = process.env.RAIL_SIGNING_SECRET;
   process.env.RAIL_SIGNING_SECRET = previousSecret || "integration_test_signing_secret_0123456789";
   try {
+    await runMigrations(pool);
+    await ensureOutboxSchema(pool);
     await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ($1, 10000), ($2, 0)", [sender, receiver]);
     const auth = await createAuthorization({ txId, senderWalletId: sender, receiverWalletId: receiver, amountMinor: 2500, currency: "INR" }, pool);
     const tokens = new PostgresOfflineTokenStore(pool);
@@ -216,16 +221,9 @@ async function paymentFixture(work) {
     });
     await work({ pool, txn, auth, tokens, token, store, makeEngine });
   } finally {
-    await pool.query("DELETE FROM outbox WHERE payload->>'txId' = $1", [txId]);
-    await pool.query("DELETE FROM rail_idempotency WHERE idempotency_key LIKE $1", [`ci_idem_${suffix}%`]);
-    await pool.query("DELETE FROM rail_payment_executions WHERE tx_id = $1", [txId]);
-    await pool.query("DELETE FROM ledger_entries WHERE tx_id = $1", [txId]);
-    await pool.query("DELETE FROM authorization_usage WHERE tx_id = $1", [txId]);
-    await pool.query("DELETE FROM authorizations WHERE tx_id = $1", [txId]);
-    await pool.query("DELETE FROM rail_offline_spends WHERE token_id IN (SELECT token_id FROM rail_offline_tokens WHERE wallet_id = $1)", [sender]);
-    await pool.query("DELETE FROM rail_offline_tokens WHERE wallet_id = $1", [sender]);
-    await pool.query("DELETE FROM wallets WHERE wallet_id = ANY($1::text[])", [[sender, receiver]]);
     await pool.end();
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
     if (previousSecret === undefined) delete process.env.RAIL_SIGNING_SECRET;
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
   }
@@ -273,6 +271,78 @@ test("payment, token usage, ledger, events and replay result commit atomically w
     assert.equal(Number(wallets.rows.find((row) => row.wallet_id === txn.senderWalletId).reserved), 0);
     assert.equal(Number(wallets.rows.find((row) => row.wallet_id === txn.receiverWalletId).balance), 2500);
     assert.equal((await pool.query("SELECT * FROM rail_payment_executions WHERE tx_id = $1", [txn.txId])).rowCount, 1);
+  });
+});
+
+test("database commit guards reject incomplete or mismatched payments and roll back money", { skip: !databaseUrl }, async () => {
+  for (const fault of ["one_entry", "wrong_currency", "wrong_receiver", "wrong_amount", "missing_execution", "missing_usage", "unused_authorization", "wrong_replay"]) {
+    await paymentFixture(async ({ pool, txn, store, makeEngine }) => {
+      const faultyPipeline = async ctx => {
+        const client = ctx.dbClient;
+        if (fault !== "unused_authorization") await claimAuthorizationForExecution(client, txn.authorizationId, txn);
+        if (fault !== "missing_usage") await client.query("INSERT INTO authorization_usage (auth_id, tx_id) VALUES ($1,$2)", [txn.authorizationId, txn.txId]);
+        await consumeReservation(client, txn.senderWalletId, txn.amountMinor, txn.currency);
+        await creditWallet(client, txn.receiverWalletId, txn.amountMinor, txn.currency);
+        const amount = fault === "wrong_amount" ? txn.amountMinor + 1 : txn.amountMinor;
+        const currency = fault === "wrong_currency" ? "USD" : txn.currency;
+        await client.query("INSERT INTO ledger_entries (tx_id, wallet_id, entry_type, amount_minor, currency) VALUES ($1,$2,'debit',$3,$4)", [txn.txId, txn.senderWalletId, amount, currency]);
+        if (fault !== "one_entry") await client.query("INSERT INTO ledger_entries (tx_id, wallet_id, entry_type, amount_minor, currency) VALUES ($1,$2,'credit',$3,$4)",
+          [txn.txId, fault === "wrong_receiver" ? txn.senderWalletId : txn.receiverWalletId, amount, currency]);
+        const result = { status: "accepted", ledgerEntryId: `leg_${txn.txId}` };
+        if (fault !== "missing_execution") await client.query("INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json) VALUES ($1,$2,$3,$4)",
+          [txn.txId, txn.idempotencyKey, createHash("sha256").update(canonicalTransactionPayload(txn)).digest("hex"), fault === "wrong_replay" ? { ...result, ledgerEntryId: "incorrect_result" } : result]);
+        ctx.result = result;
+      };
+      await assert.rejects(makeEngine(store, faultyPipeline).execute(txn), { code: "23514" }, fault);
+      const sender = (await pool.query("SELECT balance, reserved FROM wallets WHERE wallet_id = $1", [txn.senderWalletId])).rows[0];
+      assert.equal(Number(sender.balance), 7500, fault);
+      assert.equal(Number(sender.reserved), 2500, fault);
+      assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM ledger_entries")).rows[0].count, 0, fault);
+      assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM rail_idempotency")).rows[0].count, 0, fault);
+      assert.equal((await makeEngine().execute(txn)).status, "accepted", fault);
+    });
+  }
+});
+
+test("a payment cannot commit without its durable replay record", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const incompleteStore = {
+      async dedupe(_key, _fingerprint, run) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const result = await run(client);
+          await client.query("COMMIT");
+          return result;
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+    };
+    await assert.rejects(makeEngine(incompleteStore).execute(txn), /payment_commit_record_missing/);
+    assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM rail_payment_executions")).rows[0].count, 0);
+    assert.equal((await makeEngine().execute(txn)).status, "accepted");
+  });
+});
+
+test("posted payment history and used authorization financial fields cannot be rewritten", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    await assert.rejects(pool.query("INSERT INTO authorization_usage (auth_id, tx_id) VALUES ($1, 'mismatched_transaction')", [txn.authorizationId]), { code: "23503" });
+    const engine = makeEngine();
+    const result = await engine.execute(txn);
+    for (const sql of [
+      "UPDATE ledger_entries SET amount_minor = amount_minor + 1 WHERE tx_id = $1",
+      "DELETE FROM ledger_entries WHERE tx_id = $1",
+      "DELETE FROM authorization_usage WHERE tx_id = $1",
+      "UPDATE rail_payment_executions SET result_json = '{}' WHERE tx_id = $1",
+      "DELETE FROM rail_payment_executions WHERE tx_id = $1",
+      "UPDATE authorizations SET amount_minor = amount_minor + 1 WHERE tx_id = $1",
+      "UPDATE authorizations SET status = 'issued' WHERE tx_id = $1",
+    ]) await assert.rejects(pool.query(sql, [txn.txId]), { code: "23514" });
+    assert.deepEqual(await engine.execute(txn), result);
   });
 });
 

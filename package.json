@@ -6,6 +6,7 @@
   "description": "Rail — offline-first payment orchestration (PostgreSQL, HMAC/HSM hooks, sync API)",
   "type": "module",
   "scripts": {
+    "prebuild": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
     "build": "tsc -p tsconfig.json",
     "migrate": "npm run build && node dist/persistence/runMigrations.js",
     "test": "npm run build && node --test test/*.test.js",

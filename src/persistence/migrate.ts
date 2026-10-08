@@ -213,6 +213,95 @@ END $$;
 
 ALTER TABLE rail_idempotency
   ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_authorizations_identity ON authorizations(auth_id, tx_id);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorization_usage_identity_fk' AND conrelid = 'authorization_usage'::regclass) THEN
+    ALTER TABLE authorization_usage ADD CONSTRAINT authorization_usage_identity_fk
+      FOREIGN KEY (auth_id, tx_id) REFERENCES authorizations(auth_id, tx_id) NOT VALID;
+  END IF;
+END $$;
+
+-- Defer complete-payment validation until every stage has written its rows.
+CREATE OR REPLACE FUNCTION rail_assert_payment(payment_tx_id TEXT) RETURNS VOID
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  auth_record authorizations%ROWTYPE;
+  entry_count INTEGER;
+  entries_match BOOLEAN;
+BEGIN
+  SELECT * INTO auth_record FROM authorizations WHERE tx_id = payment_tx_id;
+  IF NOT FOUND OR auth_record.status <> 'used' THEN
+    RAISE EXCEPTION 'payment_authorization_not_used' USING ERRCODE = '23514';
+  END IF;
+  SELECT COUNT(*), BOOL_AND(
+    amount_minor = auth_record.amount_minor AND currency = auth_record.currency AND
+    wallet_id = CASE entry_type WHEN 'debit' THEN auth_record.sender_wallet_id ELSE auth_record.receiver_wallet_id END
+  ) INTO entry_count, entries_match FROM ledger_entries WHERE tx_id = payment_tx_id;
+  IF entry_count <> 2 OR entries_match IS DISTINCT FROM TRUE THEN
+    RAISE EXCEPTION 'payment_ledger_pair_invalid' USING ERRCODE = '23514';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM authorization_usage WHERE tx_id = payment_tx_id AND auth_id = auth_record.auth_id)
+     OR NOT EXISTS (
+       SELECT 1 FROM rail_payment_executions execution
+       JOIN rail_idempotency replay ON replay.idempotency_key = execution.idempotency_key
+       WHERE execution.tx_id = payment_tx_id AND replay.status = 'completed'
+         AND replay.request_fingerprint = execution.request_fingerprint
+         AND replay.result_json = execution.result_json
+     ) THEN
+    RAISE EXCEPTION 'payment_commit_record_missing' USING ERRCODE = '23514';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION rail_check_payment_commit() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  PERFORM rail_assert_payment(NEW.tx_id);
+  RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS rail_ledger_commit_check ON ledger_entries;
+CREATE CONSTRAINT TRIGGER rail_ledger_commit_check AFTER INSERT ON ledger_entries
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_payment_commit();
+DROP TRIGGER IF EXISTS rail_usage_commit_check ON authorization_usage;
+CREATE CONSTRAINT TRIGGER rail_usage_commit_check AFTER INSERT ON authorization_usage
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_payment_commit();
+DROP TRIGGER IF EXISTS rail_execution_commit_check ON rail_payment_executions;
+CREATE CONSTRAINT TRIGGER rail_execution_commit_check AFTER INSERT ON rail_payment_executions
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_payment_commit();
+DROP TRIGGER IF EXISTS rail_authorization_commit_check ON authorizations;
+CREATE CONSTRAINT TRIGGER rail_authorization_commit_check AFTER INSERT OR UPDATE ON authorizations
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.status = 'used') EXECUTE FUNCTION rail_check_payment_commit();
+
+CREATE OR REPLACE FUNCTION rail_reject_history_mutation() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'posted_payment_history_is_immutable' USING ERRCODE = '23514';
+END $$;
+DROP TRIGGER IF EXISTS rail_ledger_immutable ON ledger_entries;
+CREATE TRIGGER rail_ledger_immutable BEFORE UPDATE OR DELETE ON ledger_entries
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_usage_immutable ON authorization_usage;
+CREATE TRIGGER rail_usage_immutable BEFORE UPDATE OR DELETE ON authorization_usage
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_execution_immutable ON rail_payment_executions;
+CREATE TRIGGER rail_execution_immutable BEFORE UPDATE OR DELETE ON rail_payment_executions
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+
+CREATE OR REPLACE FUNCTION rail_protect_used_authorization() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.status = 'used' AND ROW(NEW.auth_id, NEW.tx_id, NEW.sender_wallet_id, NEW.receiver_wallet_id,
+      NEW.amount_minor, NEW.currency, NEW.status, NEW.signature, NEW.created_at, NEW.used_at)
+      IS DISTINCT FROM ROW(OLD.auth_id, OLD.tx_id, OLD.sender_wallet_id, OLD.receiver_wallet_id,
+      OLD.amount_minor, OLD.currency, OLD.status, OLD.signature, OLD.created_at, OLD.used_at) THEN
+    RAISE EXCEPTION 'used_authorization_financial_fields_are_immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_used_authorization_immutable ON authorizations;
+CREATE TRIGGER rail_used_authorization_immutable BEFORE UPDATE ON authorizations
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_used_authorization();
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {

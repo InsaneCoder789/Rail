@@ -38,6 +38,8 @@ Use it in the following ways:
 
 ## Latest Status
 
+New payments now have database-enforced commit checks: the used authorization, debit/credit pair, currency, amount, sender/receiver, usage identity, execution record and matching completed replay result must agree before commit. Posted ledger, usage and execution rows reject update/delete, and used authorization financial fields cannot be rewritten or reset for reuse. Two unused wallet stores with conflicting accounting conventions were removed; live wallet mutations remain in the typed authorization helpers inside the shared payment transaction. Builds regenerate `dist` from scratch so removed source files do not leave stale executable modules. Payment integration tests now use disposable schemas rather than deleting financial history. Fault-injection tests verify rollback for incomplete/mismatched commits and rejection of posted-history edits. Opening-balance reconciliation, controlled reversal/refund lifecycle and production database-role permissions remain required work.
+
 Schema migrations now identify constraints by relation, not merely by a database-wide name. Legacy API-key detection is scoped to the current schema. Runtime and outbox migrations execute under a shared transaction-scoped advisory lock, with lock/statement deadlines, rollback and failed-client disposal. PostgreSQL regression tests prove local constraints are enforced even when another schema has the same names, unrelated legacy tables remain untouched, concurrent migrators complete safely and invalid historical data does not leave partially installed runtime tables. The full local suite passes 53 tests without skips.
 
 Authorization expiry no longer depends solely on an in-process timer: reading an authorization releases its expired reservation in the same transaction, and issuance first reclaims expired sender reservations. Locked rows and guarded wallet updates prevent duplicate releases; failed release leaves the authorization unchanged for investigation. Execution checks the current database clock rather than the transaction-start timestamp. Authorization functions now receive their database pool explicitly, removing cross-context global state, and money helpers use typed clients and reject invalid amounts. The bounded `npm run authorizations:sweep` command is available for an operator-managed schedule, including serverless deployments. New PostgreSQL tests cover concurrent reads/sweeps, reusing released headroom, invalid helper inputs, atomic failure and expiry during an open transaction; production job scheduling remains unverified.
@@ -266,11 +268,7 @@ This section describes the current TypeScript source layout and the responsibili
 - `src/persistence/postgresPool.ts`
   Creates and configures the PostgreSQL connection pool used by the server.
 
-- `src/persistence/postgresWalletStore.ts`
-  An older Postgres wallet-store abstraction that has been identified as inconsistent with the live schema and is not the main source of truth for the current server path.
-
-- `src/persistence/walletStore.ts`
-  Defines the wallet-store interface abstraction used by wallet-related logic.
+The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were removed during accounting hardening. They used incompatible balance conventions and had no runtime callers. Wallet mutations now have one implementation in the typed helpers in `src/stages/authorizationStage.ts`.
 
 ### Pipeline Infrastructure
 
