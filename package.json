@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "migrate": "npm run build && node dist/persistence/runMigrations.js",
     "test": "npm run build && node --test test/*.test.js",
+    "risk:train": "npm run build && node dist/risk/trainRisk.js",
     "demo": "npm run build && node dist/demo/runPayment.js",
     "server": "npm run build && node dist/server/server.js"
   },

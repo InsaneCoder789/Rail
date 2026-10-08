@@ -3,6 +3,8 @@ import http from "node:http";
 import process from "node:process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
+import { validateRiskModel } from "../risk/logisticRisk.js";
 dotenv.config();
 
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
@@ -37,6 +39,9 @@ export async function createServerContext(options: {
   startBackgroundJobs?: boolean;
 } = {}): Promise<ServerContext> {
   const config = loadServerConfig();
+  const riskModel = process.env.RAIL_RISK_MODEL_PATH
+    ? validateRiskModel(JSON.parse(await readFile(process.env.RAIL_RISK_MODEL_PATH, "utf8")))
+    : undefined;
   const databaseUrl = process.env.DATABASE_URL;
   let pool = null;
   let offlineTokenStore;
@@ -85,7 +90,7 @@ export async function createServerContext(options: {
     outbox: new MemoryOutbox(),
     tracer,
     dlq: new MemoryDeadLetterQueue(),
-    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore),
+    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel),
     relay: (event) => eventStore.insertOutboxEvent(event),
   });
 

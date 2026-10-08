@@ -194,6 +194,8 @@ flowchart TD
 
 ## Project Status
 
+Version 2 development is on `codex/rail-v2-foundation`. This branch includes security regression fixes and an optional, trainable ML baseline in shadow mode. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
+
 The project has already gone through several important improvements:
 
 - Phase 1 introduced persisted authorization lifecycle management and transactional reserve-plus-issue behavior.
@@ -305,6 +307,7 @@ That mode is useful for local experimentation, but it is not the main supported 
 | `RAIL_SIGNING_SECRET` | HMAC signing secret for transaction and authorization integrity helpers. |
 | `RAIL_ALLOWED_ORIGINS` | Comma-separated frontend origins allowed by CORS. Localhost development origins are used by default when unset. |
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
+| `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
 | `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
 | `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
 | `RAIL_RATE_LIMIT_LOGIN_MAX` | Login attempts allowed in the configured login window. |
@@ -501,6 +504,8 @@ src/
 | Script | Command |
 |---|---|
 | Build | `npm run build` |
+| Tests | `npm test` |
+| Train risk baseline | `npm run risk:train -- dataset.json model.json` |
 | Run server | `npm run server` |
 | Demo script | `npm run demo` |
 
@@ -517,7 +522,7 @@ Current limitations include:
 - the event relay path still uses temporary bridging mechanics internally
 - API keys are still an area that can be hardened further
 - in-memory mode is best understood as a local fallback, not a full alternative runtime
-- the risk stage is still placeholder logic rather than a real fraud engine
+- no enforced fraud policy is implemented; optional ML remains in shadow mode and needs validated labeled data
 - documentation and demo flows need to be kept aligned as the project evolves
 
 These gaps are tracked more fully in [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS_REPORT.md).

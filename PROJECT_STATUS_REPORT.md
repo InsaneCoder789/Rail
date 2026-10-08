@@ -42,6 +42,8 @@ On 8 October 2026, version 2 began on `codex/rail-v2-foundation`. The original o
 
 The first V2 security pass prevents registration from claiming existing wallets, applies login/registration limits across usernames per IP, validates JSON object boundaries and enforces bcrypt's 72-byte password limit. Existing oversized passwords need a reset policy rather than silently changing hashes. Tests exercise wallet ownership against PostgreSQL, rotating usernames and invalid/multibyte inputs.
 
+The V2 ML baseline now implements trainable logistic regression, artifact/provenance validation, held-out evaluation and optional shadow observations. The transaction-ID-based placeholder has been removed. No real fraud dataset or default model is supplied, and there is no enforced fraud policy. Observations cannot override authorization, wallet or token checks. See [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for dataset format, metrics and deployment instructions.
+
 Phase 1 transaction-safety changes have now been implemented in the codebase.
 
 The major improvements completed in this phase are:

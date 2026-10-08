@@ -34,7 +34,7 @@ Severity measures potential impact. A finding does not imply every issue is reac
 
 ## Verification and release gates
 
-The first V2 pass passes 25 tests, including four live PostgreSQL tests, with no skips in the configured local database. `npm audit --json` reported zero known installed-package advisories on 8 October 2026. That does not certify application security. V2 CI now includes branch pushes and a named security/ML/audit step; hosted execution requires a push.
+The first V2 pass passes 26 tests, including four live PostgreSQL tests, with no skips in the configured local database. `npm audit --json` reported zero known installed-package advisories on 8 October 2026. That does not certify application security. V2 CI now includes branch pushes and a named security/ML/audit step; hosted execution requires a push.
 
 Close transaction/recovery, authorization, outbox and ledger findings before real-money integrations. Enable ML decisions only after temporal validation on consented labeled data, calibration, monitored false positives and a deterministic fallback. Anchor audit batches only after commitments are persisted with ledger state and signing ownership, independent checkpoints, finality and chain reorganization handling are implemented.
 

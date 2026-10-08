@@ -11,6 +11,7 @@ import { verifyTransactionSignatureIfRequired } from "../crypto/transactionSigni
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { claimAuthorizationForExecution, consumeReservation, creditWallet } from "./authorizationStage.js";
 import { Pool, PoolClient } from "pg";
+import { predictRisk, type LogisticRiskModel } from "../risk/logisticRisk.js";
 
 let ledgerPool: Pool | null = null;
 
@@ -113,20 +114,23 @@ function createStableSignatureVerifier(): Stage {
   };
 }
 
-function riskScoreStage(): Stage {
+function riskScoreStage(model?: LogisticRiskModel): Stage {
   return async (ctx) => {
     emitStage(ctx, "risk.score", "start");
-    const velocity = Math.abs(ctx.txn.txId.charCodeAt(0) % 5);
-    const score = 82 - velocity * 3;
-    const decision = score >= 75 ? "allow" : score >= 60 ? "challenge" : "block";
+    // ML observations never override authorization, balances, or payment policy.
     ctx.risk = {
-      score,
-      decision,
-      reasons: [`velocity_hint=${velocity}`],
+      score: 0,
+      decision: "allow",
+      reasons: ["no_fraud_policy_configured"],
     };
-    if (decision === "block") {
-      emitStage(ctx, "risk.score", "error");
-      throw new PipelineError("risk_blocked", "RISK_BLOCK", false);
+    if (model && model.currency === ctx.txn.currency) {
+      const prediction = predictRisk(model, ctx.txn);
+      ctx.outbox.append({ type: "risk.shadow_assessed", payload: {
+        txId: ctx.txn.txId, senderWalletId: ctx.txn.senderWalletId,
+        modelVersion: model.modelVersion, synthetic: model.synthetic,
+        mode: "shadow", probability: prediction.probability,
+        contributions: prediction.contributions,
+      } });
     }
     emitStage(ctx, "risk.score", "ok");
   };
@@ -366,7 +370,7 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
 /**
  * Advanced composition: bounded parallel pre-checks, retryable IO, saga for funds + ledger, outbox side-effects.
  */
-function buildPipelineWithVerifier(tracer: Tracer, signatureStage: Stage, tokenStore?: IOfflineTokenStore): Stage {
+function buildPipelineWithVerifier(tracer: Tracer, signatureStage: Stage, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel): Stage {
   const limiter = new Semaphore(4);
   const saga = walletSaga(tokenStore);
 
@@ -378,7 +382,7 @@ function buildPipelineWithVerifier(tracer: Tracer, signatureStage: Stage, tokenS
           await withSpan(tracer, "verify.signatures", signatureStage)(c);
         },
         async (c) => {
-          await withSpan(tracer, "risk.score", riskScoreStage())(c);
+          await withSpan(tracer, "risk.score", riskScoreStage(riskModel))(c);
         },
       ],
       ctx,
@@ -413,6 +417,6 @@ export function buildDefaultPaymentPipeline(tracer: Tracer): Stage {
 /**
  * Hardened path for Rail server: optional offline token store enables nfc|ble|qr with server-issued spend envelopes.
  */
-export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore): Stage {
-  return buildPipelineWithVerifier(tracer, createStableSignatureVerifier(), tokenStore);
+export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel): Stage {
+  return buildPipelineWithVerifier(tracer, createStableSignatureVerifier(), tokenStore, riskModel);
 }
