@@ -18,10 +18,7 @@ import { ensureOutboxSchema, runMigrations } from "../persistence/migrate.js";
 import { createPool } from "../persistence/postgresPool.js";
 import { OfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
-import {
-  initAuthorizationWallet,
-  releaseExpiredAuthorizations,
-} from "../stages/authorizationStage.js";
+import { releaseExpiredAuthorizations } from "../stages/authorizationStage.js";
 import { createAuthResolver } from "./authentication.js";
 import { loadServerConfig } from "./config.js";
 import { createEventStore } from "./events.js";
@@ -56,9 +53,9 @@ export async function createServerContext(options: {
       await ensureOutboxSchema(pool);
     }
 
-    initAuthorizationWallet(pool);
     if (startBackgroundJobs) {
-      const releasedCount = await releaseExpiredAuthorizations().catch((err) => {
+      const sweepPool = pool;
+      const releasedCount = await releaseExpiredAuthorizations(pool).catch((err) => {
         console.error("authorization_sweep_failed", err);
         return 0;
       });
@@ -66,7 +63,7 @@ export async function createServerContext(options: {
         console.log(`Rail: released ${releasedCount} expired authorization reservations`);
       }
       setInterval(() => {
-        void releaseExpiredAuthorizations().catch((err) => {
+        void releaseExpiredAuthorizations(sweepPool).catch((err) => {
           console.error("authorization_sweep_failed", err);
         });
       }, config.authSweepIntervalMs).unref();

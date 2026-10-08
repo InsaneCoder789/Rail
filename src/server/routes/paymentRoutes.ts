@@ -80,7 +80,8 @@ async function prepareAuthorizedTransaction(
     throw new RequestError(401, "authorization_required", "missing authorization");
   }
 
-  const storedAuthorization = await getAuthorizationById(txn.authorizationId);
+  if (!context.pool) throw new RequestError(503, "database_required", "payment persistence unavailable");
+  const storedAuthorization = await getAuthorizationById(txn.authorizationId, context.pool);
   if (!storedAuthorization) {
     throw new RequestError(404, "authorization_not_found", "authorization not found");
   }
@@ -143,13 +144,14 @@ export async function handlePaymentRoutes(
       trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
+    if (!context.pool) throw new RequestError(503, "database_required", "payment persistence unavailable");
     const authorization = await createAuthorization({
       txId: body.txId as string,
       senderWalletId: body.senderWalletId as string,
       receiverWalletId: body.receiverWalletId as string,
       amountMinor: body.amountMinor as number,
       currency: body.currency as string,
-    });
+    }, context.pool);
 
     json(res, 200, { authorization });
     return true;
@@ -246,7 +248,8 @@ export async function handlePaymentRoutes(
 
     await prepareAuthorizedTransaction(txn, context);
     if (providedAuthorization) {
-      const storedAuthorization = await getAuthorizationById(txn.authorizationId!);
+      if (!context.pool) throw new RequestError(503, "database_required", "payment persistence unavailable");
+      const storedAuthorization = await getAuthorizationById(txn.authorizationId!, context.pool);
       if (!storedAuthorization) {
         throw new RequestError(404, "authorization_not_found", "authorization not found");
       }

@@ -5,7 +5,7 @@ import { consoleTracer } from "../pipeline/tracing.js";
 import { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import { createPool } from "../persistence/postgresPool.js";
 import { runMigrations, ensureOutboxSchema } from "../persistence/migrate.js";
-import { createAuthorization, initAuthorizationWallet } from "../stages/authorizationStage.js";
+import { createAuthorization } from "../stages/authorizationStage.js";
 import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
 import type { PaymentTransaction } from "../domain/types.js";
 
@@ -23,7 +23,6 @@ if (!signingSecret) {
 const pool = createPool(databaseUrl);
 await runMigrations(pool);
 await ensureOutboxSchema(pool);
-initAuthorizationWallet(pool);
 
 await pool.query(
   `INSERT INTO wallets (wallet_id, balance, reserved)
@@ -50,7 +49,7 @@ const authorization = await createAuthorization({
   receiverWalletId: "wal_receiver_demo",
   amountMinor: 15_000,
   currency: "INR",
-});
+}, pool);
 
 const txn: PaymentTransaction = {
   txId: "txn_demo_001",

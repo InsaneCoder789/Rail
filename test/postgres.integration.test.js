@@ -9,7 +9,7 @@ import { Readable } from "node:stream";
 import { handleAuthRoutes } from "../dist/server/routes/authRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { SlidingWindowRateLimiter } from "../dist/server/http.js";
-import { initAuthorizationWallet, createAuthorization, claimAuthorizationForExecution } from "../dist/stages/authorizationStage.js";
+import { createAuthorization, claimAuthorizationForExecution, getAuthorizationById, releaseExpiredAuthorizations, reserveFunds, creditWallet, releaseReservation } from "../dist/stages/authorizationStage.js";
 import { buildHardenedPaymentPipeline } from "../dist/stages/paymentPipeline.js";
 import { PaymentPipelineEngine } from "../dist/pipeline/engine.js";
 import { MemoryDeadLetterQueue } from "../dist/pipeline/dlq.js";
@@ -34,9 +34,9 @@ test("PostgreSQL migrations create the required runtime tables", { skip: !databa
        FROM information_schema.tables
        WHERE table_schema = 'public'
          AND table_name = ANY($1::text[])`,
-      [["wallets", "authorizations", "ledger_entries", "rail_idempotency", "rail_rate_limit_buckets", "rail_payment_executions", "outbox"]],
+      [["wallets", "authorizations", "ledger_entries", "rail_idempotency", "rail_rate_limit_buckets", "rail_payment_executions", "rail_offline_tokens", "rail_offline_spends", "outbox"]],
     );
-    assert.equal(result.rowCount, 7);
+    assert.equal(result.rowCount, 9);
   } finally {
     await pool.end();
   }
@@ -117,9 +117,8 @@ test("concurrent authorization retries reserve once and reject mismatched engine
   const previousSecret = process.env.RAIL_SIGNING_SECRET;
   process.env.RAIL_SIGNING_SECRET = previousSecret || "integration_test_signing_secret_0123456789";
   try {
-    initAuthorizationWallet(pool);
     await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ($1, 10000), ($2, 0)", [sender, receiver]);
-    const authorizations = await Promise.all(Array.from({ length: 8 }, () => createAuthorization(input)));
+    const authorizations = await Promise.all(Array.from({ length: 8 }, () => createAuthorization(input, pool)));
     assert.equal(new Set(authorizations.map((auth) => auth.authId)).size, 1);
     const wallet = (await pool.query("SELECT balance, reserved FROM wallets WHERE wallet_id = $1", [sender])).rows[0];
     assert.equal(Number(wallet.balance), 7500);
@@ -155,9 +154,8 @@ async function paymentFixture(work) {
   const previousSecret = process.env.RAIL_SIGNING_SECRET;
   process.env.RAIL_SIGNING_SECRET = previousSecret || "integration_test_signing_secret_0123456789";
   try {
-    initAuthorizationWallet(pool);
     await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ($1, 10000), ($2, 0)", [sender, receiver]);
-    const auth = await createAuthorization({ txId, senderWalletId: sender, receiverWalletId: receiver, amountMinor: 2500, currency: "INR" });
+    const auth = await createAuthorization({ txId, senderWalletId: sender, receiverWalletId: receiver, amountMinor: 2500, currency: "INR" }, pool);
     const tokens = new PostgresOfflineTokenStore(pool);
     const token = await tokens.issue({ walletId: sender, deviceId: "ci_device", amountCapMinor: 5000 });
     const txn = { txId, idempotencyKey: `ci_idem_${suffix}`, authorizationId: auth.authId, senderWalletId: sender,
@@ -262,7 +260,7 @@ test("lost-response replay reaches the engine through HTTP after authorization e
     let status;
     let body;
     const response = { setHeader() {}, writeHead(value) { status = value; }, end(value) { body = JSON.parse(value); } };
-    const context = { config: loadServerConfig(), engine, idempotency: store, rateLimiter: new SlidingWindowRateLimiter(),
+    const context = { pool, config: loadServerConfig(), engine, idempotency: store, rateLimiter: new SlidingWindowRateLimiter(),
       authResolver: { async resolveAuthenticatedWallet() { return txn.senderWalletId; } } };
     await handlePaymentRoutes(request, response, new URL("http://localhost/v1/payments/execute"), context);
     assert.equal(status, 200);
@@ -327,6 +325,106 @@ test("outbox leases exclude parallel workers and failed deliveries retry with a 
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
     await admin.end();
   }
+});
+
+async function authorizationExpiryFixture(work) {
+  const schema = `ci_authorization_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 4, options: `-c search_path=${schema}` });
+  const previousSecret = process.env.RAIL_SIGNING_SECRET;
+  process.env.RAIL_SIGNING_SECRET = previousSecret || "integration_test_signing_secret_0123456789";
+  try {
+    await runMigrations(pool);
+    await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ('expiry_sender', 10000), ('expiry_receiver', 0)");
+    const input = { txId: "expiry_transaction_one", senderWalletId: "expiry_sender", receiverWalletId: "expiry_receiver", amountMinor: 2500, currency: "INR" };
+    const auth = await createAuthorization(input, pool);
+    await pool.query("UPDATE authorizations SET expires_at = NOW() - INTERVAL '1 second' WHERE auth_id = $1", [auth.authId]);
+    await work({ pool, input, auth });
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+    if (previousSecret === undefined) delete process.env.RAIL_SIGNING_SECRET;
+    else process.env.RAIL_SIGNING_SECRET = previousSecret;
+  }
+}
+
+test("concurrent authorization reads and sweeps release expired reservations exactly once", { skip: !databaseUrl }, async () => {
+  await authorizationExpiryFixture(async ({ pool, auth }) => {
+    await Promise.all(Array.from({ length: 12 }, (_, i) => i % 2 ? getAuthorizationById(auth.authId, pool) : releaseExpiredAuthorizations(pool)));
+    const stored = await getAuthorizationById(auth.authId, pool);
+    assert.equal(stored.status, "expired");
+    assert.ok(stored.releasedAt);
+    const wallet = (await pool.query("SELECT balance, reserved FROM wallets WHERE wallet_id = 'expiry_sender'")).rows[0];
+    assert.equal(Number(wallet.balance), 10000);
+    assert.equal(Number(wallet.reserved), 0);
+    assert.equal(await releaseExpiredAuthorizations(pool), 0);
+    await assert.rejects(releaseExpiredAuthorizations(pool, -1), /invalid_sweep_limit/);
+  });
+});
+
+test("authorization issuance recovers expired headroom without a background timer", { skip: !databaseUrl }, async () => {
+  await authorizationExpiryFixture(async ({ pool, input, auth }) => {
+    const next = await createAuthorization({ ...input, txId: "expiry_transaction_two", amountMinor: 9000 }, pool);
+    assert.notEqual(next.authId, auth.authId);
+    assert.equal((await getAuthorizationById(auth.authId, pool)).status, "expired");
+    const wallet = (await pool.query("SELECT balance, reserved FROM wallets WHERE wallet_id = 'expiry_sender'")).rows[0];
+    assert.equal(Number(wallet.balance), 1000);
+    assert.equal(Number(wallet.reserved), 9000);
+    const replay = await createAuthorization(input, pool);
+    assert.equal(replay.authId, auth.authId);
+    assert.equal(replay.status, "expired");
+    await assert.rejects(createAuthorization({ ...input, amountMinor: 1 }, pool), /AUTHORIZATION_TX_CONFLICT/);
+  });
+});
+
+test("wallet reservation helpers reject invalid money and cannot over-release funds", { skip: !databaseUrl }, async () => {
+  await authorizationExpiryFixture(async ({ pool, input }) => {
+    const client = await pool.connect();
+    try {
+      for (const operation of [reserveFunds, creditWallet, releaseReservation]) {
+        for (const amount of [-1, 0, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+          await assert.rejects(operation(client, input.senderWalletId, amount, "INR"), /INVALID_TRANSACTION/);
+        }
+      }
+      await assert.rejects(releaseReservation(client, input.senderWalletId, 2501, "INR"), /RESERVATION_WALLET_NOT_FOUND/);
+      await assert.rejects(createAuthorization({ ...input, ttlMs: Infinity }, pool), /INVALID_TRANSACTION/);
+      const wallet = (await client.query("SELECT balance, reserved FROM wallets WHERE wallet_id = $1", [input.senderWalletId])).rows[0];
+      assert.equal(Number(wallet.balance), 7500);
+      assert.equal(Number(wallet.reserved), 2500);
+    } finally {
+      client.release();
+    }
+  });
+});
+
+test("failed expiry release rolls back instead of marking inconsistent reservations expired", { skip: !databaseUrl }, async () => {
+  await authorizationExpiryFixture(async ({ pool, auth }) => {
+    await pool.query("UPDATE wallets SET balance = 10000, reserved = 0 WHERE wallet_id = 'expiry_sender'");
+    await assert.rejects(getAuthorizationById(auth.authId, pool), /RESERVATION_WALLET_NOT_FOUND/);
+    const stored = (await pool.query("SELECT status, released_at FROM authorizations WHERE auth_id = $1", [auth.authId])).rows[0];
+    assert.equal(stored.status, "issued");
+    assert.equal(stored.released_at, null);
+    const wallet = (await pool.query("SELECT balance, reserved FROM wallets WHERE wallet_id = 'expiry_sender'")).rows[0];
+    assert.equal(Number(wallet.balance), 10000);
+    assert.equal(Number(wallet.reserved), 0);
+  });
+});
+
+test("execution checks the current database clock rather than a stale transaction-start timestamp", { skip: !databaseUrl }, async () => {
+  await authorizationExpiryFixture(async ({ pool, auth, input }) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE authorizations SET expires_at = transaction_timestamp() + INTERVAL '1 millisecond' WHERE auth_id = $1", [auth.authId]);
+      await client.query("SELECT pg_sleep(0.02)");
+      await assert.rejects(claimAuthorizationForExecution(client, auth.authId, input), /AUTH_NOT_EXECUTABLE/);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+  });
 });
 
 test("outbox retries end in dead letters and expired worker leases can be reclaimed", { skip: !databaseUrl }, async () => {

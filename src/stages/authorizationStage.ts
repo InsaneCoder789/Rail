@@ -1,26 +1,20 @@
-import { Pool, type PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { randomUUID } from "node:crypto";
 import type { PaymentAuthorization, StoredPaymentAuthorization } from "../domain/authorization.js";
 import type { PaymentTransaction } from "../domain/types.js";
 import { PipelineError } from "../pipeline/errors.js";
 import { signAuthorization } from "../crypto/authorizationSigning.js";
 
-let pool: Pool | undefined;
 const DEFAULT_AUTH_TTL_MS = 5 * 60 * 1000;
-
-export function initAuthorizationWallet(p: Pool) {
-  pool = p;
-}
-
-function requirePool(): Pool {
-  if (!pool) {
-    throw new Error("wallet pool not initialized");
+function validateMoney(amount: number, currency: string): void {
+  if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 1e12 || !/^[A-Z]{3}$/.test(currency)) {
+    throw new PipelineError("INVALID_TRANSACTION", "INVALID_TRANSACTION");
   }
-  return pool;
 }
 
 // 🔒 Reserve money (authorization step)
-export async function reserveFunds(client: any, walletId: string, amount: number, currency: string): Promise<void> {
+export async function reserveFunds(client: PoolClient, walletId: string, amount: number, currency: string): Promise<void> {
+  validateMoney(amount, currency);
   const res = await client.query(
     `UPDATE wallets
      SET balance = balance - $2,
@@ -35,7 +29,8 @@ export async function reserveFunds(client: any, walletId: string, amount: number
 }
 
 // 💸 Consume reserved money (final debit)
-export async function consumeReservation(client: any, walletId: string, amount: number, currency: string): Promise<void> {
+export async function consumeReservation(client: PoolClient, walletId: string, amount: number, currency: string): Promise<void> {
+  validateMoney(amount, currency);
   const res = await client.query(
     `UPDATE wallets
      SET reserved = reserved - $2
@@ -49,12 +44,13 @@ export async function consumeReservation(client: any, walletId: string, amount: 
 }
 
 // 🔄 Release reserved money (rollback case)
-export async function releaseReservation(client: any, walletId: string, amount: number, currency: string): Promise<void> {
+export async function releaseReservation(client: PoolClient, walletId: string, amount: number, currency: string): Promise<void> {
+  validateMoney(amount, currency);
   const res = await client.query(
     `UPDATE wallets
      SET balance = balance + $2,
          reserved = reserved - $2
-     WHERE wallet_id = $1 AND currency = $3`,
+     WHERE wallet_id = $1 AND currency = $3 AND reserved >= $2`,
     [walletId, amount, currency]
   );
   if (res.rowCount === 0) {
@@ -63,7 +59,8 @@ export async function releaseReservation(client: any, walletId: string, amount: 
 }
 
 // 💰 Credit the receiver's wallet
-export async function creditWallet(client: any, walletId: string, amount: number, currency: string): Promise<void> {
+export async function creditWallet(client: PoolClient, walletId: string, amount: number, currency: string): Promise<void> {
+  validateMoney(amount, currency);
   const res = await client.query(
     `UPDATE wallets
      SET balance = balance + $2
@@ -93,32 +90,12 @@ function mapStoredAuthorization(row: Record<string, unknown>): StoredPaymentAuth
   };
 }
 
-export async function getAuthorizationById(authId: string): Promise<StoredPaymentAuthorization | undefined> {
-  const db = requirePool();
-  const res = await db.query(
-    `SELECT
-       auth_id,
-       tx_id,
-       sender_wallet_id,
-       receiver_wallet_id,
-       amount_minor,
-       currency,
-       status,
-       signature,
-       created_at,
-       expires_at,
-       used_at,
-       released_at
-     FROM authorizations
-     WHERE auth_id = $1`,
-    [authId],
-  );
-
-  if (res.rowCount === 0) {
-    return undefined;
-  }
-
-  return mapStoredAuthorization(res.rows[0] as Record<string, unknown>);
+export async function getAuthorizationById(authId: string, db: Pool): Promise<StoredPaymentAuthorization | undefined> {
+  return authorizationTransaction(db, async client => {
+    await expireReservations(client, 1, undefined, authId);
+    const result = await client.query("SELECT * FROM authorizations WHERE auth_id = $1", [authId]);
+    return result.rows.length ? mapStoredAuthorization(result.rows[0]) : undefined;
+  });
 }
 
 export async function claimAuthorizationForExecution(
@@ -137,7 +114,7 @@ export async function claimAuthorizationForExecution(
        AND amount_minor = $5
        AND currency = $6
        AND status = 'issued'
-       AND expires_at > NOW()`,
+       AND expires_at > clock_timestamp()`,
     [authId, txn.txId, txn.senderWalletId, txn.receiverWalletId, txn.amountMinor, txn.currency],
   );
 
@@ -163,48 +140,51 @@ export async function verifyCommittedAuthorization(client: PoolClient, txn: Paym
   }
 }
 
-export async function releaseExpiredAuthorizations(limit = 100): Promise<number> {
-  const db = requirePool();
+async function authorizationTransaction<T>(db: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await db.connect();
+  let discard = false;
+  const onError = () => { discard = true; };
+  client.on("error", onError);
   try {
     await client.query("BEGIN");
-
-    const expired = await client.query(
-      `SELECT auth_id, sender_wallet_id, amount_minor, currency
-       FROM authorizations
-       WHERE status = 'issued'
-         AND expires_at <= NOW()
-       ORDER BY expires_at ASC
-       LIMIT $1
-       FOR UPDATE SKIP LOCKED`,
-      [limit],
-    );
-
-    for (const row of expired.rows as Record<string, unknown>[]) {
-      await releaseReservation(
-        client,
-        String(row.sender_wallet_id),
-        Number(row.amount_minor),
-        String(row.currency),
-      );
-
-      await client.query(
-        `UPDATE authorizations
-         SET status = 'expired',
-             released_at = NOW()
-         WHERE auth_id = $1`,
-        [String(row.auth_id)],
-      );
-    }
-
+    await client.query("SET LOCAL lock_timeout = '5s'");
+    await client.query("SET LOCAL statement_timeout = '15s'");
+    const result = await work(client);
     await client.query("COMMIT");
-    return expired.rowCount ?? 0;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
+    return result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { discard = true; }
+    throw error;
   } finally {
-    client.release();
+    client.release(discard);
+    client.removeListener("error", onError);
   }
+}
+
+async function expireReservations(client: PoolClient, limit: number, walletId?: string, authId?: string): Promise<number> {
+  const expired = await client.query(
+    `SELECT auth_id, sender_wallet_id, amount_minor, currency FROM authorizations
+     WHERE status = 'issued' AND expires_at <= clock_timestamp()
+       AND ($2::text IS NULL OR sender_wallet_id = $2)
+       AND ($3::text IS NULL OR auth_id = $3)
+     ORDER BY expires_at ASC, auth_id ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
+    [limit, walletId ?? null, authId ?? null],
+  );
+  // Match payment execution's wallet lock order to avoid opposing-transfer deadlocks.
+  const wallets = [...new Set(expired.rows.map(row => String(row.sender_wallet_id)))].sort();
+  if (wallets.length) {
+    await client.query("SELECT wallet_id FROM wallets WHERE wallet_id = ANY($1::text[]) ORDER BY wallet_id FOR UPDATE", [wallets]);
+  }
+  for (const row of expired.rows as Record<string, unknown>[]) {
+    await releaseReservation(client, String(row.sender_wallet_id), Number(row.amount_minor), String(row.currency));
+    await client.query("UPDATE authorizations SET status = 'expired', released_at = NOW() WHERE auth_id = $1", [String(row.auth_id)]);
+  }
+  return expired.rowCount ?? 0;
+}
+
+export async function releaseExpiredAuthorizations(db: Pool, limit = 100): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error("invalid_sweep_limit");
+  return authorizationTransaction(db, client => expireReservations(client, limit));
 }
 
 export async function createAuthorization(input: {
@@ -214,21 +194,26 @@ export async function createAuthorization(input: {
   amountMinor: number;
   currency: string;
   ttlMs?: number;
-}): Promise<PaymentAuthorization> {
+}, db: Pool): Promise<PaymentAuthorization> {
+  validateMoney(input.amountMinor, input.currency);
+  for (const [id, minimum] of [[input.txId, 8], [input.senderWalletId, 3], [input.receiverWalletId, 3]] as const) {
+    if (typeof id !== "string" || id.length < minimum || id.length > 128 || /[\x00-\x1f\x7f]/.test(id)) {
+      throw new PipelineError("INVALID_TRANSACTION", "INVALID_TRANSACTION");
+    }
+  }
+  if (input.senderWalletId === input.receiverWalletId) throw new PipelineError("SELF_TRANSFER", "SELF_TRANSFER");
+  const ttlMs = input.ttlMs ?? DEFAULT_AUTH_TTL_MS;
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < 1000 || ttlMs > 30 * 60 * 1000) throw new PipelineError("INVALID_TRANSACTION", "INVALID_TRANSACTION");
   const secret = process.env.RAIL_SIGNING_SECRET ?? "";
 
   if (!secret) {
     throw new Error("missing signing secret");
   }
 
-  const db = requirePool();
-  const client = await db.connect();
-  try {
-    await client.query("BEGIN");
-
+  return authorizationTransaction(db, async client => {
     // Serialize issuance even when the authorization row does not exist yet.
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`authorize:${input.txId}`]);
-    const existing = await client.query(
+    let existing = await client.query(
       `SELECT auth_id, tx_id, sender_wallet_id, receiver_wallet_id, amount_minor,
               currency, status, signature, created_at, expires_at, used_at, released_at
        FROM authorizations
@@ -236,7 +221,9 @@ export async function createAuthorization(input: {
        FOR UPDATE`,
       [input.txId],
     );
+    await expireReservations(client, 1000, input.senderWalletId);
     if (existing.rowCount && existing.rowCount > 0) {
+      existing = await client.query("SELECT * FROM authorizations WHERE tx_id = $1", [input.txId]);
       const current = mapStoredAuthorization(existing.rows[0] as Record<string, unknown>);
       if (
         current.senderWalletId !== input.senderWalletId ||
@@ -244,9 +231,8 @@ export async function createAuthorization(input: {
         current.amountMinor !== input.amountMinor ||
         current.currency !== input.currency
       ) {
-        throw new Error("AUTHORIZATION_TX_CONFLICT");
+        throw new PipelineError("AUTHORIZATION_TX_CONFLICT", "AUTHORIZATION_TX_CONFLICT");
       }
-      await client.query("COMMIT");
       return current;
     }
 
@@ -260,7 +246,7 @@ export async function createAuthorization(input: {
       amountMinor: input.amountMinor,
       currency: input.currency,
       createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + (input.ttlMs ?? DEFAULT_AUTH_TTL_MS)).toISOString(),
+      expiresAt: new Date(Date.now() + ttlMs).toISOString(),
     } as const;
 
     const signature = signAuthorization(unsignedAuth, secret);
@@ -295,12 +281,6 @@ export async function createAuthorization(input: {
       ],
     );
 
-    await client.query("COMMIT");
     return auth;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
+  });
 }

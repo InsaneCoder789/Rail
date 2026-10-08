@@ -11,6 +11,7 @@
     "test": "npm run build && node --test test/*.test.js",
     "risk:train": "npm run build && node dist/risk/trainRisk.js",
     "outbox:dispatch": "npm run build && node dist/persistence/runOutboxWorker.js",
+    "authorizations:sweep": "npm run build && node dist/persistence/runAuthorizationSweep.js",
     "demo": "npm run build && node dist/demo/runPayment.js",
     "server": "npm run build && node dist/server/server.js"
   },

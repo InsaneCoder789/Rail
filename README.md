@@ -508,11 +508,14 @@ src/
 | Build | `npm run build` |
 | Tests | `npm test` |
 | Deliver outbox batch | `npm run outbox:dispatch` |
+| Release expired authorizations | `npm run authorizations:sweep` |
 | Train risk baseline | `npm run risk:train -- dataset.json model.json` |
 | Run server | `npm run server` |
 | Demo script | `npm run demo` |
 
 `npm run demo` follows the current authorization-first flow. It requires `DATABASE_URL` and `RAIL_SIGNING_SECRET`, creates a real authorization, executes an online payment through the hardened pipeline, and then replays the same request to demonstrate idempotent retry behavior.
+
+Schedule `npm run authorizations:sweep` outside the API process for unattended expiry cleanup. Each run releases at most 1,000 expired reservations; repeat runs drain larger backlogs. Reads and new authorizations also reclaim expired reservations transactionally. Serverless instances do not start background timers. Keep database credentials in the scheduler's secret storage and monitor failed runs.
 
 ---
 
