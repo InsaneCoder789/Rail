@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 
 const SCHEMA = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS rail_offline_tokens (
 );
 
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rail_offline_tokens_amounts_non_negative') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rail_offline_tokens_amounts_non_negative' AND conrelid = 'rail_offline_tokens'::regclass) THEN
     ALTER TABLE rail_offline_tokens ADD CONSTRAINT rail_offline_tokens_amounts_non_negative
       CHECK (amount_cap_minor > 0 AND remaining_minor >= 0 AND remaining_minor <= amount_cap_minor);
   END IF;
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS wallets (
 );
 
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'wallets_amounts_non_negative') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'wallets_amounts_non_negative' AND conrelid = 'wallets'::regclass) THEN
     ALTER TABLE wallets ADD CONSTRAINT wallets_amounts_non_negative
       CHECK (balance >= 0 AND reserved >= 0);
   END IF;
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 );
 
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_amount_positive') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_amount_positive' AND conrelid = 'ledger_entries'::regclass) THEN
     ALTER TABLE ledger_entries ADD CONSTRAINT ledger_entries_amount_positive
       CHECK (amount_minor > 0);
   END IF;
@@ -102,11 +102,11 @@ CREATE TABLE IF NOT EXISTS authorizations (
 );
 
 DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_amount_positive') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_amount_positive' AND conrelid = 'authorizations'::regclass) THEN
     ALTER TABLE authorizations ADD CONSTRAINT authorizations_amount_positive
       CHECK (amount_minor > 0);
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_distinct_wallets') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_distinct_wallets' AND conrelid = 'authorizations'::regclass) THEN
     ALTER TABLE authorizations ADD CONSTRAINT authorizations_distinct_wallets
       CHECK (sender_wallet_id <> receiver_wallet_id);
   END IF;
@@ -140,7 +140,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_name = 'api_keys' AND column_name = 'api_key'
+    WHERE table_schema = current_schema() AND table_name = 'api_keys' AND column_name = 'api_key'
   ) THEN
     ALTER TABLE api_keys RENAME TO api_keys_legacy;
   END IF;
@@ -159,7 +159,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.tables
-    WHERE table_name = 'api_keys_legacy'
+    WHERE table_schema = current_schema() AND table_name = 'api_keys_legacy'
   ) THEN
     INSERT INTO api_keys (key_id, api_key_hash, wallet_id)
     SELECT
@@ -185,27 +185,27 @@ CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_id);
 
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_wallet_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_wallet_fk' AND conrelid = 'ledger_entries'::regclass) THEN
     ALTER TABLE ledger_entries
       ADD CONSTRAINT ledger_entries_wallet_fk FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_sender_wallet_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_sender_wallet_fk' AND conrelid = 'authorizations'::regclass) THEN
     ALTER TABLE authorizations
       ADD CONSTRAINT authorizations_sender_wallet_fk FOREIGN KEY (sender_wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_receiver_wallet_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_receiver_wallet_fk' AND conrelid = 'authorizations'::regclass) THEN
     ALTER TABLE authorizations
       ADD CONSTRAINT authorizations_receiver_wallet_fk FOREIGN KEY (receiver_wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorization_usage_auth_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'authorization_usage_auth_fk' AND conrelid = 'authorization_usage'::regclass) THEN
     ALTER TABLE authorization_usage
       ADD CONSTRAINT authorization_usage_auth_fk FOREIGN KEY (auth_id) REFERENCES authorizations(auth_id) NOT VALID;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_keys_wallet_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_keys_wallet_fk' AND conrelid = 'api_keys'::regclass) THEN
     ALTER TABLE api_keys
       ADD CONSTRAINT api_keys_wallet_fk FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_wallet_fk') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_wallet_fk' AND conrelid = 'users'::regclass) THEN
     ALTER TABLE users
       ADD CONSTRAINT users_wallet_fk FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) NOT VALID;
   END IF;
@@ -215,17 +215,35 @@ ALTER TABLE rail_idempotency
   ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
 `;
 
-export async function runMigrations(pool: Pool): Promise<void> {
+async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {
   const client = await pool.connect();
+  let discard = false;
+  const onError = () => { discard = true; };
+  client.on("error", onError);
   try {
-    await client.query(SCHEMA);
+    await client.query("BEGIN");
+    await client.query("SET LOCAL lock_timeout = '30s'");
+    await client.query("SET LOCAL statement_timeout = '60s'");
+    // Also protects extension creation when two fresh schemas migrate simultaneously.
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('rail:schema:migrate', 0))");
+    await work(client);
+    await client.query("COMMIT");
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { discard = true; }
+    throw error;
   } finally {
-    client.release();
+    client.release(discard);
+    client.removeListener("error", onError);
   }
 }
 
+export async function runMigrations(pool: Pool): Promise<void> {
+  await migrateTransaction(pool, async client => { await client.query(SCHEMA); });
+}
+
 export async function ensureOutboxSchema(pool: Pool): Promise<void> {
-  await pool.query(`
+  await migrateTransaction(pool, async client => {
+    await client.query(`
     CREATE TABLE IF NOT EXISTS outbox (
       id BIGSERIAL PRIMARY KEY,
       type TEXT NOT NULL,
@@ -233,11 +251,11 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
       occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-  await pool.query(`
+    await client.query(`
     CREATE INDEX IF NOT EXISTS idx_outbox_occurred_at_desc
     ON outbox (occurred_at DESC);
   `);
-  await pool.query(`
+    await client.query(`
     ALTER TABLE outbox
       ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
@@ -249,5 +267,6 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
       ADD COLUMN IF NOT EXISTS last_delivery_error TEXT;
     CREATE INDEX IF NOT EXISTS idx_outbox_delivery
       ON outbox (next_attempt_at, id) WHERE delivery_status IN ('pending', 'processing');
-  `);
+    `);
+  });
 }

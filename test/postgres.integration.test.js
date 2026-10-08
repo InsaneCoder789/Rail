@@ -42,6 +42,55 @@ test("PostgreSQL migrations create the required runtime tables", { skip: !databa
   }
 });
 
+test("concurrent migrations enforce local constraints and ignore foreign legacy tables", { skip: !databaseUrl }, async () => {
+  const suffix = crypto.randomUUID().replaceAll("-", "");
+  const target = `ci_migration_${suffix}`;
+  const foreign = `ci_legacy_${suffix}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${target}; CREATE SCHEMA ${foreign}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 4, options: `-c search_path=${target}` });
+  try {
+    await admin.query(`CREATE TABLE ${foreign}.api_keys (api_key TEXT, wallet_id TEXT);
+      CREATE TABLE ${foreign}.api_keys_legacy (api_key TEXT, wallet_id TEXT);
+      INSERT INTO ${foreign}.api_keys_legacy VALUES ('foreign_test_key', 'foreign_wallet')`);
+    await Promise.all(Array.from({ length: 6 }, () => runMigrations(pool)));
+    await Promise.all(Array.from({ length: 6 }, () => ensureOutboxSchema(pool)));
+    await assert.rejects(pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ('invalid_wallet', -1)"), { code: "23514" });
+    await assert.rejects(pool.query("INSERT INTO users (user_id, password_hash, wallet_id) VALUES ('orphan_user', 'test_hash', 'missing_wallet')"), { code: "23503" });
+    const legacy = await admin.query(`SELECT * FROM ${foreign}.api_keys_legacy`);
+    assert.equal(legacy.rows[0].api_key, "foreign_test_key");
+    assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM api_keys")).rows[0].count, 0);
+    const columns = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'api_keys'", [target]);
+    assert.ok(columns.rows.some(row => row.column_name === "api_key_hash"));
+    assert.ok(!columns.rows.some(row => row.column_name === "api_key"));
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA ${target} CASCADE; DROP SCHEMA ${foreign} CASCADE`);
+    await admin.end();
+  }
+});
+
+test("failed schema migrations roll back new objects instead of leaving a partial runtime", { skip: !databaseUrl }, async () => {
+  const schema = `ci_bad_migration_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 1, options: `-c search_path=${schema}` });
+  try {
+    await pool.query("CREATE TABLE wallets (wallet_id TEXT PRIMARY KEY, balance BIGINT NOT NULL, reserved BIGINT DEFAULT 0, currency TEXT DEFAULT 'INR', updated_at TIMESTAMPTZ DEFAULT NOW())");
+    await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ('invalid_historical_wallet', -1)");
+    await assert.rejects(runMigrations(pool), { code: "23514" });
+    assert.equal((await pool.query("SELECT to_regclass('rail_rate_limit_buckets') AS table_id")).rows[0].table_id, null);
+    assert.equal((await pool.query("SELECT balance FROM wallets")).rows[0].balance, "-1");
+    await pool.query("UPDATE wallets SET balance = 0");
+    await runMigrations(pool);
+    await ensureOutboxSchema(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
 test("PostgreSQL rate limits are shared and idempotency is durable", { skip: !databaseUrl }, async () => {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 });
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
