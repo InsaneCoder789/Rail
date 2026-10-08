@@ -200,13 +200,12 @@ function walletSaga(tokenStore?: IOfflineTokenStore): SagaCoordinator {
           await claimAuthorizationForExecution(
             client,
             authId,
-            ctx.txn.txId,
+            ctx.txn,
           );
 
           await client.query(
             `INSERT INTO authorization_usage (auth_id, tx_id)
-             VALUES ($1, $2)
-             ON CONFLICT (auth_id) DO NOTHING`,
+             VALUES ($1, $2)`,
             [authId, ctx.txn.txId],
           );
 

@@ -1,6 +1,7 @@
 import { Pool, type PoolClient } from "pg";
 import { randomUUID } from "node:crypto";
 import type { PaymentAuthorization, StoredPaymentAuthorization } from "../domain/authorization.js";
+import type { PaymentTransaction } from "../domain/types.js";
 import { signAuthorization } from "../crypto/authorizationSigning.js";
 
 let pool: Pool | undefined;
@@ -122,7 +123,7 @@ export async function getAuthorizationById(authId: string): Promise<StoredPaymen
 export async function claimAuthorizationForExecution(
   client: PoolClient,
   authId: string,
-  txId: string,
+  txn: PaymentTransaction,
 ): Promise<void> {
   const res = await client.query(
     `UPDATE authorizations
@@ -130,9 +131,13 @@ export async function claimAuthorizationForExecution(
          used_at = NOW()
      WHERE auth_id = $1
        AND tx_id = $2
+       AND sender_wallet_id = $3
+       AND receiver_wallet_id = $4
+       AND amount_minor = $5
+       AND currency = $6
        AND status = 'issued'
        AND expires_at > NOW()`,
-    [authId, txId],
+    [authId, txn.txId, txn.senderWalletId, txn.receiverWalletId, txn.amountMinor, txn.currency],
   );
 
   if (res.rowCount === 0) {
@@ -203,6 +208,8 @@ export async function createAuthorization(input: {
   try {
     await client.query("BEGIN");
 
+    // Serialize issuance even when the authorization row does not exist yet.
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`authorize:${input.txId}`]);
     const existing = await client.query(
       `SELECT auth_id, tx_id, sender_wallet_id, receiver_wallet_id, amount_minor,
               currency, status, signature, created_at, expires_at, used_at, released_at
