@@ -134,12 +134,12 @@ When a payment is executed:
 - the transaction is validated
 - the stored `authorizationId` is loaded and matched against the transaction
 - the idempotency layer protects retries
-- the pipeline runs validation, prechecks, and the funds-and-ledger saga
+- the pipeline runs validation and prechecks using a single durable payment transaction
 - the authorization is claimed inside the payment transaction
 - the sender reservation is consumed
 - the receiver balance is credited
 - ledger rows are written
-- events are emitted
+- ledger entries, execution fingerprints, replay results and outbox events commit with the wallet changes
 
 ### Sync flow
 

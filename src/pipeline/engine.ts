@@ -2,12 +2,13 @@ import type { PaymentTransaction, PipelineResult } from "../domain/types.js";
 import { createPaymentContext } from "./context.js";
 import type { DeadLetterQueue } from "./dlq.js";
 import type { IdempotencyStore } from "./idempotency.js";
-import type { OutboxRelay, OutboxWriter } from "./outbox.js";
+import { MemoryOutbox, type OutboxRelay } from "./outbox.js";
 import type { Tracer } from "./tracing.js";
 import { withSpan } from "./middleware.js";
 import type { Stage } from "./stage.js";
 import { createHash, randomUUID } from "node:crypto";
-import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
+import { canonicalTransactionPayload, legacyTransactionPayload } from "../crypto/transactionSigning.js";
+import { verifyCommittedAuthorization } from "../stages/authorizationStage.js";
 
 function randomId(): string {
   return randomUUID();
@@ -15,7 +16,6 @@ function randomId(): string {
 
 export interface PaymentPipelineEngineOptions {
   readonly idempotency: IdempotencyStore;
-  readonly outbox: OutboxWriter;
   readonly tracer: Tracer;
   readonly dlq: DeadLetterQueue;
   readonly pipeline: Stage;
@@ -37,16 +37,26 @@ export class PaymentPipelineEngine {
       const fingerprint = createHash("sha256")
         .update(canonicalTransactionPayload(txn), "utf8")
         .digest("hex");
-      const result = await this.opts.idempotency.dedupe(txn.idempotencyKey, fingerprint, async () => {
-        const ctx = createPaymentContext(randomId(), randomId(), txn, this.opts.outbox);
+      const legacy = legacyTransactionPayload(txn);
+      const result = await this.opts.idempotency.dedupe(txn.idempotencyKey, fingerprint, async (client) => {
+        const outbox = new MemoryOutbox();
+        const ctx = createPaymentContext(randomId(), randomId(), txn, outbox, client);
         const root = withSpan(this.opts.tracer, "payment_pipeline", this.opts.pipeline);
         await root(ctx);
         if (!ctx.result) {
           throw new Error("invariant_broken:missing_result");
         }
-        await this.flushOutboxRelay(this.opts.relay);
+        for (const event of outbox.drain()) {
+          if (client) {
+            await client.query("INSERT INTO outbox (type, payload, occurred_at) VALUES ($1, $2::jsonb, $3::timestamptz)",
+              [event.type, JSON.stringify(event.payload), event.occurredAt]);
+          } else {
+            await this.opts.relay?.(event);
+          }
+        }
         return ctx.result;
-      });
+      }, { legacyFingerprint: legacy ? createHash("sha256").update(legacy).digest("hex") : undefined,
+        validateLegacy: (client) => verifyCommittedAuthorization(client, txn) });
       span.end("ok", { status: result.status });
       return result;
     } catch (err) {
@@ -60,10 +70,4 @@ export class PaymentPipelineEngine {
     }
   }
 
-  /** Simulate Kafka relay / bridge worker that publishes drained outbox events. */
-  async flushOutboxRelay(relay?: OutboxRelay): Promise<void> {
-    for (const evt of this.opts.outbox.drain()) {
-      await relay?.(evt);
-    }
-  }
 }

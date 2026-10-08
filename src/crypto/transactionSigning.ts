@@ -6,18 +6,27 @@ import { PipelineError } from "../pipeline/errors.js";
  * Canonical UTF-8 string for HMAC. Version this format if you add fields (e.g. `v1:` prefix).
  */
 export function canonicalTransactionPayload(txn: PaymentTransaction): string {
-  return [
+  return JSON.stringify([
+    "rail:transaction:v2",
     txn.txId,
     txn.idempotencyKey,
+    txn.authorizationId ?? null,
     txn.senderWalletId,
     txn.receiverWalletId,
-    String(txn.amountMinor),
+    txn.amountMinor,
     txn.currency,
     txn.channel,
     txn.offlineTokenId ?? "",
     txn.deviceId ?? "",
     txn.createdAt,
-  ].join("|");
+  ]);
+}
+
+/** Only for migrating verified historical replay records; never used to sign requests. */
+export function legacyTransactionPayload(txn: PaymentTransaction): string | undefined {
+  const values = [txn.txId, txn.idempotencyKey, txn.senderWalletId, txn.receiverWalletId,
+    String(txn.amountMinor), txn.currency, txn.channel, txn.offlineTokenId ?? "", txn.deviceId ?? "", txn.createdAt];
+  return values.some((value) => value.includes("|")) ? undefined : values.join("|");
 }
 
 export function verifyTransactionHmac(txn: PaymentTransaction, signatureB64: string | undefined, secret: string): boolean {

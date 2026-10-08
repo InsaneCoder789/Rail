@@ -28,6 +28,10 @@ Use separate values for Preview and Development. Never upload `.env` or copy rea
 
 ## Database setup
 
+The current payment path requires the `rail_payment_executions` table and transactional outbox schema. Apply migrations before updating API instances. PostgreSQL deduplication uses transaction-scoped advisory locks, not session locks. Verify the selected provider's transaction pooling and deadline behavior in its sandbox before live use.
+
+New HMAC requests use versioned JSON-array canonical payloads and include `authorizationId`. Regenerate signatures using the exported helper. Stored completed legacy replay fingerprints are upgraded only when authorization and ledger evidence match; unverifiable historical records need reconciliation. Do not delete idempotency records to force a retry.
+
 Apply the schema from a trusted environment before enabling the Vercel deployment:
 
 ```bash

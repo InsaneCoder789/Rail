@@ -1,13 +1,12 @@
 import process from "node:process";
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
 import { PaymentPipelineEngine } from "../pipeline/engine.js";
-import { MemoryOutbox } from "../pipeline/outbox.js";
 import { consoleTracer } from "../pipeline/tracing.js";
 import { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import { createPool } from "../persistence/postgresPool.js";
-import { runMigrations } from "../persistence/migrate.js";
+import { runMigrations, ensureOutboxSchema } from "../persistence/migrate.js";
 import { createAuthorization, initAuthorizationWallet } from "../stages/authorizationStage.js";
-import { buildHardenedPaymentPipeline, initLedger } from "../stages/paymentPipeline.js";
+import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
 import type { PaymentTransaction } from "../domain/types.js";
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -23,8 +22,8 @@ if (!signingSecret) {
 
 const pool = createPool(databaseUrl);
 await runMigrations(pool);
+await ensureOutboxSchema(pool);
 initAuthorizationWallet(pool);
-initLedger(pool);
 
 await pool.query(
   `INSERT INTO wallets (wallet_id, balance, reserved)
@@ -35,13 +34,11 @@ await pool.query(
 );
 
 const tracer = consoleTracer("[demo]");
-const outbox = new MemoryOutbox();
 const idempotency = new PostgresIdempotencyStore(pool);
 const dlq = new MemoryDeadLetterQueue();
 
 const engine = new PaymentPipelineEngine({
   idempotency,
-  outbox,
   tracer,
   dlq,
   pipeline: buildHardenedPaymentPipeline(tracer),

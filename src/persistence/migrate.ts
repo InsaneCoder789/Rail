@@ -105,6 +105,14 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_authorizations_sender ON authorizations(sender_wallet_id);
 CREATE INDEX IF NOT EXISTS idx_authorizations_status_expires ON authorizations(status, expires_at);
 
+CREATE TABLE IF NOT EXISTS rail_payment_executions (
+  tx_id TEXT PRIMARY KEY REFERENCES authorizations(tx_id),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  request_fingerprint TEXT NOT NULL,
+  result_json JSONB NOT NULL,
+  committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS authorization_usage (
   auth_id TEXT PRIMARY KEY,
   tx_id TEXT NOT NULL,

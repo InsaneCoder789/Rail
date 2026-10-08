@@ -10,6 +10,14 @@ import { handleAuthRoutes } from "../dist/server/routes/authRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { SlidingWindowRateLimiter } from "../dist/server/http.js";
 import { initAuthorizationWallet, createAuthorization, claimAuthorizationForExecution } from "../dist/stages/authorizationStage.js";
+import { buildHardenedPaymentPipeline } from "../dist/stages/paymentPipeline.js";
+import { PaymentPipelineEngine } from "../dist/pipeline/engine.js";
+import { MemoryDeadLetterQueue } from "../dist/pipeline/dlq.js";
+import { noopTracer } from "../dist/pipeline/tracing.js";
+import { PostgresOfflineTokenStore } from "../dist/persistence/postgresOfflineTokenStore.js";
+import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
+import { createHash } from "node:crypto";
+import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
 
 dotenv.config();
 
@@ -25,9 +33,9 @@ test("PostgreSQL migrations create the required runtime tables", { skip: !databa
        FROM information_schema.tables
        WHERE table_schema = 'public'
          AND table_name = ANY($1::text[])`,
-      [["wallets", "authorizations", "ledger_entries", "rail_idempotency", "rail_rate_limit_buckets", "outbox"]],
+      [["wallets", "authorizations", "ledger_entries", "rail_idempotency", "rail_rate_limit_buckets", "rail_payment_executions", "outbox"]],
     );
-    assert.equal(result.rowCount, 6);
+    assert.equal(result.rowCount, 7);
   } finally {
     await pool.end();
   }
@@ -134,4 +142,134 @@ test("concurrent authorization retries reserve once and reject mismatched engine
     if (previousSecret === undefined) delete process.env.RAIL_SIGNING_SECRET;
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
   }
+});
+
+async function paymentFixture(work) {
+  // A single connection proves that execution never nests another checkout.
+  const pool = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 1000 });
+  const suffix = crypto.randomUUID();
+  const sender = `ci_sender_${suffix}`;
+  const receiver = `ci_receiver_${suffix}`;
+  const txId = `ci_payment_${suffix}`;
+  const previousSecret = process.env.RAIL_SIGNING_SECRET;
+  process.env.RAIL_SIGNING_SECRET = previousSecret || "integration_test_signing_secret_0123456789";
+  try {
+    initAuthorizationWallet(pool);
+    await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ($1, 10000), ($2, 0)", [sender, receiver]);
+    const auth = await createAuthorization({ txId, senderWalletId: sender, receiverWalletId: receiver, amountMinor: 2500, currency: "INR" });
+    const tokens = new PostgresOfflineTokenStore(pool);
+    const token = await tokens.issue({ walletId: sender, deviceId: "ci_device", amountCapMinor: 5000 });
+    const txn = { txId, idempotencyKey: `ci_idem_${suffix}`, authorizationId: auth.authId, senderWalletId: sender,
+      receiverWalletId: receiver, amountMinor: 2500, currency: "INR", channel: "nfc",
+      deviceId: "ci_device", offlineTokenId: token.tokenId, createdAt: new Date().toISOString() };
+    const store = new PostgresIdempotencyStore(pool);
+    const makeEngine = (idempotency = store, pipeline = buildHardenedPaymentPipeline(noopTracer, tokens)) => new PaymentPipelineEngine({
+      idempotency, tracer: noopTracer, dlq: new MemoryDeadLetterQueue(), pipeline,
+    });
+    await work({ pool, txn, auth, tokens, token, store, makeEngine });
+  } finally {
+    await pool.query("DELETE FROM outbox WHERE payload->>'txId' = $1", [txId]);
+    await pool.query("DELETE FROM rail_idempotency WHERE idempotency_key LIKE $1", [`ci_idem_${suffix}%`]);
+    await pool.query("DELETE FROM rail_payment_executions WHERE tx_id = $1", [txId]);
+    await pool.query("DELETE FROM ledger_entries WHERE tx_id = $1", [txId]);
+    await pool.query("DELETE FROM authorization_usage WHERE tx_id = $1", [txId]);
+    await pool.query("DELETE FROM authorizations WHERE tx_id = $1", [txId]);
+    await pool.query("DELETE FROM rail_offline_tokens WHERE wallet_id = $1", [sender]);
+    await pool.query("DELETE FROM wallets WHERE wallet_id = ANY($1::text[])", [[sender, receiver]]);
+    await pool.end();
+    if (previousSecret === undefined) delete process.env.RAIL_SIGNING_SECRET;
+    else process.env.RAIL_SIGNING_SECRET = previousSecret;
+  }
+}
+
+test("payment, token usage, ledger, events and replay result commit atomically with a one-connection pool", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, tokens, token, makeEngine }) => {
+    const engine = makeEngine();
+    const results = await Promise.all(Array.from({ length: 6 }, () => engine.execute(txn)));
+    assert.ok(results.every((result) => result.status === "accepted"));
+    assert.equal((await pool.query("SELECT * FROM ledger_entries WHERE tx_id = $1", [txn.txId])).rowCount, 2);
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 2500);
+    const events = await pool.query("SELECT * FROM outbox WHERE payload->>'txId' = $1", [txn.txId]);
+    assert.ok(events.rowCount > 0);
+    const initialEventCount = events.rowCount;
+    await engine.execute(txn);
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE payload->>'txId' = $1", [txn.txId])).rowCount, initialEventCount);
+    const wallets = await pool.query("SELECT wallet_id, balance, reserved FROM wallets WHERE wallet_id = ANY($1::text[])", [[txn.senderWalletId, txn.receiverWalletId]]);
+    assert.equal(Number(wallets.rows.find((row) => row.wallet_id === txn.senderWalletId).balance), 7500);
+    assert.equal(Number(wallets.rows.find((row) => row.wallet_id === txn.senderWalletId).reserved), 0);
+    assert.equal(Number(wallets.rows.find((row) => row.wallet_id === txn.receiverWalletId).balance), 2500);
+    assert.equal((await pool.query("SELECT * FROM rail_payment_executions WHERE tx_id = $1", [txn.txId])).rowCount, 1);
+  });
+});
+
+test("failure after wallet execution but before replay-result storage rolls back all effects and permits retry", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, tokens, token, store, makeEngine }) => {
+    const failingStore = {
+      dedupe(key, fingerprint, run, options) {
+        return store.dedupe(key, fingerprint, async (client) => {
+          await run(client);
+          throw new Error("simulated_failure_before_result");
+        }, options);
+      },
+    };
+    await assert.rejects(makeEngine(failingStore).execute(txn), { message: "simulated_failure_before_result" });
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 5000);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries WHERE tx_id = $1", [txn.txId])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_payment_executions WHERE tx_id = $1", [txn.txId])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_idempotency WHERE idempotency_key = $1", [txn.idempotencyKey])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE payload->>'txId' = $1", [txn.txId])).rowCount, 0);
+    assert.equal((await pool.query("SELECT status FROM authorizations WHERE auth_id = $1", [txn.authorizationId])).rows[0].status, "issued");
+    assert.equal((await makeEngine().execute(txn)).status, "accepted");
+  });
+});
+
+test("lost-response replay reaches the engine through HTTP after authorization expiry", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, store, makeEngine }) => {
+    const engine = makeEngine();
+    const original = await engine.execute(txn);
+    await pool.query("UPDATE authorizations SET expires_at = NOW() - INTERVAL '1 hour' WHERE auth_id = $1", [txn.authorizationId]);
+    const request = Readable.from([JSON.stringify(txn)]);
+    request.method = "POST";
+    request.headers = { "content-type": "application/json" };
+    request.socket = { remoteAddress: "127.0.0.1" };
+    let status;
+    let body;
+    const response = { setHeader() {}, writeHead(value) { status = value; }, end(value) { body = JSON.parse(value); } };
+    const context = { config: loadServerConfig(), engine, idempotency: store, rateLimiter: new SlidingWindowRateLimiter(),
+      authResolver: { async resolveAuthenticatedWallet() { return txn.senderWalletId; } } };
+    await handlePaymentRoutes(request, response, new URL("http://localhost/v1/payments/execute"), context);
+    assert.equal(status, 200);
+    assert.deepEqual(body.result, original);
+    await assert.rejects(engine.execute({ ...txn, idempotencyKey: `${txn.idempotencyKey}_changed` }), { message: "PAYMENT_ALREADY_EXECUTED" });
+    await assert.rejects(engine.execute({ ...txn, authorizationId: "altered_authorization" }), { message: "IDEMPOTENCY_KEY_REUSED" });
+  });
+});
+
+test("verified legacy replay fingerprints migrate without rerunning financial effects", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const engine = makeEngine();
+    const result = await engine.execute(txn);
+    await pool.query("UPDATE rail_idempotency SET request_fingerprint = $2 WHERE idempotency_key = $1",
+      [txn.idempotencyKey, createHash("sha256").update(legacyTransactionPayload(txn)).digest("hex")]);
+    assert.deepEqual(await engine.execute(txn), result);
+    const saved = await pool.query("SELECT request_fingerprint FROM rail_idempotency WHERE idempotency_key = $1", [txn.idempotencyKey]);
+    assert.equal(saved.rows[0].request_fingerprint, createHash("sha256").update(canonicalTransactionPayload(txn)).digest("hex"));
+  });
+});
+
+test("terminating the transaction connection before commit leaves no partial payment and retry succeeds", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, store, tokens, token, makeEngine }) => {
+    const terminating = { dedupe(key, fingerprint, run, options) {
+      return store.dedupe(key, fingerprint, async (client) => {
+        await run(client);
+        await client.query("SELECT pg_terminate_backend(pg_backend_pid())");
+        return { status: "accepted" };
+      }, options);
+    } };
+    await assert.rejects(makeEngine(terminating).execute(txn));
+    assert.equal((await pool.query("SELECT * FROM ledger_entries WHERE tx_id = $1", [txn.txId])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE payload->>'txId' = $1", [txn.txId])).rowCount, 0);
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 5000);
+    assert.equal((await makeEngine().execute(txn)).status, "accepted");
+  });
 });

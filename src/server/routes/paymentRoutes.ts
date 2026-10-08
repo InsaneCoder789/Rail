@@ -59,19 +59,14 @@ async function assertStoredAuthorizationUsable(
   txn: PaymentTransaction,
   context: ServerContext,
 ): Promise<void> {
+  // Used authorizations reach the engine's fingerprint-bound replay check, even after expiry.
+  if (auth.status === "used") return;
   if (Date.parse(auth.expiresAt) <= Date.now()) {
     throw new RequestError(409, "authorization_expired", "authorization has expired");
   }
 
   if (auth.status === "issued") {
     return;
-  }
-
-  if (auth.status === "used") {
-    const completed = await context.idempotency.getCompleted(txn.idempotencyKey);
-    if (completed) {
-      return;
-    }
   }
 
   throw new RequestError(409, "authorization_not_issued", `authorization status is ${auth.status}`);

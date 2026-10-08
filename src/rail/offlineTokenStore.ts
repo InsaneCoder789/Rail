@@ -26,6 +26,7 @@ export interface IssueOfflineTokenInput {
 
 /** Common contract for in-memory and PostgreSQL offline token backends. */
 export interface IOfflineTokenStore {
+  readonly supportsTransactions: boolean;
   issue(input: IssueOfflineTokenInput): Promise<IssuedOfflineToken>;
   beginOfflineSpend(txn: PaymentTransaction, client?: PoolClient): Promise<{ ok: true } | { ok: false; reason: string }>;
   finalizeOfflineSpend(txn: PaymentTransaction, client?: PoolClient): Promise<void>;
@@ -38,6 +39,7 @@ export interface IOfflineTokenStore {
  * beginOfflineSpend reserves headroom; finalizeOfflineSpend or rollbackOfflineSpend completes the cycle.
  */
 export class OfflineTokenStore implements IOfflineTokenStore {
+  readonly supportsTransactions = false;
   private readonly tokens = new Map<string, IssuedOfflineToken>();
   private readonly mutex = new AsyncMutex();
 

@@ -6,16 +6,17 @@ import type { PaymentAuthorization } from "../domain/authorization.js";
  * MUST be identical on sign + verify
  */
 export function canonicalAuthorizationPayload(auth: Omit<PaymentAuthorization, "signature">): string {
-  return [
+  return JSON.stringify([
+    "rail:authorization:v2",
     auth.authId,
     auth.txId,
     auth.senderWalletId,
     auth.receiverWalletId,
-    String(auth.amountMinor),
+    auth.amountMinor,
     auth.currency,
     auth.createdAt,
     auth.expiresAt,
-  ].join("|");
+  ]);
 }
 
 /**
@@ -42,7 +43,7 @@ export function verifyAuthorization(
   // ⏱️ Expiry validation
   try {
     const expiry = new Date(unsigned.expiresAt).getTime();
-    if (!Number.isFinite(expiry) || Date.now() > expiry) {
+    if (!Number.isFinite(expiry) || Date.now() >= expiry) {
       return false;
     }
   } catch {

@@ -10,7 +10,6 @@ dotenv.config();
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
 import { PaymentPipelineEngine } from "../pipeline/engine.js";
 import { MemoryIdempotencyStore } from "../pipeline/idempotency.js";
-import { MemoryOutbox } from "../pipeline/outbox.js";
 import { consoleTracer } from "../pipeline/tracing.js";
 import { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import { PostgresOfflineTokenStore } from "../persistence/postgresOfflineTokenStore.js";
@@ -18,7 +17,7 @@ import { PostgresRateLimiter } from "../persistence/postgresRateLimiter.js";
 import { ensureOutboxSchema, runMigrations } from "../persistence/migrate.js";
 import { createPool } from "../persistence/postgresPool.js";
 import { OfflineTokenStore } from "../rail/offlineTokenStore.js";
-import { buildHardenedPaymentPipeline, initLedger } from "../stages/paymentPipeline.js";
+import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
 import {
   initAuthorizationWallet,
   releaseExpiredAuthorizations,
@@ -73,7 +72,6 @@ export async function createServerContext(options: {
       }, config.authSweepIntervalMs).unref();
     }
 
-    initLedger(pool);
     offlineTokenStore = new PostgresOfflineTokenStore(pool);
     idempotency = new PostgresIdempotencyStore(pool);
     console.log(`Rail: PostgreSQL persistence enabled (pool max ${config.dbPoolMax})`);
@@ -87,7 +85,6 @@ export async function createServerContext(options: {
 
   const engine = new PaymentPipelineEngine({
     idempotency,
-    outbox: new MemoryOutbox(),
     tracer,
     dlq: new MemoryDeadLetterQueue(),
     pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel),

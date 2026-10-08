@@ -2,6 +2,7 @@ import { Pool, type PoolClient } from "pg";
 import { randomUUID } from "node:crypto";
 import type { PaymentAuthorization, StoredPaymentAuthorization } from "../domain/authorization.js";
 import type { PaymentTransaction } from "../domain/types.js";
+import { PipelineError } from "../pipeline/errors.js";
 import { signAuthorization } from "../crypto/authorizationSigning.js";
 
 let pool: Pool | undefined;
@@ -141,7 +142,24 @@ export async function claimAuthorizationForExecution(
   );
 
   if (res.rowCount === 0) {
-    throw new Error("AUTH_NOT_EXECUTABLE");
+    throw new PipelineError("AUTH_NOT_EXECUTABLE", "AUTH_NOT_EXECUTABLE");
+  }
+}
+
+/** Legacy replay migration requires both a used authorization and its balanced ledger pair. */
+export async function verifyCommittedAuthorization(client: PoolClient, txn: PaymentTransaction): Promise<void> {
+  const authorization = await client.query(
+    `SELECT a.auth_id FROM authorizations a
+     JOIN authorization_usage u ON u.auth_id = a.auth_id AND u.tx_id = a.tx_id
+     WHERE a.auth_id = $1 AND a.tx_id = $2 AND a.sender_wallet_id = $3
+       AND a.receiver_wallet_id = $4 AND a.amount_minor = $5 AND a.currency = $6 AND a.status = 'used'`,
+    [txn.authorizationId, txn.txId, txn.senderWalletId, txn.receiverWalletId, txn.amountMinor, txn.currency]);
+  const ledger = await client.query(
+    "SELECT wallet_id, entry_type, amount_minor, currency FROM ledger_entries WHERE tx_id = $1", [txn.txId]);
+  const matches = (type: string, wallet: string) => ledger.rows.some((row) => row.entry_type === type &&
+    row.wallet_id === wallet && Number(row.amount_minor) === txn.amountMinor && row.currency === txn.currency);
+  if (authorization.rowCount !== 1 || ledger.rowCount !== 2 || !matches("debit", txn.senderWalletId) || !matches("credit", txn.receiverWalletId)) {
+    throw new PipelineError("COMMITTED_PAYMENT_MISMATCH", "COMMITTED_PAYMENT_MISMATCH");
   }
 }
 

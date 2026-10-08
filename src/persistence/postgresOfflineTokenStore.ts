@@ -21,6 +21,7 @@ function mapRow(row: Record<string, unknown>): IssuedOfflineToken {
 }
 
 export class PostgresOfflineTokenStore implements IOfflineTokenStore {
+  readonly supportsTransactions = true;
   constructor(private readonly pool: Pool) {}
 
   async issue(input: IssueOfflineTokenInput): Promise<IssuedOfflineToken> {

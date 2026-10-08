@@ -1,5 +1,6 @@
 import http from "node:http";
 import type { Pool } from "pg";
+import { PipelineError } from "../pipeline/errors.js";
 
 export class RequestError extends Error {
   readonly status: number;
@@ -225,6 +226,14 @@ export function toErrorResponse(
   err: unknown,
   exposeInternalErrors: boolean,
 ): { status: number; body: Record<string, unknown> } {
+  if (err instanceof PipelineError) {
+    const conflicts = ["IDEMPOTENCY_KEY_REUSED", "PAYMENT_ALREADY_EXECUTED", "AUTH_NOT_EXECUTABLE", "COMMITTED_PAYMENT_MISMATCH",
+      "unknown_or_expired_token", "token_expired", "wallet_mismatch", "device_mismatch", "currency_mismatch", "insufficient_token_headroom"];
+    if (conflicts.includes(err.code)) return { status: 409, body: { error: err.code.toLowerCase() } };
+    if (["INVALID_TRANSACTION", "SELF_TRANSFER"].includes(err.code)) return { status: 422, body: { error: err.code.toLowerCase() } };
+    if (["MISSING_AUTH_ID", "SIGNATURE_INVALID"].includes(err.code)) return { status: 401, body: { error: err.code.toLowerCase() } };
+    if (err.retryable || err.code === "OFFLINE_TOKEN_STORE_REQUIRED") return { status: 503, body: { error: "temporarily_unavailable" } };
+  }
   if (err instanceof RequestError) {
     const body: Record<string, unknown> = { error: err.code };
     if (err.hint) body.hint = err.hint;

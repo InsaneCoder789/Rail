@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import dotenv from "dotenv";
 import { signAuthorization, verifyAuthorization } from "../dist/crypto/authorizationSigning.js";
-import { signTransactionHmac, verifyTransactionHmac } from "../dist/crypto/transactionSigning.js";
+import { signTransactionHmac, verifyTransactionHmac, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
 import { OfflineTokenStore } from "../dist/rail/offlineTokenStore.js";
 import { PipelineError } from "../dist/pipeline/errors.js";
 import { withRetry } from "../dist/pipeline/retry.js";
@@ -42,6 +42,15 @@ test("rejects tampered transaction HMACs", () => {
   const signature = signTransactionHmac(transaction, secret);
   assert.equal(verifyTransactionHmac(transaction, signature, secret), true);
   assert.equal(verifyTransactionHmac({ ...transaction, amountMinor: 2501 }, signature, secret), false);
+});
+
+test("canonical signing prevents delimiter collisions and binds authorization references", () => {
+  const left = { ...transaction, txId: "tx_example|tail", idempotencyKey: "idem_example", authorizationId: "auth_one" };
+  const right = { ...left, txId: "tx_example", idempotencyKey: "tail|idem_example" };
+  assert.notEqual(canonicalTransactionPayload(left), canonicalTransactionPayload(right));
+  const signature = signTransactionHmac(left, secret);
+  assert.equal(verifyTransactionHmac(right, signature, secret), false);
+  assert.equal(verifyTransactionHmac({ ...left, authorizationId: "auth_two" }, signature, secret), false);
 });
 
 test("enforces offline token device binding and restores rolled-back headroom", async () => {

@@ -1,11 +1,19 @@
 import type { PipelineResult } from "../domain/types.js";
+import type { PoolClient } from "pg";
+import { PipelineError } from "./errors.js";
+
+export interface DedupeOptions {
+  readonly legacyFingerprint?: string;
+  readonly validateLegacy?: (client: PoolClient) => Promise<void>;
+}
+export type IdempotencyWork = (client?: PoolClient) => Promise<PipelineResult>;
 
 type RecordState =
   | { status: "inflight"; fingerprint: string; promise: Promise<PipelineResult> }
   | { status: "completed"; fingerprint: string; result: PipelineResult };
 
 export interface IdempotencyStore {
-  dedupe(key: string, fingerprint: string, run: () => Promise<PipelineResult>): Promise<PipelineResult>;
+  dedupe(key: string, fingerprint: string, run: IdempotencyWork, options?: DedupeOptions): Promise<PipelineResult>;
   getCompleted(key: string): Promise<PipelineResult | undefined> | PipelineResult | undefined;
 }
 
@@ -23,12 +31,12 @@ export class MemoryIdempotencyStore implements IdempotencyStore {
 
   /**
    * Ensures a single execution per key; concurrent callers await the same promise.
-   * Failed runs are terminal for this key (replay returns the same failure).
+   * Failed runs are removed so temporary failures can be retried.
    */
   async dedupe(key: string, fingerprint: string, run: () => Promise<PipelineResult>): Promise<PipelineResult> {
     const existing = this.records.get(key);
     if (existing?.fingerprint !== undefined && existing.fingerprint !== fingerprint) {
-      throw new Error("IDEMPOTENCY_KEY_REUSED");
+      throw new PipelineError("IDEMPOTENCY_KEY_REUSED", "IDEMPOTENCY_KEY_REUSED");
     }
     if (existing?.status === "completed") return existing.result;
     if (existing?.status === "inflight") return existing.promise;

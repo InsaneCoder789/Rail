@@ -53,7 +53,7 @@ test("ML shadow observations cannot authorize or fund a payment", async () => {
   const outbox = new MemoryOutbox();
   const txn = { txId: "risk_test_001", idempotencyKey: "risk_idem_001", senderWalletId: "sender",
     receiverWalletId: "receiver", amountMinor: 1_100_000, currency: "INR", channel: "online",
-    createdAt: "2026-10-08T00:00:00.000Z" };
+    authorizationId: "auth_risk_001", createdAt: "2026-10-08T00:00:00.000Z" };
   const context = createPaymentContext("trace", "correlation", txn, outbox);
   await assert.rejects(buildHardenedPaymentPipeline(noopTracer, undefined, model)(context),
     { message: "db_not_initialized" });
