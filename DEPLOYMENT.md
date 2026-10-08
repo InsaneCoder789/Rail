@@ -50,7 +50,7 @@ Then verify the deployment with an authenticated smoke test. A public `GET /heal
 
 ## Operational limitations
 
-The current sliding-window rate limiter is process-local. It protects each warm function instance, but it is not a globally shared limiter across all Vercel instances. For higher-risk or higher-volume use, move rate-limit counters to Redis or another shared store.
+PostgreSQL deployments use shared fixed-window rate-limit buckets with row locking. Memory-only development uses a process-local sliding window. Capacity testing and retention for old buckets remain operational work.
 
 The current SSE event stream is designed for a long-lived Node process. It is explicitly disabled on Vercel serverless execution, so hosted clients should use `GET /v1/events` polling until event delivery is moved to a managed pub/sub service.
 

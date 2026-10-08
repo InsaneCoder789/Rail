@@ -424,7 +424,8 @@ Streams wallet-visible events over SSE.
 Frontend note:
 
 - regular clients can use `Authorization: Bearer <token>`
-- browser `EventSource` clients can also use `?access_token=<jwt>` or `?api_key=<key>` when custom headers are unavailable
+- use authenticated `fetch` streaming when custom headers are required, or poll `GET /v1/events`
+- query-string credentials are not accepted; hosted serverless runtimes disable SSE
 
 ---
 
@@ -525,7 +526,7 @@ These gaps are tracked more fully in [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS
 
 ## License
 
-Add a `LICENSE` file before publishing the project more widely.
+Licensed under AGPL-3.0-only. See [LICENSE](./LICENSE).
 
 ---
 

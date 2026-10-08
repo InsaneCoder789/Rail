@@ -38,6 +38,10 @@ Use it in the following ways:
 
 ## Latest Status
 
+On 8 October 2026, version 2 began on `codex/rail-v2-foundation`. The original offline-capable payment flow remains the foundation. Current findings, fixed issues and release gates are tracked in [SECURITY_REVIEW.md](./SECURITY_REVIEW.md). Earlier phase descriptions below remain historical records, not a claim that every financial-system safeguard is complete.
+
+The first V2 security pass prevents registration from claiming existing wallets, applies login/registration limits across usernames per IP, validates JSON object boundaries and enforces bcrypt's 72-byte password limit. Existing oversized passwords need a reset policy rather than silently changing hashes. Tests exercise wallet ownership against PostgreSQL, rotating usernames and invalid/multibyte inputs.
+
 Phase 1 transaction-safety changes have now been implemented in the codebase.
 
 The major improvements completed in this phase are:
@@ -859,6 +863,8 @@ Six additional hardening tests were added for authorization-signature tampering,
 The in-memory offline-token store now returns defensive copies from token issuance and reads. This prevents accidental or malicious mutation of token headroom, wallet ownership, or device binding outside the store's validation and mutex-protected operations.
 
 ## Shared Rate-Limit Hardening
+
+On 8 October 2026, concurrent creation of a new bucket was corrected: the bucket is inserted before row locking, because PostgreSQL cannot lock a row that does not exist. A live integration test confirms twelve concurrent calls admit exactly three at a quota of three.
 
 On 2026-08-30, durable PostgreSQL-backed rate limiting was added for database-backed deployments. Login, authorization, execution, token issuance, and synchronization now use a database bucket protected by row-level locking, so the quota is shared across warm instances instead of being limited to one process. Memory rate limiting remains available only for local development without PostgreSQL.
 

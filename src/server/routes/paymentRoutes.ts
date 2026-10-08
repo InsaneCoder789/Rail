@@ -7,6 +7,7 @@ import { RequestError, applyRateLimit, json, readAndParseJson, requireJsonConten
 import type { ServerContext } from "../types.js";
 import {
   isCurrency,
+  isRecord,
   isIssueTokenRequest,
   isPaymentTransaction,
   isSafeText,
@@ -219,7 +220,8 @@ export async function handlePaymentRoutes(
       throw err;
     }
 
-    const body = parsed as Record<string, unknown>;
+    if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
+    const body = parsed;
     const { authorizationId, providedAuthorization } = resolveAuthorizationReference(body);
     const { authorization: _authorization, ...txnRaw } = body;
 

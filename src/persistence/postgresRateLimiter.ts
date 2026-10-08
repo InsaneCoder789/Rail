@@ -8,6 +8,13 @@ export class PostgresRateLimiter implements RateLimiter {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // Create the row before locking it: SELECT FOR UPDATE cannot lock an absent bucket.
+      await client.query(
+        `INSERT INTO rail_rate_limit_buckets (bucket_key, window_started_at, hit_count)
+         VALUES ($1, NOW(), 0)
+         ON CONFLICT (bucket_key) DO NOTHING`,
+        [key],
+      );
       const result = await client.query(
         `SELECT window_started_at, hit_count
          FROM rail_rate_limit_buckets

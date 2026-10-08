@@ -5,6 +5,10 @@ import { Pool } from "pg";
 import { ensureOutboxSchema, runMigrations } from "../dist/persistence/migrate.js";
 import { PostgresIdempotencyStore } from "../dist/persistence/postgresIdempotency.js";
 import { PostgresRateLimiter } from "../dist/persistence/postgresRateLimiter.js";
+import { Readable } from "node:stream";
+import { handleAuthRoutes } from "../dist/server/routes/authRoutes.js";
+import { loadServerConfig } from "../dist/server/config.js";
+import { SlidingWindowRateLimiter } from "../dist/server/http.js";
 
 dotenv.config();
 
@@ -53,6 +57,43 @@ test("PostgreSQL rate limits are shared and idempotency is durable", { skip: !da
   } finally {
     await pool.query("DELETE FROM rail_rate_limit_buckets WHERE bucket_key = $1", [rateKey]);
     await pool.query("DELETE FROM rail_idempotency WHERE idempotency_key = $1", [idempotencyKey]);
+    await pool.end();
+  }
+});
+
+test("concurrent first requests cannot exceed a new PostgreSQL rate-limit bucket", { skip: !databaseUrl }, async () => {
+  const pool = new Pool({ connectionString: databaseUrl, max: 12 });
+  const key = `ci:concurrent:${crypto.randomUUID()}`;
+  try {
+    const decisions = await Promise.all(Array.from({ length: 12 }, () =>
+      new PostgresRateLimiter(pool).consume(key, 3, 60_000)));
+    assert.equal(decisions.filter((decision) => decision.retryAfterSeconds === 0).length, 3);
+    assert.equal(decisions.filter((decision) => decision.retryAfterSeconds > 0).length, 9);
+    assert.equal(Number((await pool.query("SELECT hit_count FROM rail_rate_limit_buckets WHERE bucket_key = $1", [key])).rows[0].hit_count), 3);
+  } finally {
+    await pool.query("DELETE FROM rail_rate_limit_buckets WHERE bucket_key = $1", [key]);
+    await pool.end();
+  }
+});
+
+test("registration cannot claim a pre-existing wallet", { skip: !databaseUrl }, async () => {
+  const pool = new Pool({ connectionString: databaseUrl, max: 2 });
+  const walletId = `ci_wallet_${crypto.randomUUID()}`;
+  try {
+    await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ($1, 9000)", [walletId]);
+    const request = Readable.from([JSON.stringify({ userId: walletId, password: "test_password_123" })]);
+    request.method = "POST";
+    request.headers = { "content-type": "application/json" };
+    request.socket = { remoteAddress: "127.0.0.1" };
+    const response = { setHeader() {} };
+    const context = { pool, config: loadServerConfig(), rateLimiter: new SlidingWindowRateLimiter() };
+    await assert.rejects(handleAuthRoutes(request, response, new URL("http://localhost/auth/register"), context),
+      { status: 409, code: "wallet_exists" });
+    assert.equal((await pool.query("SELECT * FROM users WHERE user_id = $1", [walletId])).rowCount, 0);
+    assert.equal(Number((await pool.query("SELECT balance FROM wallets WHERE wallet_id = $1", [walletId])).rows[0].balance), 9000);
+  } finally {
+    await pool.query("DELETE FROM users WHERE user_id = $1", [walletId]);
+    await pool.query("DELETE FROM wallets WHERE wallet_id = $1", [walletId]);
     await pool.end();
   }
 });

@@ -3,7 +3,7 @@ import * as bcrypt from "bcryptjs";
 import { generateToken } from "../../auth/jwt.js";
 import { RequestError, applyRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
 import type { ServerContext } from "../types.js";
-import { isSafeText } from "../validation.js";
+import { isSafeText, isRecord } from "../validation.js";
 
 export async function handleAuthRoutes(
   req: http.IncomingMessage,
@@ -14,7 +14,8 @@ export async function handleAuthRoutes(
   if (req.method === "POST" && url.pathname === "/auth/register") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
-    const body = parsed as Record<string, unknown>;
+    if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
+    const body = parsed;
     await applyRateLimit({
       req,
       res,
@@ -22,7 +23,6 @@ export async function handleAuthRoutes(
       scope: "register",
       limit: context.config.rateLimits.loginMax,
       windowMs: context.config.rateLimits.loginWindowMs,
-      discriminator: String(body?.userId ?? ""),
       trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
@@ -35,20 +35,23 @@ export async function handleAuthRoutes(
     if (!isSafeText(body.userId, 3, 128)) {
       throw new RequestError(422, "invalid_body", "userId is invalid");
     }
-    if (typeof body.password !== "string" || body.password.length < 8 || body.password.length > 128) {
-      throw new RequestError(422, "weak_password", "password must be 8-128 characters");
+    if (typeof body.password !== "string" || body.password.length < 8 || Buffer.byteLength(body.password, "utf8") > 72) {
+      throw new RequestError(422, "weak_password", "password must contain at least 8 characters and at most 72 UTF-8 bytes");
     }
 
     const hash = await bcrypt.hash(body.password, 10);
     const client = await context.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(
+      const wallet = await client.query(
         `INSERT INTO wallets (wallet_id, balance, reserved)
          VALUES ($1, 0, 0)
          ON CONFLICT (wallet_id) DO NOTHING`,
         [body.userId],
       );
+      if (wallet.rowCount !== 1) {
+        throw new RequestError(409, "wallet_exists", "registration cannot claim an existing wallet");
+      }
       await client.query(
         `INSERT INTO users (user_id, password_hash, wallet_id)
          VALUES ($1, $2, $1)`,
@@ -73,7 +76,8 @@ export async function handleAuthRoutes(
   if (req.method === "POST" && url.pathname === "/auth/login") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
-    const body = parsed as Record<string, unknown>;
+    if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
+    const body = parsed;
     await applyRateLimit({
       req,
       res,
@@ -81,12 +85,16 @@ export async function handleAuthRoutes(
       scope: "login",
       limit: context.config.rateLimits.loginMax,
       windowMs: context.config.rateLimits.loginWindowMs,
-      discriminator: String(body?.userId ?? ""),
       trustProxyHeaders: context.config.trustProxyHeaders,
     });
 
     if (!context.pool) {
       throw new Error("DB_NOT_INITIALIZED");
+    }
+
+    if (!isSafeText(body.userId, 3, 128) || typeof body.password !== "string" ||
+        body.password.length < 8 || Buffer.byteLength(body.password, "utf8") > 72) {
+      throw new RequestError(422, "invalid_body", "invalid login credentials");
     }
 
     const resDb = await context.pool.query(

@@ -8,6 +8,10 @@ const MIN_TTL_SECONDS = 60;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
 const OFFLINE_CHANNELS = new Set<PaymentTransaction["channel"]>(["nfc", "ble", "qr"]);
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 export function isSafeText(value: unknown, min: number, max: number): value is string {
   if (typeof value !== "string") return false;
   if (value.length < min || value.length > max) return false;
