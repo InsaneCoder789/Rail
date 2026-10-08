@@ -1,7 +1,7 @@
 import http from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { Pool } from "pg";
-import { verifyToken } from "../auth/jwt.js";
+import { verifyToken, InvalidTokenError } from "../auth/jwt.js";
 import { RequestError, json, normalizeHeaderValue } from "./http.js";
 import type { AuthResolver } from "./types.js";
 
@@ -42,7 +42,7 @@ async function getWalletFromApiKey(pool: Pool, apiKey: string): Promise<string> 
   );
 
   if (res.rowCount === 0) {
-    throw new Error("INVALID_API_KEY");
+    throw new RequestError(401, "invalid_credentials", "invalid credentials");
   }
 
   return res.rows[0].wallet_id as string;
@@ -55,7 +55,7 @@ async function getWalletFromUser(pool: Pool, userId: string): Promise<string> {
   );
 
   if (res.rowCount === 0) {
-    throw new Error("USER_NOT_FOUND");
+    throw new RequestError(401, "invalid_credentials", "invalid credentials");
   }
 
   return res.rows[0].wallet_id as string;
@@ -75,8 +75,13 @@ export function createAuthResolver(args: {
 
       const bearer = resolveBearerToken(req);
       if (bearer) {
-        const decoded = verifyToken(bearer);
-        return getWalletFromUser(pool, decoded.userId);
+        try {
+          const decoded = verifyToken(bearer);
+          return await getWalletFromUser(pool, decoded.userId);
+        } catch (err) {
+          if (err instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
+          throw err;
+        }
       }
 
       const apiKey = resolveApiKeyHeader(req);

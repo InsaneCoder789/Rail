@@ -65,10 +65,12 @@ export function loadServerConfig(): ServerConfig {
   const allowedOrigins = resolveAllowedOrigins();
   const jwtSecret = process.env.JWT_SECRET ?? "";
   const signingSecret = process.env.RAIL_SIGNING_SECRET ?? "";
+  const apiKey = process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "";
 
   if (isProduction) {
     if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED_IN_PRODUCTION");
     if (!process.env.RAIL_API_KEY && !process.env.KYLR_API_KEY) throw new Error("RAIL_API_KEY_REQUIRED_IN_PRODUCTION");
+    if (apiKey.trim().length < 32) throw new Error("PRODUCTION_API_KEY_MUST_BE_AT_LEAST_32_CHARACTERS");
     if (jwtSecret.length < 32 || signingSecret.length < 32) {
       throw new Error("PRODUCTION_SECRETS_MUST_BE_AT_LEAST_32_CHARACTERS");
     }
@@ -82,8 +84,8 @@ export function loadServerConfig(): ServerConfig {
     serverless,
     dbPoolMax: resolvePositiveIntEnv("RAIL_DB_POOL_MAX", serverless ? 5 : 20),
     disableSse: process.env.RAIL_DISABLE_SSE === "true" || serverless,
-    trustProxyHeaders: process.env.RAIL_TRUST_PROXY_HEADERS === "true" || serverless,
-    apiKey: process.env.RAIL_API_KEY ?? process.env.KYLR_API_KEY ?? "",
+    trustProxyHeaders: process.env.RAIL_TRUST_PROXY_HEADERS === "true",
+    apiKey,
     apiKeyScopes: resolveApiKeyScopes(),
     allowedOrigins,
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),

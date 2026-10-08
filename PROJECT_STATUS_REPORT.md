@@ -38,6 +38,8 @@ Use it in the following ways:
 
 ## Latest Status
 
+Production configuration now rejects service API keys shorter than 32 non-whitespace characters and requires an explicit proxy-trust setting even in serverless runtimes. JWT verification accepts only HS256, validates user claims and maps invalid/expired tokens to generic 401 responses; unknown API keys and deleted users also return 401. Tests cover production configuration, explicit proxy trust, token expiry, algorithm mismatch and missing credential owners. Account-level delays and session revocation remain tracked work.
+
 Concurrency hardening reserves semaphore slots during FIFO handoff, makes release idempotent and bounds queued work. Retry cancellation now rejects already-aborted work, stops after abort and removes delay listeners on completion. Regression tests cover newcomer races, queue overflow, cancellation and listener cleanup. Timeout propagation across payment commits remains a separate open item.
 
 Authorization hardening now checks sender, receiver, amount and currency in the transactional claim used by the engine. Transaction-scoped locking also serializes concurrent issuance for a previously absent transaction ID. PostgreSQL regression coverage confirms eight simultaneous retries return the same authorization and reserve exactly once. Crash recovery and serverless expiry remain tracked separately until their tests pass.
