@@ -54,6 +54,12 @@ Then verify the deployment with an authenticated smoke test. A public `GET /heal
 
 ## Operational limitations
 
+### Durable external event delivery
+
+Configure `RAIL_OUTBOX_WEBHOOK_URL` as a trusted HTTPS receiver and `RAIL_OUTBOX_WEBHOOK_SECRET` as a separate random secret of at least 32 characters. The worker refuses redirects and URL credentials. Run `npm run outbox:dispatch` from a scheduled worker/cron environment after applying migrations; each invocation claims a bounded batch and exits. The command is not run during API requests or serverless cold starts.
+
+The receiver must durably process and deduplicate the `Idempotency-Key`/`deliveryId` before returning a 2xx acknowledgement. Delivery is at least once: a worker can crash after the receiver processes an event but before recording its acknowledgement. Failure count, next attempt, lease and final dead-letter state are persisted in `outbox`. Monitor dead-letter rows and review before an explicit operator retry; never discard them to conceal delivery failure. Payment correctness does not depend on webhook availability.
+
 PostgreSQL deployments use shared fixed-window rate-limit buckets with row locking. Memory-only development uses a process-local sliding window. Capacity testing and retention for old buckets remain operational work.
 
 The current SSE event stream is designed for a long-lived Node process. It is explicitly disabled on Vercel serverless execution, so hosted clients should use `GET /v1/events` polling until event delivery is moved to a managed pub/sub service.

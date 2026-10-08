@@ -10,6 +10,7 @@
     "migrate": "npm run build && node dist/persistence/runMigrations.js",
     "test": "npm run build && node --test test/*.test.js",
     "risk:train": "npm run build && node dist/risk/trainRisk.js",
+    "outbox:dispatch": "npm run build && node dist/persistence/runOutboxWorker.js",
     "demo": "npm run build && node dist/demo/runPayment.js",
     "server": "npm run build && node dist/server/server.js"
   },

@@ -507,6 +507,7 @@ src/
 |---|---|
 | Build | `npm run build` |
 | Tests | `npm test` |
+| Deliver outbox batch | `npm run outbox:dispatch` |
 | Train risk baseline | `npm run risk:train -- dataset.json model.json` |
 | Run server | `npm run server` |
 | Demo script | `npm run demo` |
@@ -521,7 +522,7 @@ This project is much stronger than a toy payment demo, but it is still honest to
 
 Current limitations include:
 
-- the event relay path still uses temporary bridging mechanics internally
+- durable webhook delivery needs a scheduled worker and a receiver that deduplicates event IDs; SSE lifecycle improvements remain tracked
 - API keys are still an area that can be hardened further
 - in-memory mode is best understood as a local fallback, not a full alternative runtime
 - no enforced fraud policy is implemented; optional ML remains in shadow mode and needs validated labeled data

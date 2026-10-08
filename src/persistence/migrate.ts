@@ -227,4 +227,17 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_outbox_occurred_at_desc
     ON outbox (occurred_at DESC);
   `);
+  await pool.query(`
+    ALTER TABLE outbox
+      ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
+      ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
+      ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS lease_id UUID,
+      ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS last_delivery_error TEXT;
+    CREATE INDEX IF NOT EXISTS idx_outbox_delivery
+      ON outbox (next_attempt_at, id) WHERE delivery_status IN ('pending', 'processing');
+  `);
 }

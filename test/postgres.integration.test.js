@@ -18,6 +18,7 @@ import { PostgresOfflineTokenStore } from "../dist/persistence/postgresOfflineTo
 import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
 import { createHash } from "node:crypto";
 import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
+import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
 
 dotenv.config();
 
@@ -272,4 +273,63 @@ test("terminating the transaction connection before commit leaves no partial pay
     assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 5000);
     assert.equal((await makeEngine().execute(txn)).status, "accepted");
   });
+});
+
+test("outbox leases exclude parallel workers and failed deliveries retry with a stable ID", { skip: !databaseUrl }, async () => {
+  const schema = `ci_outbox_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 4, options: `-c search_path=${schema}` });
+  try {
+    await ensureOutboxSchema(pool);
+    const row = (await pool.query("INSERT INTO outbox (type, payload) VALUES ('test.event', '{}') RETURNING id")).rows[0];
+    const ids = [];
+    const policies = { batchSize: 1, leaseMs: 1000, deliveryTimeoutMs: 500, retryDelayMs: 60_000, maxAttempts: 2 };
+    const workers = await Promise.all([1, 2].map(() => dispatchOutboxBatch(pool, async (event) => {
+      ids.push(event.deliveryId);
+      throw new Error("external_failure");
+    }, policies)));
+    assert.equal(workers.reduce((sum, worker) => sum + worker.failed, 0), 1);
+    await pool.query("UPDATE outbox SET next_attempt_at = NOW() - INTERVAL '1 second'");
+    const retried = await dispatchOutboxBatch(pool, async (event) => { ids.push(event.deliveryId); }, policies);
+    assert.equal(retried.delivered, 1);
+    assert.deepEqual(ids, [String(row.id), String(row.id)]);
+    assert.equal((await pool.query("SELECT delivery_status, delivery_attempts FROM outbox")).rows[0].delivery_attempts, 2);
+    assert.equal((await dispatchOutboxBatch(pool, async () => assert.fail("delivered event replayed"), policies)).delivered, 0);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+test("outbox retries end in dead letters and expired worker leases can be reclaimed", { skip: !databaseUrl }, async () => {
+  const schema = `ci_outbox_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 2, options: `-c search_path=${schema}` });
+  try {
+    await ensureOutboxSchema(pool);
+    await pool.query("INSERT INTO outbox (type, payload) VALUES ('test.dead_letter', '{}')");
+    const policy = { batchSize: 1, maxAttempts: 1, leaseMs: 1000, deliveryTimeoutMs: 500 };
+    await dispatchOutboxBatch(pool, async () => { throw new Error("failure"); }, policy);
+    assert.equal((await pool.query("SELECT delivery_status FROM outbox")).rows[0].delivery_status, "dead_letter");
+    await pool.query(`INSERT INTO outbox (type, payload, delivery_status, delivery_attempts, lease_id, lease_expires_at)
+      VALUES ('test.recovered', '{}', 'processing', 1, $1::uuid, NOW() - INTERVAL '1 second')`, [crypto.randomUUID()]);
+    const result = await dispatchOutboxBatch(pool, async () => {}, { ...policy, maxAttempts: 3 });
+    assert.equal(result.delivered, 1);
+    const row = (await pool.query("SELECT * FROM outbox WHERE type = 'test.recovered'")).rows[0];
+    assert.equal(row.delivery_attempts, 2);
+    assert.equal(row.delivery_status, "delivered");
+    assert.equal(row.lease_id, null);
+    await pool.query("INSERT INTO outbox (type, payload) VALUES ('test.timeout', '{}')");
+    const timed = await dispatchOutboxBatch(pool, async () => new Promise(() => {}),
+      { ...policy, leaseMs: 100, deliveryTimeoutMs: 10 });
+    assert.equal(timed.failed, 1);
+    assert.equal((await pool.query("SELECT delivery_status FROM outbox WHERE type = 'test.timeout'")).rows[0].delivery_status, "dead_letter");
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+  }
 });
