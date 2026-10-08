@@ -74,6 +74,43 @@ test("enforces offline token device binding and restores rolled-back headroom", 
   assert.equal((await store.getToken(token.tokenId)).remainingMinor, 5000);
 });
 
+test("offline store validates issuance caps, lifetimes and bindings", async () => {
+  const store = new OfflineTokenStore();
+  const input = { walletId: "wallet_sender", deviceId: "device_a", amountCapMinor: 5000 };
+  for (const amountCapMinor of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+    await assert.rejects(store.issue({ ...input, amountCapMinor }), /invalid_amount_cap/);
+  }
+  for (const ttlSeconds of [0, -1, 1.5, Infinity, 2592001]) {
+    await assert.rejects(store.issue({ ...input, ttlSeconds }), /invalid_token_ttl/);
+  }
+  await assert.rejects(store.issue({ ...input, currency: "invalid" }), /invalid_currency/);
+  await assert.rejects(store.issue({ ...input, deviceId: "device\nspoof" }), /invalid_token_binding/);
+});
+
+test("offline reservations are idempotent and refunds require a matching reserved spend", async () => {
+  const store = new OfflineTokenStore();
+  const token = await store.issue({ walletId: "wallet_sender", deviceId: "device_a", amountCapMinor: 5000 });
+  const txn = { ...transaction, channel: "nfc", offlineTokenId: token.tokenId, deviceId: "device_a" };
+  assert.deepEqual(await store.beginOfflineSpend({ ...txn, txId: undefined }), { ok: false, reason: "invalid_transaction" });
+  for (const amountMinor of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+    assert.deepEqual(await store.beginOfflineSpend({ ...txn, amountMinor }), { ok: false, reason: "invalid_amount" });
+  }
+  await store.rollbackOfflineSpend(txn);
+  await store.beginOfflineSpend(txn);
+  await store.beginOfflineSpend(txn);
+  assert.equal((await store.getToken(token.tokenId)).remainingMinor, 2500);
+  assert.deepEqual(await store.beginOfflineSpend({ ...txn, amountMinor: 1 }), { ok: false, reason: "offline_spend_mismatch" });
+  await assert.rejects(store.rollbackOfflineSpend({ ...txn, deviceId: "device_b" }), /offline_spend_mismatch/);
+  await store.rollbackOfflineSpend(txn);
+  await store.rollbackOfflineSpend(txn);
+  assert.equal((await store.getToken(token.tokenId)).remainingMinor, 5000);
+  await store.beginOfflineSpend(txn);
+  await store.finalizeOfflineSpend(txn);
+  await store.rollbackOfflineSpend(txn);
+  await store.beginOfflineSpend(txn);
+  assert.equal((await store.getToken(token.tokenId)).remainingMinor, 2500);
+});
+
 test("does not expose mutable offline token state", async () => {
   const store = new OfflineTokenStore();
   const token = await store.issue({ walletId: "wallet_sender", deviceId: "device_a", amountCapMinor: 5000 });

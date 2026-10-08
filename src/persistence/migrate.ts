@@ -39,6 +39,16 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_rail_offline_tokens_wallet ON rail_offline_tokens(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_rail_offline_tokens_expires ON rail_offline_tokens(expires_at_ms);
 
+CREATE TABLE IF NOT EXISTS rail_offline_spends (
+  tx_id TEXT PRIMARY KEY,
+  token_id TEXT NOT NULL REFERENCES rail_offline_tokens(token_id),
+  request_fingerprint TEXT NOT NULL,
+  amount_minor BIGINT NOT NULL CHECK (amount_minor > 0 AND amount_minor <= 1000000000000),
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'finalized', 'rolled_back')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rail_offline_spends_token ON rail_offline_spends(token_id);
+
 CREATE TABLE IF NOT EXISTS wallets (
   wallet_id TEXT PRIMARY KEY,
   balance BIGINT NOT NULL,

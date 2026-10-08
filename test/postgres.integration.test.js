@@ -175,6 +175,7 @@ async function paymentFixture(work) {
     await pool.query("DELETE FROM ledger_entries WHERE tx_id = $1", [txId]);
     await pool.query("DELETE FROM authorization_usage WHERE tx_id = $1", [txId]);
     await pool.query("DELETE FROM authorizations WHERE tx_id = $1", [txId]);
+    await pool.query("DELETE FROM rail_offline_spends WHERE token_id IN (SELECT token_id FROM rail_offline_tokens WHERE wallet_id = $1)", [sender]);
     await pool.query("DELETE FROM rail_offline_tokens WHERE wallet_id = $1", [sender]);
     await pool.query("DELETE FROM wallets WHERE wallet_id = ANY($1::text[])", [[sender, receiver]]);
     await pool.end();
@@ -182,6 +183,31 @@ async function paymentFixture(work) {
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
   }
 }
+
+test("PostgreSQL offline reservations reject invalid amounts and cannot double-reserve or double-refund", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ txn, tokens, token }) => {
+    await assert.rejects(tokens.issue({ walletId: txn.senderWalletId, deviceId: "ci_device", amountCapMinor: NaN }), /invalid_amount_cap/);
+    await assert.rejects(tokens.issue({ walletId: txn.senderWalletId, deviceId: "ci_device", amountCapMinor: 5000, ttlSeconds: Infinity }), /invalid_token_ttl/);
+    assert.deepEqual(await tokens.beginOfflineSpend({ ...txn, txId: undefined }), { ok: false, reason: "invalid_transaction" });
+    for (const amountMinor of [-1, 0, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+      assert.deepEqual(await tokens.beginOfflineSpend({ ...txn, amountMinor }), { ok: false, reason: "invalid_amount" });
+    }
+    await tokens.rollbackOfflineSpend(txn);
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 5000);
+    const reservations = await Promise.all(Array.from({ length: 8 }, () => tokens.beginOfflineSpend(txn)));
+    assert.ok(reservations.every(result => result.ok));
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 2500);
+    await assert.rejects(tokens.rollbackOfflineSpend({ ...txn, amountMinor: 1 }), /offline_spend_mismatch/);
+    await tokens.rollbackOfflineSpend(txn);
+    await tokens.rollbackOfflineSpend(txn);
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 5000);
+    await tokens.beginOfflineSpend(txn);
+    await tokens.finalizeOfflineSpend(txn);
+    await tokens.rollbackOfflineSpend(txn);
+    await tokens.beginOfflineSpend(txn);
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 2500);
+  });
+});
 
 test("payment, token usage, ledger, events and replay result commit atomically with a one-connection pool", { skip: !databaseUrl }, async () => {
   await paymentFixture(async ({ pool, txn, tokens, token, makeEngine }) => {
