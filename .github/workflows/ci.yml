@@ -52,5 +52,7 @@ jobs:
         run: node --test test/hardening.test.js
       - name: Verify event delivery and stream lifecycle
         run: node --test test/events.test.js
+      - name: Verify request deadlines and bounded diagnostic stores
+        run: node --test test/resources.test.js
       - name: Verify authentication and existing shadow-risk and audit regressions
         run: node --test test/authRoutes.test.js test/risk.test.js test/auditCommitment.test.js

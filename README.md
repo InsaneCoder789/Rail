@@ -311,6 +311,7 @@ That mode is useful for local experimentation, but it is not the main supported 
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
 | `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
 | `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
+| `RAIL_REQUEST_BODY_TIMEOUT_MS` | Absolute body-read deadline for JSON routes. Default 10000 ms; slow/stalled uploads receive 408. |
 | `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
 | `RAIL_RATE_LIMIT_LOGIN_MAX` | Login attempts allowed in the configured login window. |
 | `RAIL_RATE_LIMIT_LOGIN_WINDOW_MS` | Login rate-limit window in milliseconds. |
@@ -437,6 +438,12 @@ Frontend note:
 - query-string credentials are not accepted; hosted serverless runtimes disable SSE
 
 ---
+
+## Request and Diagnostic Bounds
+
+JSON bodies are size-limited and have an absolute read deadline. Oversized requests receive 413; stalled bodies receive 408. Both responses close the connection after flushing the JSON error, rather than destroying the socket before the client can read it. Reverse proxies still need independent header, connection and upload limits.
+
+Development memory stores are bounded: idempotency retains at most 10,000 records and refuses new keys when full, never evicting successful replay results to admit another payment. The memory rate limiter caps identities and denies new ones until expired entries can be reclaimed. The memory diagnostic DLQ keeps the latest 1,000 entries and is not an audit log or delivery queue; durable delivery failures live in the PostgreSQL outbox. Database replay/token retention must be designed separately before pruning financial records.
 
 ## Event Model
 

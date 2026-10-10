@@ -38,6 +38,14 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Request and Resource Review: 10 October 2026
+
+JSON readers now have an absolute configurable deadline (`RAIL_REQUEST_BODY_TIMEOUT_MS`, default 10 seconds), handle interrupted bodies, release listeners/buffers and pause rejected uploads. The HTTP handler flushes 413/408 JSON errors before closing an unread connection. Real socket tests verify both responses rather than only testing an error object.
+
+Memory diagnostic dead letters retain the latest 1,000 items and return defensive copies. Development idempotency caps records at 10,000 without evicting replay results, rejects new keys at capacity, isolates returned result objects, and correctly retries a synchronously thrown failure. The memory rate limiter caps identities, expires buckets using their own window and fails closed when full. These are local safeguards, not replacements for durable PostgreSQL state or deployment-level denial-of-service protection.
+
+Eight new regressions bring the suite to 79 passing tests with no skips. GitHub Actions explicitly reruns resource tests as well as the full suite. Financial retention cleanup, production proxy limits and the remaining authentication/deployment gates are still open.
+
 ### Event Delivery Review: 10 October 2026
 
 Wallet-visible history now filters committed outbox rows in SQL before applying limits, with wallet lookup indexes and stable event IDs. REST accepts a bounded limit and an older-page cursor, and returns `nextBefore`. Failed outbox writes propagate errors instead of producing phantom live events. Operational errors stay in server logs rather than being inserted and broadcast twice.

@@ -23,9 +23,13 @@ export interface IdempotencyStore {
 export class MemoryIdempotencyStore implements IdempotencyStore {
   private readonly records = new Map<string, RecordState>();
 
+  constructor(private readonly capacity = 10000) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("invalid_idempotency_capacity");
+  }
+
   getCompleted(key: string): PipelineResult | undefined {
     const r = this.records.get(key);
-    if (r?.status === "completed") return r.result;
+    if (r?.status === "completed") return { ...r.result };
     return undefined;
   }
 
@@ -38,21 +42,22 @@ export class MemoryIdempotencyStore implements IdempotencyStore {
     if (existing?.fingerprint !== undefined && existing.fingerprint !== fingerprint) {
       throw new PipelineError("IDEMPOTENCY_KEY_REUSED", "IDEMPOTENCY_KEY_REUSED");
     }
-    if (existing?.status === "completed") return existing.result;
-    if (existing?.status === "inflight") return existing.promise;
+    if (existing?.status === "completed") return { ...existing.result };
+    if (existing?.status === "inflight") return { ...await existing.promise };
+    // Never evict completed replay state merely to admit new payments.
+    if (this.records.size >= this.capacity) throw new PipelineError("MEMORY_IDEMPOTENCY_CAPACITY", "MEMORY_IDEMPOTENCY_CAPACITY");
 
-    const promise = (async () => {
-      try {
-        const result = await run();
-        this.records.set(key, { status: "completed", fingerprint, result });
-        return result;
-      } catch (err) {
-        this.records.delete(key);
-        throw err;
-      }
-    })();
+    // Defer invocation until the inflight record exists, including sync throws.
+    const promise = Promise.resolve().then(run).then(result => {
+      const stored = Object.freeze({ ...result });
+      this.records.set(key, { status: "completed", fingerprint, result: stored });
+      return stored;
+    }).catch(err => {
+      this.records.delete(key);
+      throw err;
+    });
 
     this.records.set(key, { status: "inflight", fingerprint, promise });
-    return promise;
+    return { ...await promise };
   }
 }

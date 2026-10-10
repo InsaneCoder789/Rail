@@ -160,6 +160,11 @@ export async function handleRequest(
       }
 
       const mapped = toErrorResponse(err, context.config.exposeInternalErrors);
+      if (mapped.status === 413 || mapped.status === 408) {
+        // Flush the error response before closing an unread or stalled request body.
+        res.setHeader("Connection", "close");
+        res.once("finish", () => { req.destroy(); });
+      }
       if (err instanceof RateLimitError) {
         res.setHeader("Retry-After", String(err.retryAfterSeconds));
         res.setHeader("X-RateLimit-Limit", String(err.limit));

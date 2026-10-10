@@ -13,7 +13,7 @@ export async function handleAuthRoutes(
 ): Promise<boolean> {
   if (req.method === "POST" && url.pathname === "/auth/register") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
-    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
+    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
     if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
     const body = parsed;
     await applyRateLimit({
@@ -75,7 +75,7 @@ export async function handleAuthRoutes(
 
   if (req.method === "POST" && url.pathname === "/auth/login") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
-    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
+    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
     if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
     const body = parsed;
     await applyRateLimit({

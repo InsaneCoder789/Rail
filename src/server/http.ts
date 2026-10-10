@@ -75,25 +75,40 @@ export function json(res: http.ServerResponse, status: number, body: unknown): v
   res.end(payload);
 }
 
-export function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
+export function readJsonBody(req: http.IncomingMessage, maxBytes: number, timeoutMs = 10_000): Promise<string> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    return Promise.reject(new Error("invalid_body_read_limits"));
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     let finished = false;
+    const cleanup = () => {
+      clearTimeout(deadline);
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("error", onError);
+      req.removeListener("aborted", onAborted);
+      req.removeListener("close", onClose);
+    };
 
     const rejectOnce = (err: unknown): void => {
       if (finished) return;
       finished = true;
+      cleanup();
+      chunks.length = 0;
+      req.pause();
       reject(err);
     };
 
     const resolveOnce = (value: string): void => {
       if (finished) return;
       finished = true;
+      cleanup();
       resolve(value);
     };
 
-    req.on("data", (c) => {
+    const onData = (c: Buffer | string) => {
       const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
       totalBytes += chunk.length;
       if (totalBytes > maxBytes) {
@@ -105,18 +120,26 @@ export function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promi
             "reduce payload size or increase RAIL_MAX_REQUEST_BODY_BYTES",
           ),
         );
-        req.destroy();
         return;
       }
       chunks.push(chunk);
-    });
-    req.on("end", () => resolveOnce(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", (err) => rejectOnce(err));
+    };
+    const onEnd = () => resolveOnce(Buffer.concat(chunks).toString("utf8"));
+    const onError = (error: Error) => rejectOnce(error);
+    const onAborted = () => rejectOnce(new RequestError(400, "request_aborted", "request body was interrupted"));
+    const onClose = () => { if (!finished) onAborted(); };
+    const deadline = setTimeout(() => rejectOnce(new RequestError(408, "body_timeout", "request body deadline exceeded")), timeoutMs);
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("aborted", onAborted);
+    req.once("close", onClose);
+    if (req.aborted || req.destroyed) onAborted();
   });
 }
 
-export async function readAndParseJson(req: http.IncomingMessage, maxBytes: number): Promise<unknown> {
-  const raw = await readJsonBody(req, maxBytes);
+export async function readAndParseJson(req: http.IncomingMessage, maxBytes: number, timeoutMs = 10_000): Promise<unknown> {
+  const raw = await readJsonBody(req, maxBytes, timeoutMs);
   try {
     return JSON.parse(raw || "{}");
   } catch {
@@ -154,16 +177,29 @@ export function getClientIp(req: http.IncomingMessage, trustProxyHeaders = false
 }
 
 export class SlidingWindowRateLimiter {
-  private readonly hits = new Map<string, number[]>();
+  private readonly hits = new Map<string, { timestamps: number[]; expiresAt: number }>();
+
+  constructor(private readonly capacity = 10000) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("invalid_rate_limit_capacity");
+  }
 
   consume(key: string, limit: number, windowMs: number): { limit: number; remaining: number; retryAfterSeconds: number } {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000 || !Number.isSafeInteger(windowMs) || windowMs < 1) {
+      throw new Error("invalid_rate_limit_policy");
+    }
     const now = Date.now();
     const earliest = now - windowMs;
-    const current = (this.hits.get(key) ?? []).filter((ts) => ts > earliest);
+    if (!this.hits.has(key) && this.hits.size >= this.capacity) {
+      for (const [existingKey, bucket] of this.hits) {
+        if (bucket.expiresAt <= now) this.hits.delete(existingKey);
+      }
+      if (this.hits.size >= this.capacity) return { limit, remaining: 0, retryAfterSeconds: 1 };
+    }
+    const current = (this.hits.get(key)?.timestamps ?? []).filter((ts) => ts > earliest);
 
     if (current.length >= limit) {
       const retryAfterMs = Math.max(1_000, windowMs - (now - current[0]));
-      this.hits.set(key, current);
+      this.hits.set(key, { timestamps: current, expiresAt: current.at(-1)! + windowMs });
       return {
         limit,
         remaining: 0,
@@ -172,15 +208,7 @@ export class SlidingWindowRateLimiter {
     }
 
     current.push(now);
-    this.hits.set(key, current);
-
-    if (this.hits.size > 20_000) {
-      for (const [existingKey, timestamps] of this.hits) {
-        if (timestamps.length === 0 || timestamps[timestamps.length - 1] <= earliest) {
-          this.hits.delete(existingKey);
-        }
-      }
-    }
+    this.hits.set(key, { timestamps: current, expiresAt: now + windowMs });
 
     return {
       limit,

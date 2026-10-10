@@ -18,6 +18,7 @@ export interface ServerConfig {
   readonly apiKeyScopes: readonly string[];
   readonly allowedOrigins: readonly string[];
   readonly maxRequestBodyBytes: number;
+  readonly requestBodyTimeoutMs: number;
   readonly maxSyncBatchSize: number;
   readonly exposeInternalErrors: boolean;
   readonly requireJsonContentType: boolean;
@@ -89,6 +90,7 @@ export function loadServerConfig(): ServerConfig {
     apiKeyScopes: resolveApiKeyScopes(),
     allowedOrigins,
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),
+    requestBodyTimeoutMs: resolvePositiveIntEnv("RAIL_REQUEST_BODY_TIMEOUT_MS", 10_000),
     maxSyncBatchSize: resolvePositiveIntEnv("RAIL_MAX_SYNC_BATCH_SIZE", 100),
     exposeInternalErrors: process.env.RAIL_EXPOSE_INTERNAL_ERRORS === "true",
     requireJsonContentType: process.env.RAIL_REQUIRE_JSON_CONTENT_TYPE !== "false",

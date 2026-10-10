@@ -99,7 +99,7 @@ export async function handlePaymentRoutes(
   if (req.method === "POST" && url.pathname === "/v1/payments/authorize") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
-    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
+    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
 
     let authenticatedWallet: string;
     try {
@@ -161,7 +161,7 @@ export async function handlePaymentRoutes(
     if (!context.authResolver.requireApiKey(req, res, "offline_tokens:issue")) return true;
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
-    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
+    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
     if (!isIssueTokenRequest(parsed)) {
       json(res, 422, {
         error: "invalid_body",
@@ -207,7 +207,7 @@ export async function handlePaymentRoutes(
   if (req.method === "POST" && url.pathname === "/v1/payments/execute") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
-    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
+    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
 
     let authenticatedWallet: string;
     try {
@@ -272,7 +272,7 @@ export async function handlePaymentRoutes(
     if (!context.authResolver.requireApiKey(req, res, "sync:write")) return true;
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
-    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes);
+    const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
     if (!isSyncBody(parsed, context.config.maxSyncBatchSize)) {
       json(res, 422, {
         error: "invalid_body",
