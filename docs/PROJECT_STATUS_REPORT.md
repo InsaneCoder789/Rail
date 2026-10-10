@@ -38,6 +38,12 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Documentation Organization: 10 October 2026
+
+All 44 project Markdown files now live under `docs/`, including the repository README, public reports, technical guides, local manuals and ignored private plans. Four extracted historical documentation packs retain their separate names under `docs/archives/`, avoiding collisions or overwriting newer documents. Their ZIP archive and image assets remain in `deliverables/`. Dependency/build/Git directories were excluded from the move.
+
+Document-to-document links remain relative within `docs/`; the README license link now resolves to the root `LICENSE`. The private scope and V2 report remain ignored, with an additional `docs/PRIVATE_*.md` rule protecting private Markdown in the new location. Previously untracked manuals and archive copies remain untracked. This changes documentation paths only, not the application runtime. Link targets, file inventory and Git ignore behavior were checked; runtime tests were not rerun for these moves.
+
 ### V2.0 Atomic Protected Evidence: 10 October 2026
 
 The HTTP runtime now requires an explicitly configured `RAIL_EVIDENCE_KEY_RING` and supplies a transaction evidence store to the payment engine. Newly executed online and reconnect/offline payments encrypt the canonical audit copy with AES-256-GCM and authenticate its versioned envelope using a separate HMAC-SHA256 key. Evidence insertion uses the same database client and transaction as wallet, authorization, token, ledger, outbox and replay state. A required-evidence execution cannot commit without its fingerprint-bound evidence; evidence rows are immutable. Replays retain the original committed record rather than re-encrypting it.
@@ -289,6 +295,8 @@ The system is not a settlement rail by itself. It is closer to a payment control
 
 The repository is small and focused. The major code areas are:
 
+- `docs/`
+  All project Markdown, including README, deployment guidance, status reports and local supporting manuals. Private plans are ignored. Extracted historical packs are kept in `docs/archives/`; non-Markdown deliverables remain in `deliverables/`.
 - `src/server/`
   Main HTTP server bootstrap, route-family handlers, auth helpers, validation, rate limiting, and event wiring.
 - `src/stages/`

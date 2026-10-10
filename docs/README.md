@@ -570,7 +570,7 @@ These gaps are tracked more fully in [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS
 
 ## License
 
-Licensed under AGPL-3.0-only. See [LICENSE](./LICENSE).
+Licensed under AGPL-3.0-only. See [LICENSE](../LICENSE).
 
 ---
 
