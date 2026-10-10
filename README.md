@@ -346,7 +346,15 @@ Authenticates a user and returns a JWT.
 Notes:
 
 - login failures return a generic invalid-credentials response
-- login is rate limited
+- login is rate limited per IP and per account across IPs (default five attempts per 15 minutes); account identifiers are hashed in quota keys
+- successful attempts count toward the same bounded quota; this temporary throttle is not an adaptive fraud engine or permanent account lockout
+- JWTs carry the stored credential version and expire after 15 minutes; tokens issued before this versioned-token change require a fresh login
+
+### `POST /auth/logout-all`
+
+Send `Authorization: Bearer <token>`. Rail atomically increments the user's credential version, returning `{ "ok": true, "sessionsRevoked": "all" }`. Previously issued bearer tokens fail subsequent authentication across instances, including stream rechecks. The caller must log in again. This does not revoke API keys or cancel a payment already authenticated and executing; uncertain payment responses must be retried with the original idempotency key.
+
+Password recovery and operator credential resets must also increment this version. No public password-reset flow is implemented in V1; do not expose a manual database reset operation to client applications.
 
 ### `POST /v1/payments/authorize`
 

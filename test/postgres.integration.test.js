@@ -22,6 +22,9 @@ import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
 import { findReconciliationIssues, recordWalletOpeningBalance } from "../dist/persistence/reconciliation.js";
 import { createEventStore } from "../dist/server/events.js";
 import { runPaymentDemo } from "../dist/demo/runPayment.js";
+import { createAuthResolver } from "../dist/server/authentication.js";
+import { generateToken } from "../dist/auth/jwt.js";
+import * as bcrypt from "bcryptjs";
 
 dotenv.config();
 
@@ -340,6 +343,39 @@ test("event readers on another instance cannot observe an uncommitted notificati
       await client.query("ROLLBACK");
       client.release();
       await reader.end();
+    }
+  });
+});
+
+test("logout-all revokes tokens across instances and prevents repeated revocation", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn }) => {
+    const previousSecret = process.env.JWT_SECRET;
+    process.env.JWT_SECRET = previousSecret || "integration_jwt_secret_01234567890123456789";
+    try {
+      await pool.query("INSERT INTO users(user_id, password_hash, wallet_id) VALUES ('user_session_test', $2, $1)",
+        [txn.senderWalletId, await bcrypt.hash("session_test_password", 10)]);
+      const first = createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] });
+      const second = createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] });
+      const token = generateToken("user_session_test", 0);
+      const req = { method: "POST", headers: { authorization: `Bearer ${token}` } };
+      assert.equal(await first.resolveAuthenticatedWallet(req), txn.senderWalletId);
+      let result;
+      const res = { writeHead() {}, end(body) { result = JSON.parse(body); } };
+      await handleAuthRoutes(req, res, new URL("http://local/auth/logout-all"), { pool });
+      assert.equal(result.sessionsRevoked, "all");
+      await assert.rejects(second.resolveAuthenticatedWallet(req), { status: 401 });
+      await assert.rejects(handleAuthRoutes(req, res, new URL("http://local/auth/logout-all"), { pool }), { status: 401 });
+      assert.equal((await pool.query("SELECT auth_version FROM users WHERE user_id = 'user_session_test'")).rows[0].auth_version, 1);
+      assert.equal(await second.resolveAuthenticatedWallet({ headers: { authorization: `Bearer ${generateToken("user_session_test", 1)}` } }), txn.senderWalletId);
+      const login = Readable.from([JSON.stringify({ userId: "user_session_test", password: "session_test_password" })]);
+      login.method = "POST";
+      login.headers = { "content-type": "application/json" };
+      login.socket = { remoteAddress: "127.0.0.1" };
+      await handleAuthRoutes(login, { ...res, setHeader() {} }, new URL("http://local/auth/login"),
+        { pool, config: loadServerConfig(), rateLimiter: new PostgresRateLimiter(pool) });
+      assert.equal(await second.resolveAuthenticatedWallet({ headers: { authorization: `Bearer ${result.token}` } }), txn.senderWalletId);
+    } finally {
+      if (previousSecret === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = previousSecret;
     }
   });
 });

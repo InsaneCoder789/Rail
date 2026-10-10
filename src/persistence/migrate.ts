@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_id);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0 CHECK (auth_version >= 0);
 
 DO $$
 BEGIN

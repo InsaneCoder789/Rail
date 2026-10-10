@@ -42,3 +42,17 @@ test("registration rejects passwords beyond bcrypt's UTF-8 byte limit", async ()
   await assert.rejects(handleAuthRoutes(request({ userId: "new_user", password: "\u00e9".repeat(37) }),
     { setHeader() {} }, new URL("http://localhost/auth/register"), context), { status: 422, code: "weak_password" });
 });
+
+test("rotating IP addresses cannot bypass the shared account login quota", async () => {
+  const config = loadServerConfig();
+  const context = { config: { ...config, rateLimits: { ...config.rateLimits, loginMax: 2 } },
+    pool: { async query() { return { rowCount: 0, rows: [] }; } }, rateLimiter: new SlidingWindowRateLimiter() };
+  for (let i = 0; i < 2; i++) {
+    const req = request({ userId: "target_account", password: "password_123" });
+    req.socket.remoteAddress = `192.0.2.${i + 1}`;
+    await assert.rejects(handleAuthRoutes(req, { setHeader() {} }, new URL("http://local/auth/login"), context), { status: 401 });
+  }
+  const req = request({ userId: "target_account", password: "password_123" });
+  req.socket.remoteAddress = "192.0.2.99";
+  await assert.rejects(handleAuthRoutes(req, { setHeader() {} }, new URL("http://local/auth/login"), context), { status: 429 });
+});

@@ -14,8 +14,7 @@
 export type HsmMode = "none" | "hmac_env" | "kms" | "pkcs11";
 
 export function resolveHsmMode(): HsmMode {
-  if (process.env.RAIL_PKCS11_MODULE_PATH) return "pkcs11";
-  if (process.env.RAIL_KMS_KEY_ID) return "kms";
+  if (process.env.RAIL_PKCS11_MODULE_PATH || process.env.RAIL_KMS_KEY_ID) throw new Error("HSM_PROVIDER_NOT_IMPLEMENTED");
   if (process.env.RAIL_SIGNING_SECRET) return "hmac_env";
   return "none";
 }

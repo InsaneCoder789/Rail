@@ -1,7 +1,8 @@
 import http from "node:http";
 import * as bcrypt from "bcryptjs";
-import { generateToken } from "../../auth/jwt.js";
-import { RequestError, applyRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
+import { createHash } from "node:crypto";
+import { generateToken, verifyToken, InvalidTokenError } from "../../auth/jwt.js";
+import { RateLimitError, RequestError, applyRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
 import type { ServerContext } from "../types.js";
 import { isSafeText, isRecord } from "../validation.js";
 
@@ -41,8 +42,13 @@ export async function handleAuthRoutes(
 
     const hash = await bcrypt.hash(body.password, 10);
     const client = await context.pool.connect();
+    let discard = false;
+    const onError = () => { discard = true; };
+    client.on("error", onError);
     try {
       await client.query("BEGIN");
+      await client.query("SET LOCAL lock_timeout = '5s'");
+      await client.query("SET LOCAL statement_timeout = '15s'");
       const wallet = await client.query(
         `INSERT INTO wallets (wallet_id, balance, reserved)
          VALUES ($1, 0, 0)
@@ -59,14 +65,15 @@ export async function handleAuthRoutes(
       );
       await client.query("COMMIT");
     } catch (err: unknown) {
-      await client.query("ROLLBACK");
+      try { await client.query("ROLLBACK"); } catch { discard = true; }
       const pgError = err as { code?: string };
       if (pgError?.code === "23505") {
         throw new RequestError(409, "user_exists", "user already exists");
       }
       throw err;
     } finally {
-      client.release();
+      client.release(discard);
+      client.removeListener("error", onError);
     }
 
     json(res, 200, { ok: true });
@@ -97,8 +104,13 @@ export async function handleAuthRoutes(
       throw new RequestError(422, "invalid_body", "invalid login credentials");
     }
 
+    // No IP component: rotating source addresses cannot bypass this account quota.
+    // Hash the identifier to avoid placing usernames in rate-limit bucket keys.
+    const account = createHash("sha256").update(body.userId).digest("hex");
+    const quota = await context.rateLimiter.consume(`login_account:${account}`, context.config.rateLimits.loginMax, context.config.rateLimits.loginWindowMs);
+    if (quota.retryAfterSeconds > 0) throw new RateLimitError("account login quota exceeded", quota.retryAfterSeconds, quota.limit, quota.remaining);
     const resDb = await context.pool.query(
-      `SELECT password_hash FROM users WHERE user_id = $1`,
+      `SELECT password_hash, auth_version FROM users WHERE user_id = $1`,
       [body.userId],
     );
 
@@ -111,8 +123,26 @@ export async function handleAuthRoutes(
       throw new RequestError(401, "invalid_credentials", "invalid credentials");
     }
 
-    const token = generateToken(String(body.userId));
+    const token = generateToken(body.userId, resDb.rows[0].auth_version);
     json(res, 200, { token });
+    return true;
+  }
+
+  if (req.method === "POST" && url.pathname === "/auth/logout-all") {
+    const header = req.headers.authorization;
+    if (typeof header !== "string" || !header.startsWith("Bearer ")) throw new RequestError(401, "unauthorized", "bearer token required");
+    if (!context.pool) throw new Error("DB_NOT_INITIALIZED");
+    let credentials;
+    try { credentials = verifyToken(header.slice(7)); }
+    catch (error) {
+      if (error instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
+      throw error;
+    }
+    const result = await context.pool.query(`UPDATE users SET auth_version = auth_version + 1
+      WHERE user_id = $1 AND auth_version = $2 AND auth_version < 2147483647 RETURNING user_id`,
+      [credentials.userId, credentials.authVersion]);
+    if (result.rowCount !== 1) throw new RequestError(401, "invalid_credentials", "invalid credentials");
+    json(res, 200, { ok: true, sessionsRevoked: "all" });
     return true;
   }
 

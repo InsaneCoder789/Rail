@@ -38,6 +38,14 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V1 Authentication Closure: 10 October 2026
+
+Login now consumes a second shared quota keyed by a hash of the account identifier without an IP component, preventing source-address rotation from bypassing account limits. Both successful and failed attempts count; the default is five attempts per 15 minutes, not a permanent or adaptive lockout. JWTs carry `authVersion`, require integer issuance/expiry values and a maximum 15-minute lifetime, and authentication checks the stored version. Old versionless tokens must log in again.
+
+`POST /auth/logout-all` uses a bearer token and atomically advances the stored version, invalidating previous tokens on subsequent requests across instances. Concurrent/repeated revocations cannot increment the version with a stale token. Login after revocation issues the new version. In-flight authenticated payments are not cancelled. API-key rotation and password recovery remain separate operations; operator password resets must increment the version too.
+
+Registration now uses database deadlines and discards clients after connection/rollback failures. Production configuration cannot enable internal error exposure. Unimplemented KMS/PKCS#11 settings fail closed instead of advertising unavailable protection. Four new regressions bring the suite to 86 passing tests with no skips. Release scope and the historical accounting decision still require explicit owner confirmation; no existing financial records were rewritten.
+
 ### CI Runtime Review: 10 October 2026
 
 The successful demo-fix CI run reported deprecated Node 20 action runtimes and an upcoming `ubuntu-latest` image change. The workflow now pins verified official checkout/setup-node release commits, disables persisted checkout credentials, selects Ubuntu 24.04 explicitly and runs the full PostgreSQL-backed suite on Node 22 and 24 independently. Read-only repository permissions and the ten-minute job limit remain unchanged. Version upgrades must deliberately review the pinned action SHAs rather than silently following mutable major tags.

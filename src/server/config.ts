@@ -61,6 +61,7 @@ function resolveApiKeyScopes(): string[] {
 }
 
 export function loadServerConfig(): ServerConfig {
+  if (process.env.RAIL_PKCS11_MODULE_PATH || process.env.RAIL_KMS_KEY_ID) throw new Error("HSM_PROVIDER_NOT_IMPLEMENTED");
   const serverless = process.env.VERCEL === "1" || process.env.RAIL_RUNTIME === "serverless";
   const isProduction = process.env.NODE_ENV === "production";
   const allowedOrigins = resolveAllowedOrigins();
@@ -92,7 +93,7 @@ export function loadServerConfig(): ServerConfig {
     maxRequestBodyBytes: resolvePositiveIntEnv("RAIL_MAX_REQUEST_BODY_BYTES", 64 * 1024),
     requestBodyTimeoutMs: resolvePositiveIntEnv("RAIL_REQUEST_BODY_TIMEOUT_MS", 10_000),
     maxSyncBatchSize: resolvePositiveIntEnv("RAIL_MAX_SYNC_BATCH_SIZE", 100),
-    exposeInternalErrors: process.env.RAIL_EXPOSE_INTERNAL_ERRORS === "true",
+    exposeInternalErrors: !isProduction && process.env.RAIL_EXPOSE_INTERNAL_ERRORS === "true",
     requireJsonContentType: process.env.RAIL_REQUIRE_JSON_CONTENT_TYPE !== "false",
     authSweepIntervalMs: resolvePositiveIntEnv("RAIL_AUTH_SWEEP_INTERVAL_MS", 60_000),
     rateLimits: {

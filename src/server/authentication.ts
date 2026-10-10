@@ -48,10 +48,10 @@ async function getWalletFromApiKey(pool: Pool, apiKey: string): Promise<string> 
   return res.rows[0].wallet_id as string;
 }
 
-async function getWalletFromUser(pool: Pool, userId: string): Promise<string> {
+async function getWalletFromUser(pool: Pool, userId: string, authVersion: number): Promise<string> {
   const res = await pool.query(
-    `SELECT wallet_id FROM users WHERE user_id = $1`,
-    [userId],
+    `SELECT wallet_id FROM users WHERE user_id = $1 AND auth_version = $2`,
+    [userId, authVersion],
   );
 
   if (res.rowCount === 0) {
@@ -77,7 +77,7 @@ export function createAuthResolver(args: {
       if (bearer) {
         try {
           const decoded = verifyToken(bearer);
-          return await getWalletFromUser(pool, decoded.userId);
+          return await getWalletFromUser(pool, decoded.userId, decoded.authVersion);
         } catch (err) {
           if (err instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
           throw err;
