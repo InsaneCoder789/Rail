@@ -38,6 +38,12 @@ Use it in the following ways:
 
 ## Latest Status
 
+### CI Runtime Review: 10 October 2026
+
+The successful demo-fix CI run reported deprecated Node 20 action runtimes and an upcoming `ubuntu-latest` image change. The workflow now pins verified official checkout/setup-node release commits, disables persisted checkout credentials, selects Ubuntu 24.04 explicitly and runs the full PostgreSQL-backed suite on Node 22 and 24 independently. Read-only repository permissions and the ten-minute job limit remain unchanged. Version upgrades must deliberately review the pinned action SHAs rather than silently following mutable major tags.
+
+Runtime changes were checked against the [official checkout documentation](https://github.com/actions/checkout), [setup-node documentation](https://github.com/actions/setup-node) and [Node release schedule](https://nodejs.org/en/about/previous-releases). The local shell still runs Node 20; the supported-runtime matrix is therefore a separate remote verification, not a claim about the local interpreter. These CI changes do not close production deployment or accounting release gates.
+
 ### Demo Acceptance Review: 10 October 2026
 
 The old demo reused fixed wallet/payment IDs in the configured database while generating a new request timestamp on each invocation. A second run could therefore collide with its completed fingerprint, and synthetic funds could coexist with historical data. The demo now requires explicit `RAIL_DEMO_MODE=true`, refuses production mode, and confines all synthetic wallets/payments to a new random schema. It removes only that schema on completion and closes its pools even on failure.
