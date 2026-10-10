@@ -85,6 +85,12 @@ Then verify the deployment with an authenticated smoke test. A public `GET /heal
 
 ## Operational limitations
 
+### Agent control foundation
+
+The V2.1 control schema adds `rail_agents`, `rail_agent_credentials` and `rail_agent_mandates`. Apply migrations before updating hosted instances. Owner management accepts only user JWTs with current credential versions; existing service/wallet API keys cannot manage agents. Agent tokens are distinct, hashed at rest, short-lived and revoked through owner endpoints. Never record the one-time issuance response in proxy/APM logs; store it in restricted server-side credential storage.
+
+Agent execution is disabled. Mandate records express future policy but do not reserve funds, consume a budget, or authorize the existing execute/sync routes. Human approval and transactional budget consumption remain required before enabling agent payments. No extra deployment secret is introduced by this control-only increment. Monitor shared management quotas and retained-record capacities; lifecycle/retention decisions must not delete audit history automatically.
+
 ### Durable external event delivery
 
 Configure `RAIL_OUTBOX_WEBHOOK_URL` as a trusted HTTPS receiver and `RAIL_OUTBOX_WEBHOOK_SECRET` as a separate random secret of at least 32 characters. The worker refuses redirects and URL credentials. Run `npm run outbox:dispatch` from a scheduled worker/cron environment after applying migrations; each invocation claims a bounded batch and exits. The command is not run during API requests or serverless cold starts.

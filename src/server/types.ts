@@ -6,6 +6,7 @@ import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import type { ServerConfig } from "./config.js";
 import type { RateLimiter } from "./http.js";
 import type { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
+import type { AgentAuthorityStore } from "../persistence/agentAuthority.js";
 
 export interface AuthenticatedViewer {
   readonly walletId: string;
@@ -25,6 +26,7 @@ export interface ServerEvent {
 
 
 export interface AuthResolver {
+  resolveOwnerWallet(req: http.IncomingMessage): Promise<string>;
   resolveAuthenticatedWallet(
     req: http.IncomingMessage,
   ): Promise<string>;
@@ -47,6 +49,7 @@ export interface ServerContext {
   readonly idempotency: PostgresIdempotencyStore;
   readonly engine: PaymentPipelineEngine;
   readonly evidenceStore: TransactionEvidenceStore;
+  readonly agentStore: AgentAuthorityStore;
   readonly rateLimiter: RateLimiter;
   readonly authResolver: AuthResolver;
   readonly eventStore: EventStore;

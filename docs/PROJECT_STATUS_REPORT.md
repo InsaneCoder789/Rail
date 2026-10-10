@@ -38,6 +38,18 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.1 Agent Control Foundation: 11 October 2026
+
+Implemented owner-managed agents, separate agent credentials and spending-mandate records. The new `rail_agents`, `rail_agent_credentials` and `rail_agent_mandates` tables bind identities and policies to existing wallets. Credentials contain 256 bits of random token material, are returned once, and are persisted only as SHA-256 hashes. Their current scope is fixed to `payments:propose`, with explicit expiry and revocation. Agent tokens cannot authenticate as owner JWTs or wallet API keys.
+
+Owner control routes require a current-version user JWT through the explicit `resolveOwnerWallet` authentication method. Reads and writes share a PostgreSQL-backed 20-per-minute owner bucket without an IP or agent-ID component. Owner filtering precedes child-resource mutation. Agent introspection has a separate 30-per-minute source bucket. All responses use existing non-cacheable JSON handling; credential metadata and audit events contain no token. Revocation is checked on subsequent authentication, not a promise to cancel already authenticated work.
+
+Mandates support `approval_required` and `budgeted`, positive minor-unit limits, a total budget not smaller than the per-payment limit, a matching owner/receiver currency, 1-20 distinct existing receivers, expiry and revocation. Self-payment policies are rejected. These are control records, not active payment authorization: every agent/mandate response says `executionEnabled: false`. No agent payment endpoint, exact-request approval lifecycle, budget reservation or budget consumption is enabled. Existing owner/offline financial execution is unchanged.
+
+Agent-row locks serialize issuance/policy creation against revocation; revoking an agent revokes its credentials and mandates transactionally. Owner creation uses an advisory transaction lock to enforce a 50-retained-agent bound under concurrency. Each agent retains at most 100 credentials and 100 mandates, including expired/revoked records. Control mutations and their outbox audit events commit together under SQL deadlines; an audit failure rolls back the control change. This does not add an automatic retention/deletion policy or idempotent creation response.
+
+Verification: all 115 local tests pass, with zero failures/skips. Twelve new tests cover malformed inputs, hashed/one-time credentials, separation from owner authentication, ownership isolation, database-clock expiry, revocation races, policy restrictions without money movement, audit rollback, concurrent capacity, database constraints, owner JWT version revocation and IP-independent shared management quotas. GitHub Actions includes an explicit agent-control step, but this unpushed revision has not run remotely. README, deployment guidance and the private report describe endpoints and remaining gates. V2.0 key recovery/deployment acceptance, historical accounting and production roles remain open. Next code category: exact intent approvals and atomic mandate-budget execution, before ML enforcement or blockchain anchoring.
+
 ### Documentation Organization: 10 October 2026
 
 All 44 project Markdown files now live under `docs/`, including the repository README, public reports, technical guides, local manuals and ignored private plans. Four extracted historical documentation packs retain their separate names under `docs/archives/`, avoiding collisions or overwriting newer documents. Their ZIP archive and image assets remain in `deliverables/`. Dependency/build/Git directories were excluded from the move.
@@ -361,6 +373,9 @@ This section describes the current TypeScript source layout and the responsibili
 - `src/persistence/postgresPool.ts`
   Creates and configures the PostgreSQL connection pool used by the server.
 
+- `src/persistence/agentAuthority.ts`
+  Stores owner-bound agents, hashed expiring credentials and validated mandate records. Serializes revocation/control mutations, enforces retained-record bounds and persists audit events atomically. Does not execute agent payments or consume budgets.
+
 - `src/persistence/reconciliation.ts`
   Performs snapshot-consistent accounting checks and validates evidence-referenced, one-time historical opening-balance records.
 
@@ -444,6 +459,9 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
 
 - `src/server/routes/authRoutes.ts`
   Contains registration and login route handling.
+
+- `src/server/routes/agentRoutes.ts`
+  Handles owner-JWT-only identity, credential and mandate management with a shared owner quota, plus separate scoped-agent introspection. Responses explicitly disable execution until financial authority integration is complete.
 
 - `src/server/routes/paymentRoutes.ts`
   Contains payment authorization, offline token issuance, payment execution, and sync route handling.

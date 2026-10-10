@@ -66,7 +66,21 @@ export function createAuthResolver(args: {
   apiKey: string;
   apiKeyScopes: readonly string[];
 }): AuthResolver {
+  const resolveOwnerWallet = async (req: http.IncomingMessage): Promise<string> => {
+    const bearer = resolveBearerToken(req);
+    if (!bearer) throw new RequestError(401, "owner_authentication_required", "owner bearer token required");
+    const pool = args.getPool();
+    if (!pool) throw new Error("DB_NOT_INITIALIZED");
+    try {
+      const decoded = verifyToken(bearer);
+      return await getWalletFromUser(pool, decoded.userId, decoded.authVersion);
+    } catch (err) {
+      if (err instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
+      throw err;
+    }
+  };
   return {
+    resolveOwnerWallet,
     async resolveAuthenticatedWallet(req) {
       const pool = args.getPool();
       if (!pool) {
@@ -75,13 +89,7 @@ export function createAuthResolver(args: {
 
       const bearer = resolveBearerToken(req);
       if (bearer) {
-        try {
-          const decoded = verifyToken(bearer);
-          return await getWalletFromUser(pool, decoded.userId, decoded.authVersion);
-        } catch (err) {
-          if (err instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
-          throw err;
-        }
+        return resolveOwnerWallet(req);
       }
 
       const apiKey = resolveApiKeyHeader(req);

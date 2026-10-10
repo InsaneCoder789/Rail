@@ -7,6 +7,7 @@ import { readFile } from "node:fs/promises";
 import { validateRiskModel } from "../risk/logisticRisk.js";
 import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
+import { AgentAuthorityStore } from "../persistence/agentAuthority.js";
 dotenv.config();
 
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
@@ -24,6 +25,7 @@ import { loadServerConfig } from "./config.js";
 import { createEventStore } from "./events.js";
 import { RateLimitError, RequestError, applyCors, json, toErrorResponse } from "./http.js";
 import { handleAuthRoutes } from "./routes/authRoutes.js";
+import { handleAgentRoutes } from "./routes/agentRoutes.js";
 import { handleEventRoutes } from "./routes/eventRoutes.js";
 import { handlePaymentRoutes } from "./routes/paymentRoutes.js";
 import type { ServerContext } from "./types.js";
@@ -94,6 +96,7 @@ export async function createServerContext(options: {
     idempotency,
     engine,
     evidenceStore,
+    agentStore: new AgentAuthorityStore(pool),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,
@@ -143,6 +146,7 @@ export async function handleRequest(
       if (await handleAuthRoutes(req, res, url, context)) {
         return;
       }
+      if (await handleAgentRoutes(req, res, url, context)) return;
       if (await handlePaymentRoutes(req, res, url, context)) {
         return;
       }

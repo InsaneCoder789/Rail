@@ -221,6 +221,46 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_id);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0 CHECK (auth_version >= 0);
 
+CREATE TABLE IF NOT EXISTS rail_agents (
+  agent_id UUID PRIMARY KEY,
+  owner_wallet_id TEXT NOT NULL REFERENCES wallets(wallet_id),
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  revoked_at TIMESTAMPTZ,
+  UNIQUE (agent_id, owner_wallet_id),
+  CHECK ((status = 'active' AND revoked_at IS NULL) OR (status = 'revoked' AND revoked_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agents_owner ON rail_agents(owner_wallet_id, created_at, agent_id);
+CREATE TABLE IF NOT EXISTS rail_agent_credentials (
+  credential_id UUID PRIMARY KEY,
+  agent_id UUID NOT NULL REFERENCES rail_agents(agent_id),
+  token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[a-f0-9]{64}$'),
+  scope TEXT NOT NULL CHECK (scope = 'payments:propose'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON rail_agent_credentials(agent_id);
+CREATE TABLE IF NOT EXISTS rail_agent_mandates (
+  mandate_id UUID PRIMARY KEY,
+  agent_id UUID NOT NULL,
+  owner_wallet_id TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('approval_required', 'budgeted')),
+  currency TEXT NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  per_payment_limit_minor BIGINT NOT NULL CHECK (per_payment_limit_minor BETWEEN 1 AND 1000000000000),
+  total_budget_minor BIGINT NOT NULL CHECK (total_budget_minor BETWEEN 1 AND 1000000000000),
+  allowed_receiver_wallet_ids TEXT[] NOT NULL CHECK (cardinality(allowed_receiver_wallet_ids) BETWEEN 1 AND 20 AND array_position(allowed_receiver_wallet_ids, NULL) IS NULL),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  FOREIGN KEY (agent_id, owner_wallet_id) REFERENCES rail_agents(agent_id, owner_wallet_id),
+  CHECK (per_payment_limit_minor <= total_budget_minor),
+  CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
+);
+CREATE INDEX IF NOT EXISTS idx_agent_mandates_agent ON rail_agent_mandates(agent_id, created_at, mandate_id);
+
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_entries_wallet_fk' AND conrelid = 'ledger_entries'::regclass) THEN

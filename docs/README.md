@@ -334,6 +334,42 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 
 ## API Overview
 
+### Agent control APIs (V2.1 foundation)
+
+These endpoints configure identities and policy; they do **not** execute agent payments. Owner management requires a user JWT, not a wallet/service API key or agent credential. All owner control reads/writes share a PostgreSQL-backed limit of 20 requests per minute per owner, independent of source IP or agent ID.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v2/agents` | Create an owned agent using `{ "name": "Invoice assistant" }`. |
+| `GET /v2/agents` | List the owner's agents. |
+| `POST /v2/agents/:agentId/revoke` | Permanently revoke the agent through the API and revoke its credentials/mandates. Send `{}`. |
+| `POST /v2/agents/:agentId/credentials` | Issue a random credential with optional `ttlSeconds`; its token is returned once. |
+| `GET /v2/agents/:agentId/credentials` | List credential metadata without tokens or hashes. |
+| `POST /v2/agents/:agentId/credentials/:credentialId/revoke` | Revoke one credential. Send `{}`. |
+| `POST /v2/agents/:agentId/mandates` | Create a bounded, recipient-specific policy. |
+| `GET /v2/agents/:agentId/mandates` | List policies and their active/expired/revoked status. |
+| `POST /v2/agents/:agentId/mandates/:mandateId/revoke` | Revoke one policy. Send `{}`. |
+| `GET /v2/agent/identity` | Validate an agent token in `Authorization: Bearer <token>`; limited to 30 requests/minute per request source. |
+
+Credential scope is currently fixed to `payments:propose`. Default expiry is 24 hours; supplied lifetimes must be 60 seconds to 30 days. Only a SHA-256 hash of the 256-bit random token is persisted. Capture the one-time token response securely, never in browser storage or application logs. If the response is lost, inspect credential metadata, revoke that credential and issue a replacement; issuance itself is not an idempotent payment operation.
+
+Example mandate body:
+
+```json
+{
+  "mode": "budgeted",
+  "currency": "INR",
+  "perPaymentLimitMinor": 2500,
+  "totalBudgetMinor": 10000,
+  "allowedReceiverWalletIds": ["receiver_wallet"],
+  "ttlSeconds": 86400
+}
+```
+
+`approval_required` is the other supported mode. Amounts use minor units, the per-payment limit cannot exceed the total budget, and 1-20 distinct receivers must already exist in the owner's currency. Self-payment policies are rejected. Both modes return `executionEnabled: false`: exact payment approvals and transactional budget consumption are not enabled yet. Creating a policy reserves no wallet funds. There is no unrestricted mode or agent execution endpoint.
+
+Limits are 50 retained agents per owner and 100 retained credentials/mandates per agent, including revoked or expired rows. These are deliberate storage bounds; no automatic deletion resets them. Each control mutation commits its audit event in the same transaction, and a failed audit write rolls the change back. Apply the database migration before updating hosted API instances.
+
 ### `GET /v1/payments/:txId/evidence`
 
 Authenticated sender/receiver access to committed payment evidence status. Returns `verified` with a ciphertext commitment, `legacy_unprotected` for historical payments without evidence, or `verification_unavailable` with a safe reason. Unknown and inaccessible payments both return `404`. Reads are limited to 30 per minute per wallet and request-source bucket; responses use `Cache-Control: no-store`.
