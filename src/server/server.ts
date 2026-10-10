@@ -9,24 +9,22 @@ dotenv.config();
 
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
 import { PaymentPipelineEngine } from "../pipeline/engine.js";
-import { MemoryIdempotencyStore } from "../pipeline/idempotency.js";
 import { consoleTracer } from "../pipeline/tracing.js";
 import { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import { PostgresOfflineTokenStore } from "../persistence/postgresOfflineTokenStore.js";
 import { PostgresRateLimiter } from "../persistence/postgresRateLimiter.js";
 import { ensureOutboxSchema, runMigrations } from "../persistence/migrate.js";
 import { createPool } from "../persistence/postgresPool.js";
-import { OfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { buildHardenedPaymentPipeline } from "../stages/paymentPipeline.js";
 import { releaseExpiredAuthorizations } from "../stages/authorizationStage.js";
 import { createAuthResolver } from "./authentication.js";
 import { loadServerConfig } from "./config.js";
 import { createEventStore } from "./events.js";
-import { RateLimitError, RequestError, SlidingWindowRateLimiter, applyCors, json, toErrorResponse } from "./http.js";
+import { RateLimitError, RequestError, applyCors, json, toErrorResponse } from "./http.js";
 import { handleAuthRoutes } from "./routes/authRoutes.js";
 import { handleEventRoutes } from "./routes/eventRoutes.js";
 import { handlePaymentRoutes } from "./routes/paymentRoutes.js";
-import type { ServerContext, ServerIdempotencyStore } from "./types.js";
+import type { ServerContext } from "./types.js";
 
 const tracer = consoleTracer("[rail]");
 
@@ -35,48 +33,44 @@ export async function createServerContext(options: {
   startBackgroundJobs?: boolean;
 } = {}): Promise<ServerContext> {
   const config = loadServerConfig();
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl?.trim()) throw new Error("DATABASE_URL_REQUIRED_FOR_SERVER");
   const riskModel = process.env.RAIL_RISK_MODEL_PATH
     ? validateRiskModel(JSON.parse(await readFile(process.env.RAIL_RISK_MODEL_PATH, "utf8")))
     : undefined;
-  const databaseUrl = process.env.DATABASE_URL;
-  let pool = null;
-  let offlineTokenStore;
-  let idempotency: ServerIdempotencyStore;
+  const pool = createPool(databaseUrl, config.dbPoolMax);
+  const initializeDatabase = options.initializeDatabase ?? !config.serverless;
+  const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
 
-  if (databaseUrl) {
-    pool = createPool(databaseUrl, config.dbPoolMax);
-    const initializeDatabase = options.initializeDatabase ?? !config.serverless;
-    const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
-
-    if (initializeDatabase) {
+  if (initializeDatabase) {
+    try {
       await runMigrations(pool);
       await ensureOutboxSchema(pool);
+    } catch (error) {
+      await pool.end();
+      throw error;
     }
-
-    if (startBackgroundJobs) {
-      const sweepPool = pool;
-      const releasedCount = await releaseExpiredAuthorizations(pool).catch((err) => {
-        console.error("authorization_sweep_failed", err);
-        return 0;
-      });
-      if (releasedCount > 0) {
-        console.log(`Rail: released ${releasedCount} expired authorization reservations`);
-      }
-      setInterval(() => {
-        void releaseExpiredAuthorizations(sweepPool).catch((err) => {
-          console.error("authorization_sweep_failed", err);
-        });
-      }, config.authSweepIntervalMs).unref();
-    }
-
-    offlineTokenStore = new PostgresOfflineTokenStore(pool);
-    idempotency = new PostgresIdempotencyStore(pool);
-    console.log(`Rail: PostgreSQL persistence enabled (pool max ${config.dbPoolMax})`);
-  } else {
-    offlineTokenStore = new OfflineTokenStore();
-    idempotency = new MemoryIdempotencyStore();
-    console.warn("Rail: DATABASE_URL not set — using in-memory idempotency + offline tokens (dev only)");
   }
+
+  if (startBackgroundJobs) {
+    const sweepPool = pool;
+    const releasedCount = await releaseExpiredAuthorizations(pool).catch((err) => {
+      console.error("authorization_sweep_failed", err);
+      return 0;
+    });
+    if (releasedCount > 0) {
+      console.log(`Rail: released ${releasedCount} expired authorization reservations`);
+    }
+    setInterval(() => {
+      void releaseExpiredAuthorizations(sweepPool).catch((err) => {
+        console.error("authorization_sweep_failed", err);
+      });
+    }, config.authSweepIntervalMs).unref();
+  }
+
+  const offlineTokenStore = new PostgresOfflineTokenStore(pool);
+  const idempotency = new PostgresIdempotencyStore(pool);
+  console.log(`Rail: PostgreSQL persistence enabled (pool max ${config.dbPoolMax})`);
 
   const eventStore = createEventStore(() => pool);
 
@@ -95,7 +89,7 @@ export async function createServerContext(options: {
     offlineTokenStore,
     idempotency,
     engine,
-    rateLimiter: pool ? new PostgresRateLimiter(pool) : new SlidingWindowRateLimiter(),
+    rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,
       apiKey: config.apiKey,

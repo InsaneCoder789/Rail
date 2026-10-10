@@ -38,6 +38,12 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Runtime Contract Review: 10 October 2026
+
+The HTTP application now requires a nonblank `DATABASE_URL` in development as well as production. It no longer boots an incomplete memory mode while authentication and money execution depend on PostgreSQL. The composition always selects durable token, idempotency and rate-limit stores. If local startup migrations fail, the new pool is closed before the error propagates. Memory components remain available for isolated tests and examples; earlier descriptions of a fallback runtime below are historical, not current deployment instructions.
+
+A startup regression covers missing and blank database configuration. The full local suite now passes 80 tests without skips. `/health` reports process liveness/configuration only: it is not a database-readiness, accounting or settlement acceptance test. Provider deployment and the historical reconciliation decision remain outstanding.
+
 ### Request and Resource Review: 10 October 2026
 
 JSON readers now have an absolute configurable deadline (`RAIL_REQUEST_BODY_TIMEOUT_MS`, default 10 seconds), handle interrupted bodies, release listeners/buffers and pause rejected uploads. The HTTP handler flushes 413/408 JSON errors before closing an unread connection. Real socket tests verify both responses rather than only testing an error object.

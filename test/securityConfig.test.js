@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { loadServerConfig } from "../dist/server/config.js";
 import { generateToken, verifyToken } from "../dist/auth/jwt.js";
 import { createAuthResolver } from "../dist/server/authentication.js";
+import { createServerContext } from "../dist/server/server.js";
 
 function withEnvironment(values, work) {
   const original = {};
@@ -17,6 +18,14 @@ function withEnvironment(values, work) {
     }
   });
 }
+
+test("server startup refuses an incomplete in-memory runtime", () => withEnvironment({
+  NODE_ENV: "test", DATABASE_URL: undefined,
+}, async () => {
+  await assert.rejects(createServerContext(), { message: "DATABASE_URL_REQUIRED_FOR_SERVER" });
+  process.env.DATABASE_URL = " ";
+  await assert.rejects(createServerContext(), { message: "DATABASE_URL_REQUIRED_FOR_SERVER" });
+}));
 
 test("serverless runtime does not implicitly trust client proxy headers", () => withEnvironment({
   NODE_ENV: "test", VERCEL: "1", RAIL_TRUST_PROXY_HEADERS: undefined,

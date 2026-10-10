@@ -13,7 +13,7 @@ The project is intentionally positioned as a control and execution layer, not as
 - replay queued offline transactions consistently
 - record ledger activity and emit operational events
 
-This repository is PostgreSQL-first for serious runs, with limited in-memory fallback support for local development.
+The HTTP application requires PostgreSQL for authentication, wallet accounting, replay protection and events. Memory components remain available for isolated tests and examples, not as an alternate payment-server runtime.
 
 The current `main` branch is the polished, resume-grade version of the project: it focuses on transaction safety, explainable architecture, security-conscious design, and a backend structure that reflects how a real fintech execution layer should be modeled.
 
@@ -186,7 +186,7 @@ flowchart TD
 | Offline tokens | Device-bound spend headroom with expiry and remaining balance tracking |
 | Execution pipeline | Validation, parallel prechecks, idempotency, saga, ledger posting |
 | Sync replay | Offline-only batch replay with stored `authorizationId` enforcement |
-| Idempotency | In-memory for local fallback, PostgreSQL-backed for durable runs |
+| Idempotency | PostgreSQL-backed in the HTTP application; bounded memory store for isolated tests |
 | Event visibility | Authenticated wallet-scoped events via REST and SSE |
 | Rate limiting | Route-specific limits for login, authorize, execute, sync, and token issue |
 
@@ -289,11 +289,9 @@ Example response:
 }
 ```
 
-### Limited in-memory fallback
+### PostgreSQL Is Required
 
-If `DATABASE_URL` is not set, Rail falls back to in-memory idempotency and offline-token storage for lightweight development.
-
-That mode is useful for local experimentation, but it is not the main supported runtime story anymore because authentication, wallet identity, and durable execution are fundamentally PostgreSQL-centric in the current codebase.
+The server refuses startup if `DATABASE_URL` is missing or blank. It does not start an incomplete in-memory application. Memory idempotency and offline-token components can still be tested independently. `/health` is a process-liveness/configuration response, not proof of database readiness, successful reconciliation or external settlement; production verification must check those separately.
 
 ---
 
@@ -302,7 +300,7 @@ That mode is useful for local experimentation, but it is not the main supported 
 | Variable | Purpose |
 |---|---|
 | `PORT` | HTTP port. Default `8787`. |
-| `DATABASE_URL` | Enables PostgreSQL-backed persistence. |
+| `DATABASE_URL` | Required for the HTTP application's PostgreSQL-backed persistence. |
 | `RAIL_API_KEY` | Shared secret for restricted routes such as offline token issue and sync. |
 | `KYLR_API_KEY` | Legacy alias if `RAIL_API_KEY` is not set. |
 | `JWT_SECRET` | JWT signing and verification secret. |
@@ -541,9 +539,9 @@ This project is much stronger than a toy payment demo, but it is still honest to
 
 Current limitations include:
 
-- durable webhook delivery needs a scheduled worker and a receiver that deduplicates event IDs; SSE lifecycle improvements remain tracked
+- durable webhook delivery needs a scheduled worker and a receiver that deduplicates event IDs; SSE is advisory and requires REST recovery
 - API keys are still an area that can be hardened further
-- in-memory mode is best understood as a local fallback, not a full alternative runtime
+- memory components are test utilities, not a supported HTTP runtime
 - no enforced fraud policy is implemented; optional ML remains in shadow mode and needs validated labeled data
 - documentation and demo flows need to be kept aligned as the project evolves
 
