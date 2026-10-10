@@ -5,6 +5,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import { validateRiskModel } from "../risk/logisticRisk.js";
+import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
+import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 dotenv.config();
 
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
@@ -35,6 +37,7 @@ export async function createServerContext(options: {
   const config = loadServerConfig();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl?.trim()) throw new Error("DATABASE_URL_REQUIRED_FOR_SERVER");
+  const evidenceStore = new TransactionEvidenceStore(loadTransactionKeyRing(process.env.RAIL_EVIDENCE_KEY_RING));
   const riskModel = process.env.RAIL_RISK_MODEL_PATH
     ? validateRiskModel(JSON.parse(await readFile(process.env.RAIL_RISK_MODEL_PATH, "utf8")))
     : undefined;
@@ -79,6 +82,7 @@ export async function createServerContext(options: {
     tracer,
     dlq: new MemoryDeadLetterQueue(),
     pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel),
+    evidence: evidenceStore,
     relay: (event) => eventStore.insertOutboxEvent(event),
   });
 
@@ -89,6 +93,7 @@ export async function createServerContext(options: {
     offlineTokenStore,
     idempotency,
     engine,
+    evidenceStore,
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,

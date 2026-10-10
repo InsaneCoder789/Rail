@@ -4,3 +4,4 @@ dist/
 .env.*
 *.log
 .DS_Store
+PRIVATE_V2_PROJECT_STATUS_REPORT.md

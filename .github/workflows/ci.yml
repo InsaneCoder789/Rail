@@ -56,6 +56,10 @@ jobs:
         run: npm test
       - name: Run hardening tests explicitly
         run: node --test test/hardening.test.js
+      - name: Verify protected transaction evidence and key lifecycle
+        run: node --test test/transactionProtection.test.js test/securityConfig.test.js
+      - name: Verify atomic evidence, replay, rotation and access controls
+        run: node --test --test-name-pattern='evidence|legacy replay remains unprotected' test/postgres.integration.test.js
       - name: Verify event delivery and stream lifecycle
         run: node --test test/events.test.js
       - name: Verify request deadlines and bounded diagnostic stores

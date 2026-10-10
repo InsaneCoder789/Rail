@@ -9,6 +9,7 @@ import type { Stage } from "./stage.js";
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalTransactionPayload, legacyTransactionPayload } from "../crypto/transactionSigning.js";
 import { verifyCommittedAuthorization } from "../stages/authorizationStage.js";
+import type { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 
 function randomId(): string {
   return randomUUID();
@@ -20,6 +21,7 @@ export interface PaymentPipelineEngineOptions {
   readonly dlq: DeadLetterQueue;
   readonly pipeline: Stage;
   readonly relay?: OutboxRelay;
+  readonly evidence?: TransactionEvidenceStore;
 }
 
 /**
@@ -41,10 +43,15 @@ export class PaymentPipelineEngine {
       const result = await this.opts.idempotency.dedupe(txn.idempotencyKey, fingerprint, async (client) => {
         const outbox = new MemoryOutbox();
         const ctx = createPaymentContext(randomId(), randomId(), txn, outbox, client);
+        ctx.state.requireEvidence = Boolean(this.opts.evidence);
         const root = withSpan(this.opts.tracer, "payment_pipeline", this.opts.pipeline);
         await root(ctx);
         if (!ctx.result) {
           throw new Error("invariant_broken:missing_result");
+        }
+        if (this.opts.evidence && ctx.result.status === "accepted") {
+          if (!client) throw new Error("transaction_evidence_requires_database");
+          await this.opts.evidence.persist(client, txn);
         }
         for (const event of outbox.drain()) {
           if (client) {

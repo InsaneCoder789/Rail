@@ -19,3 +19,11 @@ export {
   verifyTransactionHmac,
   signTransactionHmac,
 } from "./crypto/transactionSigning.js";
+export {
+  protectTransaction,
+  verifyAndDecryptTransaction,
+  protectedTransactionCommitment,
+} from "./crypto/transactionProtection.js";
+export type { ProtectedTransaction, TransactionProtectionKeys } from "./crypto/transactionProtection.js";
+export { TransactionKeyRing, loadTransactionKeyRing } from "./crypto/transactionProtection.js";
+export { TransactionEvidenceStore } from "./persistence/transactionEvidence.js";

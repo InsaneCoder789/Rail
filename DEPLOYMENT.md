@@ -18,6 +18,7 @@ RAIL_API_KEY=<long-random-server-key>
 RAIL_API_KEY_SCOPES=offline_tokens:issue,sync:write
 RAIL_SIGNING_SECRET=<long-random-signing-secret>
 JWT_SECRET=<long-random-jwt-secret>
+RAIL_EVIDENCE_KEY_RING=<private JSON key ring described below>
 RAIL_ALLOWED_ORIGINS=https://your-frontend.example
 RAIL_REQUIRE_JSON_CONTENT_TYPE=true
 RAIL_EXPOSE_INTERNAL_ERRORS=false
@@ -25,6 +26,36 @@ RAIL_TRUST_PROXY_HEADERS=true
 ```
 
 Use separate values for Preview and Development. Never upload `.env` or copy real secrets into `.env_example`.
+
+## Protected payment evidence keys
+
+HTTP startup now requires `RAIL_EVIDENCE_KEY_RING` in local and hosted modes. It fails before connecting if keys are absent or malformed. There is no silent plaintext fallback. This is a deployment configuration change; provision secrets before switching API instances.
+
+The JSON value has the following shape. Placeholders are not usable keys:
+
+```json
+{
+  "activeKeyId": "evidence_2026_10",
+  "maxRecordsPerKey": 1000000,
+  "keys": [
+    {
+      "keyId": "evidence_2026_10",
+      "encryptionKey": "<base64 of 32 random bytes>",
+      "authenticationKey": "<base64 of 32 different random bytes>"
+    }
+  ]
+}
+```
+
+Generate each value independently with a trusted cryptographic secret generator, such as `openssl rand -base64 32`, and store the JSON in deployment secret storage. Do not commit, print in CI, share with clients, or reuse JWT/authorization/webhook secrets as evidence keys. The runtime accepts up to 32 versions and rejects duplicate IDs or reused material across purposes/versions. This is an application-loaded symmetric key ring, not KMS or HSM support.
+
+Rotate by first deploying the old and new independent versions together to all instances, then switching the active ID consistently. Retain old versions for the evidence retention period, and test restore in an isolated environment. Do not replace material under an existing ID. Removing a required old version makes its status `verification_unavailable`, not `verified`. A lost key cannot be recovered from ciphertext; backup policy and restore testing remain operator responsibilities.
+
+The database enforces a configurable maximum of at most one million committed records per encryption-key fingerprint and unique committed nonces. Counters share the financial transaction and roll back with failed attempts; this is a committed-record ceiling, NOT a total count of all encryption invocations. Quota exhaustion aborts new payments until a fresh active key is configured. Existing completed replays do not consume quota. Monitor usage, rotate early and impose operational limits on failed encryption attempts too. Random 96-bit nonces do not justify unlimited encryption with one key.
+
+Apply migrations before the new runtime. New required-evidence payments cannot commit without their bound evidence, and evidence rows reject updates/deletes. Legacy executions stay explicitly unprotected; do not invent a backfill or delete replay records. Stop/drain older API writers during cutover because an older writer can still create an execution without the new required-evidence marker. A rolling mixed-version deployment is not evidence-complete.
+
+The library engine keeps evidence optional for isolated V1 regression/demo callers; the HTTP runtime always supplies the evidence store. Direct library integrations must opt in explicitly. Ledger fields and existing event payloads remain relational/plaintext; this phase encrypts the canonical audit copy only. Least-privilege database roles, retention, secure secret storage, monitoring and a production key-provider review remain release gates.
 
 ## Database setup
 

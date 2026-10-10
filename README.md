@@ -255,6 +255,7 @@ DATABASE_URL=postgres://rail:rail_dev_password@127.0.0.1:5432/rail
 JWT_SECRET=replace_this_with_a_real_secret
 RAIL_SIGNING_SECRET=replace_this_with_a_real_secret
 RAIL_API_KEY=replace_this_with_a_real_secret
+RAIL_EVIDENCE_KEY_RING=<private JSON key ring; see DEPLOYMENT.md>
 ```
 
 ### 3. Start PostgreSQL
@@ -308,6 +309,7 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 | `KYLR_API_KEY` | Legacy alias if `RAIL_API_KEY` is not set. |
 | `JWT_SECRET` | JWT signing and verification secret. |
 | `RAIL_SIGNING_SECRET` | HMAC signing secret for transaction and authorization integrity helpers. |
+| `RAIL_EVIDENCE_KEY_RING` | Required HTTP-runtime JSON key ring for AES-256-GCM evidence and separate HMAC authentication. See the rotation/setup procedure in `DEPLOYMENT.md`. Never send it to clients. |
 | `RAIL_ALLOWED_ORIGINS` | Comma-separated frontend origins allowed by CORS. Localhost development origins are used by default when unset. |
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
 | `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
@@ -325,12 +327,18 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 | `RAIL_RATE_LIMIT_TOKEN_ISSUE_MAX` | Offline-token issue requests allowed in the configured token window. |
 | `RAIL_RATE_LIMIT_TOKEN_ISSUE_WINDOW_MS` | Offline-token issue rate-limit window in milliseconds. |
 | `RAIL_AUTH_SWEEP_INTERVAL_MS` | Interval for expired authorization cleanup. |
-| `RAIL_PKCS11_MODULE_PATH` | Hook for PKCS#11-based HSM integration. |
-| `RAIL_KMS_KEY_ID` | Hook for cloud KMS-backed signing integration. |
+| `RAIL_PKCS11_MODULE_PATH` | Unsupported: setting it fails startup. |
+| `RAIL_KMS_KEY_ID` | Unsupported: setting it fails startup. |
 
 ---
 
 ## API Overview
+
+### `GET /v1/payments/:txId/evidence`
+
+Authenticated sender/receiver access to committed payment evidence status. Returns `verified` with a ciphertext commitment, `legacy_unprotected` for historical payments without evidence, or `verification_unavailable` with a safe reason. Unknown and inaccessible payments both return `404`. Reads are limited to 30 per minute per wallet and request-source bucket; responses use `Cache-Control: no-store`.
+
+New HTTP-runtime payments commit AES-256-GCM evidence and independently keyed HMAC-SHA256 in the same transaction as wallet, token, ledger, event and replay state. Retries do not regenerate the evidence. This protects the canonical audit copy, not every relational field or event payload. HMAC is server-side authentication, not a public digital signature. Historical payments are not automatically backfilled, and no blockchain is deployed by this feature.
 
 ### `POST /auth/register`
 

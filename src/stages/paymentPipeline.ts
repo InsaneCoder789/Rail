@@ -87,8 +87,8 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore): Stage {
     if (txn.channel !== "online") await tokenStore!.finalizeOfflineSpend(txn, client);
     const result = { status: "accepted" as const, ledgerEntryId: `leg_${txn.txId}` };
     await client.query(
-      `INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json)
-       VALUES ($1, $2, $3, $4::jsonb)`, [txn.txId, txn.idempotencyKey, fingerprint, JSON.stringify(result)]);
+      `INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json, evidence_required)
+       VALUES ($1, $2, $3, $4::jsonb, $5)`, [txn.txId, txn.idempotencyKey, fingerprint, JSON.stringify(result), ctx.state.requireEvidence === true]);
     ctx.outbox.append({ type: "payments.ledger_posted", payload: {
       txId: txn.txId, amountMinor: txn.amountMinor, currency: txn.currency, channel: txn.channel,
       offline: txn.channel !== "online", senderWalletId: txn.senderWalletId, receiverWalletId: txn.receiverWalletId,

@@ -16,7 +16,9 @@ import { MemoryDeadLetterQueue } from "../dist/pipeline/dlq.js";
 import { noopTracer } from "../dist/pipeline/tracing.js";
 import { PostgresOfflineTokenStore } from "../dist/persistence/postgresOfflineTokenStore.js";
 import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { TransactionKeyRing, verifyAndDecryptTransaction } from "../dist/crypto/transactionProtection.js";
+import { TransactionEvidenceStore } from "../dist/persistence/transactionEvidence.js";
 import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
 import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
 import { findReconciliationIssues, recordWalletOpeningBalance } from "../dist/persistence/reconciliation.js";
@@ -295,8 +297,8 @@ async function paymentFixture(work) {
       receiverWalletId: receiver, amountMinor: 2500, currency: "INR", channel: "nfc",
       deviceId: "ci_device", offlineTokenId: token.tokenId, createdAt: new Date().toISOString() };
     const store = new PostgresIdempotencyStore(pool);
-    const makeEngine = (idempotency = store, pipeline = buildHardenedPaymentPipeline(noopTracer, tokens)) => new PaymentPipelineEngine({
-      idempotency, tracer: noopTracer, dlq: new MemoryDeadLetterQueue(), pipeline,
+    const makeEngine = (idempotency = store, pipeline = buildHardenedPaymentPipeline(noopTracer, tokens), evidence) => new PaymentPipelineEngine({
+      idempotency, tracer: noopTracer, dlq: new MemoryDeadLetterQueue(), pipeline, evidence,
     });
     await work({ pool, txn, auth, tokens, token, store, makeEngine });
   } finally {
@@ -307,6 +309,126 @@ async function paymentFixture(work) {
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
   }
 }
+
+function evidenceFixture(maxRecordsPerKey = 1000000) {
+  const key = { keyId: "integration_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+  const ring = new TransactionKeyRing(key.keyId, [key], maxRecordsPerKey);
+  return { key, ring, evidence: new TransactionEvidenceStore(ring) };
+}
+
+test("protected evidence commits once with offline money movement and concurrent replay", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, token, tokens, makeEngine }) => {
+    const { evidence, key } = evidenceFixture();
+    const engine = makeEngine(undefined, undefined, evidence);
+    const results = await Promise.all(Array.from({ length: 6 }, () => engine.execute(txn)));
+    assert.ok(results.every(result => result.status === "accepted"));
+    const read = () => pool.query("SELECT * FROM rail_transaction_evidence WHERE tx_id = $1", [txn.txId]);
+    const before = await read();
+    assert.equal(before.rowCount, 1);
+    assert.equal(verifyAndDecryptTransaction(before.rows[0].envelope, { txId: txn.txId,
+      requestFingerprint: before.rows[0].request_fingerprint }, key), canonicalTransactionPayload(txn));
+    assert.deepEqual(await engine.execute(txn), results[0]);
+    assert.deepEqual((await read()).rows, before.rows);
+    assert.equal((await pool.query("SELECT record_count FROM rail_evidence_key_usage")).rows[0].record_count, "1");
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 2500);
+    assert.equal((await evidence.status(pool, txn.txId, txn.senderWalletId)).status, "verified");
+    assert.equal((await evidence.status(pool, txn.txId, txn.receiverWalletId)).status, "verified");
+    assert.equal(await evidence.status(pool, txn.txId, "unrelated_wallet"), undefined);
+    await assert.rejects(engine.execute({ ...txn, amountMinor: 1 }), /IDEMPOTENCY_KEY_REUSED/);
+    await assert.rejects(pool.query("UPDATE rail_transaction_evidence SET commitment = $2 WHERE tx_id = $1", [txn.txId, "a".repeat(64)]), /history_is_immutable/);
+    await assert.rejects(pool.query("DELETE FROM rail_transaction_evidence WHERE tx_id = $1", [txn.txId]), /history_is_immutable/);
+  });
+});
+
+test("evidence write failure rolls back all payment state and permits recovery", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, token, tokens, makeEngine }) => {
+    const { evidence } = evidenceFixture();
+    const failing = { persist: async (client, payment) => { await evidence.persist(client, payment); throw new Error("injected_evidence_failure"); } };
+    await assert.rejects(makeEngine(undefined, undefined, failing).execute(txn), /injected_evidence_failure/);
+    for (const table of ["rail_transaction_evidence", "rail_payment_executions", "ledger_entries", "rail_offline_spends"]) {
+      assert.equal((await pool.query(`SELECT * FROM ${table} WHERE tx_id = $1`, [txn.txId])).rowCount, 0);
+    }
+    assert.equal((await pool.query("SELECT * FROM rail_evidence_key_usage")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_idempotency WHERE idempotency_key = $1", [txn.idempotencyKey])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE payload->>'txId' = $1", [txn.txId])).rowCount, 0);
+    assert.equal((await tokens.getToken(token.tokenId)).remainingMinor, 5000);
+    const sender = (await pool.query("SELECT balance, reserved FROM wallets WHERE wallet_id = $1", [txn.senderWalletId])).rows[0];
+    assert.deepEqual(sender, { balance: "7500", reserved: "2500" });
+    assert.equal((await pool.query("SELECT status FROM authorizations WHERE tx_id = $1", [txn.txId])).rows[0].status, "issued");
+    assert.equal((await makeEngine(undefined, undefined, evidence).execute(txn)).status, "accepted");
+  });
+});
+
+test("online evidence status endpoint filters ownership, hides protected fields and rate limits reads", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const { evidence } = evidenceFixture();
+    const online = { ...txn, channel: "online", deviceId: undefined, offlineTokenId: undefined };
+    await makeEngine(undefined, undefined, evidence).execute(online);
+    let viewer = txn.senderWalletId;
+    const context = { pool, config: loadServerConfig(), evidenceStore: evidence, rateLimiter: new SlidingWindowRateLimiter(),
+      authResolver: { resolveAuthenticatedWallet: async () => viewer } };
+    const url = new URL(`http://localhost/v1/payments/${encodeURIComponent(txn.txId)}/evidence`);
+    const request = () => ({ method: "GET", headers: {}, socket: { remoteAddress: "127.0.0.1" } });
+    const response = () => ({ headers: {}, setHeader(name, value) { this.headers[name] = value; }, writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } });
+    const res = response();
+    assert.equal(await handlePaymentRoutes(request(), res, url, context), true);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers["Cache-Control"], "no-store");
+    assert.deepEqual(Object.keys(res.body.evidence).sort(), ["commitment", "status", "txId"]);
+    assert.equal(res.body.evidence.status, "verified");
+    viewer = "unrelated_wallet";
+    await assert.rejects(handlePaymentRoutes(request(), response(), url, context), { status: 404, code: "payment_not_found" });
+    viewer = txn.senderWalletId;
+    for (let i = 1; i < 30; i++) await handlePaymentRoutes(request(), response(), url, context);
+    await assert.rejects(handlePaymentRoutes(request(), response(), url, context), { status: 429 });
+    context.authResolver.resolveAuthenticatedWallet = async () => { throw Object.assign(new Error("invalid_credentials"), { status: 401 }); };
+    await assert.rejects(handlePaymentRoutes(request(), response(), url, context), { status: 401 });
+  });
+});
+
+test("database commit rejects execution requiring absent evidence", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, tokens, makeEngine }) => {
+    const pipeline = buildHardenedPaymentPipeline(noopTracer, tokens);
+    await assert.rejects(makeEngine(undefined, async ctx => { ctx.state.requireEvidence = true; await pipeline(ctx); }).execute(txn), /payment_evidence_missing/);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries WHERE tx_id = $1", [txn.txId])).rowCount, 0);
+  });
+});
+
+test("evidence rotation retains old verification and reports unavailable retired keys honestly", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const { key, evidence } = evidenceFixture();
+    await makeEngine(undefined, undefined, evidence).execute(txn);
+    const next = { keyId: "integration_v2", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+    const rotated = new TransactionEvidenceStore(new TransactionKeyRing(next.keyId, [key, next]));
+    assert.equal((await rotated.status(pool, txn.txId, txn.senderWalletId)).status, "verified");
+    const removed = new TransactionEvidenceStore(new TransactionKeyRing(next.keyId, [next]));
+    assert.deepEqual(await removed.status(pool, txn.txId, txn.senderWalletId), { txId: txn.txId,
+      status: "verification_unavailable", reason: "key_unavailable" });
+    assert.deepEqual(await makeEngine(undefined, undefined, rotated).execute(txn), await makeEngine().execute(txn));
+  });
+});
+
+test("legacy replay remains unprotected rather than being silently backfilled", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const original = await makeEngine().execute(txn);
+    const { evidence } = evidenceFixture();
+    assert.deepEqual(await makeEngine(undefined, undefined, evidence).execute(txn), original);
+    assert.deepEqual(await evidence.status(pool, txn.txId, txn.senderWalletId), { txId: txn.txId, status: "legacy_unprotected" });
+    assert.equal((await pool.query("SELECT * FROM rail_transaction_evidence")).rowCount, 0);
+  });
+});
+
+test("shared evidence key quota rejects new execution until a fresh key version is used", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const { key, evidence } = evidenceFixture(1);
+    await pool.query("INSERT INTO rail_evidence_key_usage(encryption_key_fingerprint, record_count) VALUES ($1, 1)", [createHash("sha256").update(key.encryptionKey).digest("hex")]);
+    await assert.rejects(makeEngine(undefined, undefined, evidence).execute(txn), /key_rotation_required/);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries WHERE tx_id = $1", [txn.txId])).rowCount, 0);
+    const next = { keyId: "quota_v2", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+    const rotated = new TransactionEvidenceStore(new TransactionKeyRing(next.keyId, [key, next], 1));
+    assert.equal((await makeEngine(undefined, undefined, rotated).execute(txn)).status, "accepted");
+  });
+});
 
 test("event history filters wallets in SQL and pages equal-timestamp rows without duplicates", { skip: !databaseUrl }, async () => {
   await paymentFixture(async ({ pool, txn, makeEngine }) => {

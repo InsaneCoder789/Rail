@@ -138,6 +138,28 @@ CREATE TABLE IF NOT EXISTS rail_payment_executions (
   committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE rail_payment_executions ADD COLUMN IF NOT EXISTS evidence_required BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_evidence_binding ON rail_payment_executions(tx_id, request_fingerprint);
+CREATE TABLE IF NOT EXISTS rail_evidence_key_usage (
+  encryption_key_fingerprint TEXT PRIMARY KEY CHECK (encryption_key_fingerprint ~ '^[a-f0-9]{64}$'),
+  record_count BIGINT NOT NULL CHECK (record_count BETWEEN 1 AND 1000000)
+);
+CREATE TABLE IF NOT EXISTS rail_transaction_evidence (
+  tx_id TEXT PRIMARY KEY,
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[a-f0-9]{64}$'),
+  encryption_key_fingerprint TEXT NOT NULL REFERENCES rail_evidence_key_usage(encryption_key_fingerprint),
+  nonce TEXT NOT NULL,
+  envelope JSONB NOT NULL,
+  commitment TEXT NOT NULL CHECK (commitment ~ '^[a-f0-9]{64}$'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (tx_id, request_fingerprint) REFERENCES rail_payment_executions(tx_id, request_fingerprint),
+  UNIQUE (encryption_key_fingerprint, nonce),
+  CHECK ((jsonb_typeof(envelope) = 'object' AND
+    envelope ?& ARRAY['version','algorithm','keyId','txId','requestFingerprint','nonce','ciphertext','tag','mac'] AND
+    envelope->>'version' = '1' AND envelope->>'algorithm' = 'AES-256-GCM+HMAC-SHA256' AND
+    envelope->>'txId' = tx_id AND envelope->>'requestFingerprint' = request_fingerprint AND envelope->>'nonce' = nonce) IS TRUE)
+);
+
 CREATE TABLE IF NOT EXISTS authorization_usage (
   auth_id TEXT PRIMARY KEY,
   tx_id TEXT NOT NULL,
@@ -347,6 +369,12 @@ BEGIN
      ) THEN
     RAISE EXCEPTION 'payment_commit_record_missing' USING ERRCODE = '23514';
   END IF;
+  IF EXISTS (SELECT 1 FROM rail_payment_executions execution
+      WHERE execution.tx_id = payment_tx_id AND execution.evidence_required
+        AND NOT EXISTS (SELECT 1 FROM rail_transaction_evidence evidence
+          WHERE evidence.tx_id = execution.tx_id AND evidence.request_fingerprint = execution.request_fingerprint)) THEN
+    RAISE EXCEPTION 'payment_evidence_missing' USING ERRCODE = '23514';
+  END IF;
 END $$;
 
 CREATE OR REPLACE FUNCTION rail_check_payment_commit() RETURNS TRIGGER
@@ -382,6 +410,9 @@ CREATE TRIGGER rail_usage_immutable BEFORE UPDATE OR DELETE ON authorization_usa
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 DROP TRIGGER IF EXISTS rail_execution_immutable ON rail_payment_executions;
 CREATE TRIGGER rail_execution_immutable BEFORE UPDATE OR DELETE ON rail_payment_executions
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_evidence_immutable ON rail_transaction_evidence;
+CREATE TRIGGER rail_evidence_immutable BEFORE UPDATE OR DELETE ON rail_transaction_evidence
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 
 CREATE OR REPLACE FUNCTION rail_protect_used_authorization() RETURNS TRIGGER

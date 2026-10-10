@@ -96,6 +96,20 @@ export async function handlePaymentRoutes(
   url: URL,
   context: ServerContext,
 ): Promise<boolean> {
+  const evidenceRoute = /^\/v1\/payments\/([^/]+)\/evidence$/.exec(url.pathname);
+  if (req.method === "GET" && evidenceRoute) {
+    const walletId = await context.authResolver.resolveAuthenticatedWallet(req);
+    let txId: string;
+    try { txId = decodeURIComponent(evidenceRoute[1]); } catch { throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID"); }
+    if (!isSafeText(txId, 8, 128)) throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID");
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "evidence_read", discriminator: walletId,
+      limit: 30, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
+    const evidence = await context.evidenceStore.status(context.pool, txId, walletId);
+    if (!evidence) throw new RequestError(404, "payment_not_found", "payment not found");
+    res.setHeader("Cache-Control", "no-store");
+    json(res, 200, { evidence });
+    return true;
+  }
   if (req.method === "POST" && url.pathname === "/v1/payments/authorize") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 

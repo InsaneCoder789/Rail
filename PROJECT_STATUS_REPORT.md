@@ -38,6 +38,36 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.0 Atomic Protected Evidence: 10 October 2026
+
+The HTTP runtime now requires an explicitly configured `RAIL_EVIDENCE_KEY_RING` and supplies a transaction evidence store to the payment engine. Newly executed online and reconnect/offline payments encrypt the canonical audit copy with AES-256-GCM and authenticate its versioned envelope using a separate HMAC-SHA256 key. Evidence insertion uses the same database client and transaction as wallet, authorization, token, ledger, outbox and replay state. A required-evidence execution cannot commit without its fingerprint-bound evidence; evidence rows are immutable. Replays retain the original committed record rather than re-encrypting it.
+
+The key ring validates versions and separate material, copies key buffers defensively, retains retired versions for verification and rejects missing/malformed configuration before opening a pool. A shared database counter caps committed records per encryption-key fingerprint at a configurable maximum of one million; quota exhaustion requires rotation. Unique key-fingerprint/nonces prevent duplicate committed nonce use. The counter rolls back with failed payments and is not a total encryption-invocation counter. Operational attempt limits, secure key retention/recovery and production KMS support remain open.
+
+`GET /v1/payments/:txId/evidence` authenticates the caller and filters sender/receiver access in SQL. It returns only `verified` plus a commitment, `legacy_unprotected`, or `verification_unavailable` with a safe reason. Missing and unauthorized payments both return 404. Reads have a 30-per-minute wallet/source bucket and non-cacheable responses; plaintext, ciphertext and keys are not exposed. Historical successful replays stay unchanged and are not silently backfilled.
+
+Verification: `npm test` passes 103 tests with zero failures or skips, including live PostgreSQL tests for concurrent offline evidence/replay, online endpoint access and throttling, injected rollback, missing-evidence commit rejection, retained/removed key versions, legacy replay and quota exhaustion. GitHub Actions now includes explicit crypto/key and evidence-integration steps on the existing Node 22/24 matrix; this revision has not been pushed or remotely run. README and deployment instructions document the required configuration and stop/drain cutover. Older writers and optional library/demo engines can still create legacy executions; a mixed-version rollout is not evidence-complete.
+
+This increment protects the canonical audit copy, not all database fields or existing event payloads. It does not enable ML enforcement, agent mandates, public signatures or blockchain publication. Historical accounting review, external funding/reversals, least-privilege roles, provider deployment and real key-backup/restore remain independent release gates.
+
+### Private Implementation Report: 10 October 2026
+
+Created a separate Git-ignored V2 implementation status report documenting the current baseline, direct next changes, dependent milestones, acceptance checks and deferred research. This is a planning/documentation update only: no payment behavior changed, no integration was marked complete, and no production gate was closed. The private roadmap and its new report remain outside the repository.
+
+### Version Scope Baseline: 10 October 2026
+
+Consolidated the next-version plan in the ignored private project scope document, separating required delivery milestones from speculative research. Offline capability, device/request bindings and atomic PostgreSQL accounting remain foundational. Implementation will proceed through independently tested categories; future work is not classified as delivered by this planning update. The detailed private roadmap remains excluded from version control. Existing V1 historical-data and production gates remain unchanged.
+
+### V2 Authenticated Encryption Foundation: 10 October 2026
+
+Added `src/crypto/transactionProtection.ts` and six tests in `test/transactionProtection.test.js`. The exported server-side primitive encrypts the existing canonical, authorization-bound transaction using AES-256-GCM with a fresh 96-bit nonce and 128-bit authentication tag. A separate 256-bit key produces an HMAC-SHA256 over the versioned envelope, including metadata, ciphertext and tag. Equal encryption/authentication keys and malformed key material are rejected. Decryption checks the caller's trusted transaction ID and request fingerprint, verifies the HMAC and GCM tag, and verifies the recovered payload fingerprint before returning it.
+
+This is a tested foundation, not an enabled production encryption migration. No routes, database records, existing HMAC requirements or payment decisions were changed. Keys must remain server-side; client/device authentication still needs its own credential design. GCM already authenticates ciphertext; the additional HMAC is a separately keyed envelope attestation, not a public digital signature or non-repudiation mechanism. TLS remains necessary. A ciphertext commitment can enter the existing Merkle helper, but that hash helper neither authenticates records nor publishes anything to a blockchain. Callers must verify and persist a single envelope before batching it.
+
+The existing logistic model remains shadow-only and trained/evaluated with synthetic demonstration data; it is not a validated fraud classifier. The proposed next design preserves offline/device bindings and atomic ledger execution, adds owner-approved agent mandates with approval-required and budgeted modes, and uses blockchain audit anchoring rather than moving funds on-chain. Detailed phases and acceptance gates remain in the ignored private scope file. No contract was deployed, no chain fees were incurred, and no customer data was published.
+
+Verification: `npm test` passes all 92 tests, including PostgreSQL integration, with zero failures or skips. New coverage checks round-trip protection, fresh nonces, envelope/binding tampering, independent GCM verification, key separation and Merkle proof compatibility. Existing V1 historical-data and production release gates remain open.
+
 ### V1 Redundancy and Acceptance Review: 10 October 2026
 
 Removed the unused saga coordinator/export, unused stage timeout/retry wrappers, duplicate pipeline builder and redundant catch/rethrow. The HTTP context now requires PostgreSQL explicitly and no longer advertises a memory idempotency union or query-credential options. The placeholder HSM module/export is removed; one configuration guard rejects unsupported providers. README diagrams and the current execution description now show a single database commit, not compensating sagas.

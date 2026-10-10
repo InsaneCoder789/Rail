@@ -33,6 +33,14 @@ test("unimplemented HSM providers fail closed rather than advertising active pro
   assert.throws(loadServerConfig, /HSM_PROVIDER_NOT_IMPLEMENTED/);
 }));
 
+test("HTTP startup refuses missing or malformed evidence keys before connecting", () => withEnvironment({
+  NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_EVIDENCE_KEY_RING: undefined,
+}, async () => {
+  await assert.rejects(createServerContext(), { message: "TRANSACTION_EVIDENCE_KEY_RING_REQUIRED" });
+  process.env.RAIL_EVIDENCE_KEY_RING = "do_not_echo_this_secret";
+  await assert.rejects(createServerContext(), { message: "INVALID_TRANSACTION_EVIDENCE_KEY_RING" });
+}));
+
 test("JWTs require a credential version and bounded lifetime", () => withEnvironment({ JWT_SECRET: "version_test_secret_01234567890123456789" }, () => {
   const options = { issuer: "rail", audience: "rail-clients", expiresIn: "15m" };
   for (const authVersion of [undefined, -1, 1.5, "0", 2147483648]) {
