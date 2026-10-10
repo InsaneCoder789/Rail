@@ -38,6 +38,12 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Demo Acceptance Review: 10 October 2026
+
+The old demo reused fixed wallet/payment IDs in the configured database while generating a new request timestamp on each invocation. A second run could therefore collide with its completed fingerprint, and synthetic funds could coexist with historical data. The demo now requires explicit `RAIL_DEMO_MODE=true`, refuses production mode, and confines all synthetic wallets/payments to a new random schema. It removes only that schema on completion and closes its pools even on failure.
+
+The demo verifies authorization-first execution, identical replay results, sender/receiver balances and clean reconciliation. Two new regressions verify the safety gate and two successive independent runs with no leftover demo schemas. The full suite now contains 82 passing tests without skips. A separate command-line run also returned accepted/replayed results, sender balance 85,000 and receiver balance 15,000 minor units, zero reservations and zero reconciliation issues. No existing historical wallet or accounting finding is repaired or deleted by this demonstration.
+
 ### Runtime Contract Review: 10 October 2026
 
 The HTTP application now requires a nonblank `DATABASE_URL` in development as well as production. It no longer boots an incomplete memory mode while authentication and money execution depend on PostgreSQL. The composition always selects durable token, idempotency and rate-limit stores. If local startup migrations fail, the new pool is closed before the error propagates. Memory components remain available for isolated tests and examples; earlier descriptions of a fallback runtime below are historical, not current deployment instructions.

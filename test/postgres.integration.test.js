@@ -21,10 +21,50 @@ import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/c
 import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
 import { findReconciliationIssues, recordWalletOpeningBalance } from "../dist/persistence/reconciliation.js";
 import { createEventStore } from "../dist/server/events.js";
+import { runPaymentDemo } from "../dist/demo/runPayment.js";
 
 dotenv.config();
 
 const databaseUrl = process.env.DATABASE_URL;
+
+test("payment demo requires explicit non-production consent before touching a database", async () => {
+  const mode = process.env.RAIL_DEMO_MODE;
+  const environment = process.env.NODE_ENV;
+  try {
+    delete process.env.RAIL_DEMO_MODE;
+    await assert.rejects(runPaymentDemo(), /DEMO_REQUIRES_EXPLICIT_NON_PRODUCTION_MODE/);
+    process.env.RAIL_DEMO_MODE = "true";
+    process.env.NODE_ENV = "production";
+    await assert.rejects(runPaymentDemo(), /DEMO_REQUIRES_EXPLICIT_NON_PRODUCTION_MODE/);
+  } finally {
+    if (mode === undefined) delete process.env.RAIL_DEMO_MODE; else process.env.RAIL_DEMO_MODE = mode;
+    if (environment === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = environment;
+  }
+});
+
+test("repeated payment demos reconcile isolated synthetic funds and remove only their own schemas", { skip: !databaseUrl }, async () => {
+  const mode = process.env.RAIL_DEMO_MODE;
+  const secret = process.env.RAIL_SIGNING_SECRET;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  const inventory = () => admin.query("SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'rail_demo_%' ORDER BY schema_name");
+  try {
+    const before = await inventory();
+    process.env.RAIL_DEMO_MODE = "true";
+    process.env.RAIL_SIGNING_SECRET = secret || "integration_demo_secret_01234567890123456789";
+    for (let i = 0; i < 2; i++) {
+      const demo = await runPaymentDemo();
+      assert.equal(demo.result.status, "accepted");
+      assert.deepEqual(demo.result, demo.cached);
+      assert.equal(demo.reconciliationIssues, 0);
+      assert.deepEqual(demo.wallets.map(wallet => [wallet.balance, wallet.reserved]), [["15000", "0"], ["85000", "0"]]);
+    }
+    assert.deepEqual((await inventory()).rows, before.rows);
+  } finally {
+    if (mode === undefined) delete process.env.RAIL_DEMO_MODE; else process.env.RAIL_DEMO_MODE = mode;
+    if (secret === undefined) delete process.env.RAIL_SIGNING_SECRET; else process.env.RAIL_SIGNING_SECRET = secret;
+    await admin.end();
+  }
+});
 
 test("PostgreSQL migrations create the required runtime tables", { skip: !databaseUrl }, async () => {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 });

@@ -521,9 +521,11 @@ src/
 | Check accounting consistency | `npm run accounting:reconcile` |
 | Train risk baseline | `npm run risk:train -- dataset.json model.json` |
 | Run server | `npm run server` |
-| Demo script | `npm run demo` |
+| Isolated demo script | `RAIL_DEMO_MODE=true npm run demo` |
 
-`npm run demo` follows the current authorization-first flow. It requires `DATABASE_URL` and `RAIL_SIGNING_SECRET`, creates a real authorization, executes an online payment through the hardened pipeline, and then replays the same request to demonstrate idempotent retry behavior.
+`RAIL_DEMO_MODE=true npm run demo` follows the authorization-first flow. It requires a non-production environment, `DATABASE_URL`, `RAIL_SIGNING_SECRET`, and database permissions to create/drop a schema. Use a development database and maintenance credentials, not production runtime credentials.
+
+Each invocation creates a random isolated schema, seeds synthetic opening funds there, creates an authorization, executes an online payment, replays the exact request and checks reconciliation. It prints acceptance results and balances, then removes only its own temporary schema and closes its pools. Repeated runs do not claim existing wallets or reuse stale payment fingerprints. This proves the internal demo flow, not external bank settlement or production readiness.
 
 Schedule `npm run authorizations:sweep` outside the API process for unattended expiry cleanup. Each run releases at most 1,000 expired reservations; repeat runs drain larger backlogs. Reads and new authorizations also reclaim expired reservations transactionally. Serverless instances do not start background timers. Keep database credentials in the scheduler's secret storage and monitor failed runs.
 
