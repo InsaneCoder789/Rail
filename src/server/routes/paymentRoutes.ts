@@ -103,7 +103,7 @@ export async function handlePaymentRoutes(
 
     let authenticatedWallet: string;
     try {
-      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req, url);
+      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
     } catch (err) {
       context.eventStore.emitSystemError(err, "auth.verify");
       throw err;
@@ -211,7 +211,7 @@ export async function handlePaymentRoutes(
 
     let authenticatedWallet: string;
     try {
-      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req, url);
+      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
     } catch (err) {
       context.eventStore.emitSystemError(err, "auth.verify");
       throw err;

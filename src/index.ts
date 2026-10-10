@@ -9,8 +9,7 @@ export { runMigrations } from "./persistence/migrate.js";
 export { MemoryOutbox } from "./pipeline/outbox.js";
 export { MemoryDeadLetterQueue } from "./pipeline/dlq.js";
 export { Semaphore } from "./pipeline/backpressure.js";
-export { SagaCoordinator } from "./pipeline/saga.js";
-export { buildDefaultPaymentPipeline, buildHardenedPaymentPipeline } from "./stages/paymentPipeline.js";
+export { buildHardenedPaymentPipeline } from "./stages/paymentPipeline.js";
 export { consoleTracer, noopTracer } from "./pipeline/tracing.js";
 export { OfflineTokenStore } from "./rail/offlineTokenStore.js";
 export type { IssuedOfflineToken, IssueOfflineTokenInput, IOfflineTokenStore } from "./rail/offlineTokenStore.js";
@@ -20,4 +19,3 @@ export {
   verifyTransactionHmac,
   signTransactionHmac,
 } from "./crypto/transactionSigning.js";
-export { resolveHsmMode } from "./crypto/hsm.js";

@@ -15,7 +15,7 @@ The project is intentionally positioned as a control and execution layer, not as
 
 The HTTP application requires PostgreSQL for authentication, wallet accounting, replay protection and events. Memory components remain available for isolated tests and examples, not as an alternate payment-server runtime.
 
-The current `main` branch is the polished, resume-grade version of the project: it focuses on transaction safety, explainable architecture, security-conscious design, and a backend structure that reflects how a real fintech execution layer should be modeled.
+The current `main` branch focuses on transaction safety, explainable architecture and security-conscious backend design. The [V1 acceptance record](V1_SIGN_OFF.md) distinguishes verified demonstration behavior from outstanding data and production-release gates.
 
 **Repository:** [github.com/InsaneCoder789/Rail](https://github.com/InsaneCoder789/Rail)
 
@@ -35,7 +35,7 @@ At a high level, Rail supports the following flow:
 2. The sender requests a payment authorization.
 3. Rail reserves the sender’s funds and persists an authorization record.
 4. For offline use cases, Rail can issue a device-bound offline token with limited spend headroom.
-5. A payment is executed through a pipeline with validation, prechecks, idempotency, and a ledger-writing saga.
+5. A payment is executed through validation and prechecks; authorization, wallets, offline headroom, ledger, events and replay results commit in one PostgreSQL transaction.
 6. If the device was offline, queued transactions can later be replayed through the sync endpoint using the same stored authorization model.
 7. The backend emits wallet-visible events for dashboards and operational visibility.
 
@@ -63,7 +63,7 @@ The goal of the project is not to claim production readiness. The goal is to bui
 ```mermaid
 flowchart LR
   Client["Client / Frontend / Device"]
-  Auth["Auth Routes\nregister / login"]
+  Auth["Auth Routes\nregister / login / logout-all"]
   Authorize["Authorize Route\nreserve funds + persist authorization"]
   Token["Offline Token Route\nissue device-bound headroom"]
   Execute["Execute Route\nvalidate + idempotent pipeline run"]
@@ -73,7 +73,7 @@ flowchart LR
   Engine["PaymentPipelineEngine"]
   Validation["Validation Stage"]
   Prechecks["Parallel Prechecks\nsignature + risk"]
-  Saga["Funds and Ledger Saga"]
+  Commit["Single PostgreSQL Transaction"]
 
   Wallets[("wallets")]
   Authorizations[("authorizations")]
@@ -99,13 +99,14 @@ flowchart LR
   Engine --> Idempotency
   Engine --> Validation
   Engine --> Prechecks
-  Engine --> Saga
+  Engine --> Commit
 
-  Saga --> Wallets
-  Saga --> Authorizations
-  Saga --> Tokens
-  Saga --> Ledger
-  Saga --> Outbox
+  Commit --> Wallets
+  Commit --> Authorizations
+  Commit --> Tokens
+  Commit --> Ledger
+  Commit --> Outbox
+  Commit --> Idempotency
 ```
 
 ---
@@ -172,7 +173,9 @@ flowchart TD
   J --> K["Consume reserved funds"]
   K --> L["Credit receiver"]
   L --> M["Write ledger entries"]
-  M --> N["Emit events / outbox"]
+  M --> N["Insert durable outbox events"]
+  N --> O["Store execution + replay result"]
+  O --> P["Commit once; rollback all effects on failure"]
 ```
 
 ---
@@ -184,7 +187,7 @@ flowchart TD
 | Authentication | User registration, password hashing, JWT login, wallet resolution |
 | Authorization | Durable authorization lifecycle with reserve-before-execute behavior |
 | Offline tokens | Device-bound spend headroom with expiry and remaining balance tracking |
-| Execution pipeline | Validation, parallel prechecks, idempotency, saga, ledger posting |
+| Execution pipeline | Validation, bounded prechecks and one atomic financial/replay commit |
 | Sync replay | Offline-only batch replay with stored `authorizationId` enforcement |
 | Idempotency | PostgreSQL-backed in the HTTP application; bounded memory store for isolated tests |
 | Event visibility | Authenticated wallet-scoped events via REST and SSE |
@@ -480,7 +483,6 @@ src/
     jwt.ts
   crypto/
     authorizationSigning.ts
-    hsm.ts
     transactionSigning.ts
   domain/
     authorization.ts
@@ -494,7 +496,6 @@ src/
     engine.ts
     idempotency.ts
     outbox.ts
-    saga.ts
     tracing.ts
   rail/
     offlineTokenStore.ts

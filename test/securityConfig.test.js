@@ -5,7 +5,6 @@ import { loadServerConfig } from "../dist/server/config.js";
 import { generateToken, verifyToken } from "../dist/auth/jwt.js";
 import { createAuthResolver } from "../dist/server/authentication.js";
 import { createServerContext } from "../dist/server/server.js";
-import { resolveHsmMode } from "../dist/crypto/hsm.js";
 
 function withEnvironment(values, work) {
   const original = {};
@@ -31,7 +30,6 @@ test("server startup refuses an incomplete in-memory runtime", () => withEnviron
 test("unimplemented HSM providers fail closed rather than advertising active protection", () => withEnvironment({
   RAIL_KMS_KEY_ID: "test_key", RAIL_PKCS11_MODULE_PATH: undefined,
 }, () => {
-  assert.throws(resolveHsmMode, /HSM_PROVIDER_NOT_IMPLEMENTED/);
   assert.throws(loadServerConfig, /HSM_PROVIDER_NOT_IMPLEMENTED/);
 }));
 

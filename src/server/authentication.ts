@@ -67,7 +67,7 @@ export function createAuthResolver(args: {
   apiKeyScopes: readonly string[];
 }): AuthResolver {
   return {
-    async resolveAuthenticatedWallet(req, url, options) {
+    async resolveAuthenticatedWallet(req) {
       const pool = args.getPool();
       if (!pool) {
         throw new Error("DB_NOT_INITIALIZED");

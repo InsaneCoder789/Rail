@@ -55,22 +55,18 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
         }
       }
 
-      try {
-        const result = await run(client);
-        await client.query(
-          `INSERT INTO rail_idempotency (idempotency_key, status, result_json, request_fingerprint)
-           VALUES ($1, 'completed', $2::jsonb, $3)
-           ON CONFLICT (idempotency_key) DO UPDATE SET
-             status = 'completed',
-             result_json = EXCLUDED.result_json,
-             request_fingerprint = EXCLUDED.request_fingerprint`,
-          [key, JSON.stringify(result), fingerprint],
-        );
-        await client.query("COMMIT");
-        return result;
-      } catch (err) {
-        throw err;
-      }
+      const result = await run(client);
+      await client.query(
+        `INSERT INTO rail_idempotency (idempotency_key, status, result_json, request_fingerprint)
+         VALUES ($1, 'completed', $2::jsonb, $3)
+         ON CONFLICT (idempotency_key) DO UPDATE SET
+           status = 'completed',
+           result_json = EXCLUDED.result_json,
+           request_fingerprint = EXCLUDED.request_fingerprint`,
+        [key, JSON.stringify(result), fingerprint],
+      );
+      await client.query("COMMIT");
+      return result;
     } catch (err) {
       try { await client.query("ROLLBACK"); } catch { discard = true; }
       throw err;

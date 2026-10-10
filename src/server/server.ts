@@ -125,7 +125,7 @@ export async function handleRequest(
         json(res, 200, {
           ok: true,
           service: "rail",
-          persistence: context.databaseUrl ? "postgresql" : "memory",
+          persistence: "postgresql",
           offline: {
             tokenIssue: "POST /v1/offline/tokens/issue",
             execute: "POST /v1/payments/execute",

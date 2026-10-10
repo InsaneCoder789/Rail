@@ -111,7 +111,3 @@ export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOffli
     withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore)),
   ], ctx);
 }
-
-export function buildDefaultPaymentPipeline(tracer: Tracer): Stage {
-  return buildHardenedPaymentPipeline(tracer);
-}

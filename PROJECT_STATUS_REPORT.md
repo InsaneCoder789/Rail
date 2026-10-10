@@ -38,6 +38,14 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V1 Redundancy and Acceptance Review: 10 October 2026
+
+Removed the unused saga coordinator/export, unused stage timeout/retry wrappers, duplicate pipeline builder and redundant catch/rethrow. The HTTP context now requires PostgreSQL explicitly and no longer advertises a memory idempotency union or query-credential options. The placeholder HSM module/export is removed; one configuration guard rejects unsupported providers. README diagrams and the current execution description now show a single database commit, not compensating sagas.
+
+The unsafe timeout wrapper was unused by the financial path; removing it does not introduce a new promise race around commit. SQL deadlines and durable fingerprint-bound retries remain the recovery mechanism for uncertain responses. Tested retry/semaphore utilities and memory test implementations remain because they serve distinct roles, not duplicate payment runtimes.
+
+[V1_SIGN_OFF.md](V1_SIGN_OFF.md) records the verified scope, 86-test acceptance evidence, removals and unresolved owner/data/deployment gates. Overall release remains pending scope confirmation; historical accounting failures and real-money prerequisites are not reclassified as fixed. Private manuals/deliverables and the existing `.gitignore` edits were preserved.
+
 ### V1 Authentication Closure: 10 October 2026
 
 Login now consumes a second shared quota keyed by a hash of the account identifier without an IP component, preventing source-address rotation from bypassing account limits. Both successful and failed attempts count; the default is five attempts per 15 minutes, not a permanent or adaptive lockout. JWTs carry `authVersion`, require integer issuance/expiry values and a maximum 15-minute lifetime, and authentication checks the stored version. Old versionless tokens must log in again.
@@ -290,9 +298,6 @@ This section describes the current TypeScript source layout and the responsibili
 - `src/crypto/authorizationSigning.ts`
   Defines how payment authorizations are signed and verified. This supports the signed authorization model used between authorization issuance and payment execution.
 
-- `src/crypto/hsm.ts`
-  Provides the HSM integration boundary and abstraction hooks. It represents the place where stronger key-management behavior could be integrated later.
-
 - `src/crypto/transactionSigning.ts`
   Handles transaction signature helpers used during payment verification and integrity checks.
 
@@ -358,8 +363,6 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
 - `src/pipeline/retry.ts`
   Defines retry-related helpers for pipeline tasks.
 
-- `src/pipeline/saga.ts`
-  Contains the saga orchestration abstraction used by the payment execution flow to structure compensatable multi-step work.
 
 - `src/pipeline/stage.ts`
   Defines the stage abstraction and contracts for pipeline stage execution.
@@ -416,7 +419,7 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Implements authorization creation, authorization lookup, reservation release, and wallet-authorization setup logic.
 
 - `src/stages/paymentPipeline.ts`
-  Implements the hardened payment pipeline, validation stage, prechecks, ledger logic, authorization claim behavior, and saga-driven money movement.
+  Implements validation, prechecks and money/ledger changes within the idempotency-owned database transaction. No saga compensation runtime remains.
 
 ## Build and Runtime State
 
@@ -522,7 +525,7 @@ The composed payment pipeline performs three broad phases:
 
 1. core validation
 2. parallel prechecks
-3. funds and ledger saga
+3. atomic funds, ledger, execution, outbox and replay commit
 
 ### Core Validation
 
@@ -542,11 +545,11 @@ The system runs two checks in parallel:
 - signature verification
 - risk scoring
 
-The risk scoring is currently placeholder logic, not production fraud logic.
+No enforced fraud engine is claimed. An optional model produces shadow observations only, not authorization decisions.
 
-### Saga Phase
+### Financial Transaction
 
-The payment saga performs:
+The payment transaction performs:
 
 - optional offline token reservation
 - authorization claim inside the payment transaction
@@ -555,7 +558,8 @@ The payment saga performs:
 - ledger entry creation
 - outbox event append
 - offline token finalization
-- commit or compensation
+- execution and replay-result persistence
+- commit all effects together or roll back all effects together
 
 The important change here is that authorization claim now happens in the same transaction as reservation consumption and ledger posting. If the transaction rolls back, the authorization does not remain permanently marked as used.
 

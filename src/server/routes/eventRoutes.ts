@@ -14,7 +14,7 @@ export async function handleEventRoutes(
     json(res, 501, { error: "event_stream_unavailable", hint: "use GET /v1/events for hosted serverless runtimes" });
     return true;
   }
-  const viewer = { walletId: await context.authResolver.resolveAuthenticatedWallet(req, url) };
+  const viewer = { walletId: await context.authResolver.resolveAuthenticatedWallet(req) };
   await applyRateLimit({ req, res, rateLimiter: context.rateLimiter,
     scope: stream ? "events_stream" : "events_read", discriminator: viewer.walletId,
     limit: stream ? 6 : 60, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });

@@ -1,7 +1,6 @@
 import type http from "node:http";
 import type { Pool } from "pg";
 import type { PaymentPipelineEngine } from "../pipeline/engine.js";
-import type { MemoryIdempotencyStore } from "../pipeline/idempotency.js";
 import type { PostgresIdempotencyStore } from "../persistence/postgresIdempotency.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import type { ServerConfig } from "./config.js";
@@ -23,13 +22,10 @@ export interface ServerEvent {
   readonly occurredAt?: string;
 }
 
-export type ServerIdempotencyStore = MemoryIdempotencyStore | PostgresIdempotencyStore;
 
 export interface AuthResolver {
   resolveAuthenticatedWallet(
     req: http.IncomingMessage,
-    url?: URL,
-    options?: { allowQueryCredentials?: boolean },
   ): Promise<string>;
   requireApiKey(req: http.IncomingMessage, res: http.ServerResponse, scope?: string): boolean;
 }
@@ -44,10 +40,10 @@ export interface EventStore {
 
 export interface ServerContext {
   readonly config: ServerConfig;
-  readonly pool: Pool | null;
-  readonly databaseUrl?: string;
+  readonly pool: Pool;
+  readonly databaseUrl: string;
   readonly offlineTokenStore: IOfflineTokenStore;
-  readonly idempotency: ServerIdempotencyStore;
+  readonly idempotency: PostgresIdempotencyStore;
   readonly engine: PaymentPipelineEngine;
   readonly rateLimiter: RateLimiter;
   readonly authResolver: AuthResolver;
