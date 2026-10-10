@@ -38,6 +38,14 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Event Delivery Review: 10 October 2026
+
+Wallet-visible history now filters committed outbox rows in SQL before applying limits, with wallet lookup indexes and stable event IDs. REST accepts a bounded limit and an older-page cursor, and returns `nextBefore`. Failed outbox writes propagate errors instead of producing phantom live events. Operational errors stay in server logs rather than being inserted and broadcast twice.
+
+Persistent-server SSE now polls the shared committed database every two seconds, checks credentials again, and cleans up on read errors, disconnects, slow consumers and a 60-second lifetime. Admission is capped at two streams per wallet and 64 per process; event routes also apply shared rate limits. Serverless SSE remains disabled. This is deliberately an advisory UI snapshot feed: bursts beyond its latest-100 window and commit-order differences require REST refresh/pagination and ID deduplication, not a claim of exactly-once delivery.
+
+Nine new regressions cover failed persistence, malformed cursors, wallet isolation under noisy traffic, equal-timestamp paging, uncommitted-row invisibility across instances, admission, initial read failure, backpressure and later credential failure. The full suite now contains 71 tests. The historical accounting findings and remaining V1 release gates below are unchanged; ML/V2 development is still deferred.
+
 ### Accounting Review: 10 October 2026
 
 Wallet accounting now has explicit opening balances and immutable baseline/identity fields. New wallets capture their starting state; registration remains zero-funded. Historical wallets retain a missing baseline rather than receiving an inferred value. Deferred database checks enforce both equations: available plus reserved equals opening balance plus ledger credits minus debits; reserved equals all still-issued authorization amounts, including expired reservations awaiting release. Baseline-less financial mutations fail closed with a safe `503 accounting_review_required` response. A maintenance command can record an independently reviewed opening amount and reference once, but refuses unresolved wallet-related findings or a value that does not satisfy the equations. This is not verification of external bank funding.

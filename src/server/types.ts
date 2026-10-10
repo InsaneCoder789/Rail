@@ -17,6 +17,7 @@ export interface SseClient {
 }
 
 export interface ServerEvent {
+  readonly id?: string;
   readonly type: string;
   readonly payload: Record<string, unknown>;
   readonly occurredAt?: string;
@@ -34,11 +35,10 @@ export interface AuthResolver {
 }
 
 export interface EventStore {
-  broadcastEvent(event: ServerEvent): void;
   emitSystemError(err: unknown, stage?: string, txId?: string): void;
   insertOutboxEvent(event: ServerEvent): Promise<void>;
-  listVisibleEvents(viewer: AuthenticatedViewer, limit?: number): Promise<ServerEvent[]>;
-  addSseClient(client: SseClient): void;
+  listVisibleEvents(viewer: AuthenticatedViewer, limit?: number, before?: string): Promise<ServerEvent[]>;
+  addSseClient(client: SseClient): boolean;
   removeSseClient(client: SseClient): void;
 }
 

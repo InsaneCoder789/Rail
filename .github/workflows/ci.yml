@@ -50,5 +50,7 @@ jobs:
         run: npm test
       - name: Run hardening tests explicitly
         run: node --test test/hardening.test.js
-      - name: Verify V2 security, ML and audit commitments
+      - name: Verify event delivery and stream lifecycle
+        run: node --test test/events.test.js
+      - name: Verify authentication and existing shadow-risk and audit regressions
         run: node --test test/authRoutes.test.js test/risk.test.js test/auditCommitment.test.js

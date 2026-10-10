@@ -420,11 +420,15 @@ Rules:
 
 ### `GET /v1/events`
 
-Returns recent wallet-visible events for the authenticated caller.
+Returns committed wallet-visible events for the authenticated caller. Use `?limit=20` (1-100) and `?before=<nextBefore>` for older pages. The response contains `events` and `nextBefore`; each event has a stable string `id`. Wallet filtering happens in PostgreSQL before the limit, so other wallets cannot crowd out your history.
+
+Pages are ordered by database event ID, not client timestamps. Refresh the first page when reconnecting and deduplicate by ID: IDs are allocated before commit, so a page cursor is not a guaranteed live-delivery watermark. The feed is not a settlement confirmation.
 
 ### `GET /v1/events/stream`
 
-Streams wallet-visible events over SSE.
+Streams committed wallet-visible snapshots over SSE on persistent servers. The server polls shared PostgreSQL rows every two seconds, rechecks credentials, and closes connections after 60 seconds or on write backpressure. Admission is limited to two connections per wallet and 64 per process. Event requests are rate-limited (60 REST reads or six stream starts per minute per wallet/IP).
+
+SSE is an advisory UI feed, not a durable subscription. It samples the latest 100 wallet events and can miss bursts above that window; clients must refresh and page REST history to recover, deduplicating by event ID. `Last-Event-ID` does not provide guaranteed replay. Multi-instance deployment needs provider-level connection/resource limits as well as these local caps. Serverless runtimes use REST polling only.
 
 Frontend note:
 

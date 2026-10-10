@@ -451,6 +451,12 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
       ADD COLUMN IF NOT EXISTS last_delivery_error TEXT;
     CREATE INDEX IF NOT EXISTS idx_outbox_delivery
       ON outbox (next_attempt_at, id) WHERE delivery_status IN ('pending', 'processing');
+    CREATE INDEX IF NOT EXISTS idx_outbox_sender_history
+      ON outbox ((payload->>'senderWalletId'), id DESC) WHERE type <> 'system.error';
+    CREATE INDEX IF NOT EXISTS idx_outbox_receiver_history
+      ON outbox ((payload->>'receiverWalletId'), id DESC) WHERE type <> 'system.error';
+    CREATE INDEX IF NOT EXISTS idx_outbox_wallet_history
+      ON outbox ((payload->>'walletId'), id DESC) WHERE type <> 'system.error';
     `);
   });
 }

@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
 import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
 import { findReconciliationIssues, recordWalletOpeningBalance } from "../dist/persistence/reconciliation.js";
+import { createEventStore } from "../dist/server/events.js";
 
 dotenv.config();
 
@@ -263,6 +264,45 @@ async function paymentFixture(work) {
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
   }
 }
+
+test("event history filters wallets in SQL and pages equal-timestamp rows without duplicates", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const store = createEventStore(() => pool);
+    await makeEngine().execute(txn);
+    const receiverEvents = await store.listVisibleEvents({ walletId: txn.receiverWalletId }, 100);
+    assert.ok(receiverEvents.length > 0);
+    assert.ok(receiverEvents.every(event => event.id && event.payload.receiverWalletId === txn.receiverWalletId));
+    const time = "2026-10-10T00:00:00.000Z";
+    for (let i = 0; i < 3; i++) await store.insertOutboxEvent({ type: "test.event", payload: { walletId: "wallet_target", ordinal: i }, occurredAt: time });
+    await store.insertOutboxEvent({ type: "system.error", payload: { walletId: "wallet_target", message: "private" } });
+    await pool.query(`INSERT INTO outbox(type, payload)
+      SELECT 'test.noise', '{"walletId":"wallet_other"}'::jsonb FROM generate_series(1, 200)`);
+    const first = await store.listVisibleEvents({ walletId: "wallet_target" }, 2);
+    const second = await store.listVisibleEvents({ walletId: "wallet_target" }, 2, first.at(-1).id);
+    assert.deepEqual([...first, ...second].map(event => event.payload.ordinal), [2, 1, 0]);
+    assert.equal(new Set([...first, ...second].map(event => event.id)).size, 3);
+    assert.deepEqual(await store.listVisibleEvents({ walletId: "wallet_outsider" }), []);
+  });
+});
+
+test("event readers on another instance cannot observe an uncommitted notification", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool }) => {
+    const reader = new Pool({ connectionString: databaseUrl, max: 1, options: pool.options.options });
+    const client = await pool.connect();
+    try {
+      const store = createEventStore(() => reader);
+      await client.query("BEGIN");
+      await client.query("INSERT INTO outbox(type, payload) VALUES ('test.commit', '{\"walletId\":\"wallet_target\"}'::jsonb)");
+      assert.deepEqual(await store.listVisibleEvents({ walletId: "wallet_target" }), []);
+      await client.query("COMMIT");
+      assert.equal((await store.listVisibleEvents({ walletId: "wallet_target" })).length, 1);
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+      await reader.end();
+    }
+  });
+});
 
 test("PostgreSQL offline reservations reject invalid amounts and cannot double-reserve or double-refund", { skip: !databaseUrl }, async () => {
   await paymentFixture(async ({ txn, tokens, token }) => {
