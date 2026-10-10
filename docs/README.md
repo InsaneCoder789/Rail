@@ -336,7 +336,7 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 
 ### Agent control APIs (V2.1 foundation)
 
-These endpoints configure identities and policy; they do **not** execute agent payments. Owner management requires a user JWT, not a wallet/service API key or agent credential. All owner control reads/writes share a PostgreSQL-backed limit of 20 requests per minute per owner, independent of source IP or agent ID.
+These endpoints configure identities, policy and exact-request approvals; they do **not** execute agent payments. Owner management requires a user JWT, not a wallet/service API key or agent credential. All owner control reads/writes share a PostgreSQL-backed limit of 20 requests per minute per owner, independent of source IP or agent ID.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -350,6 +350,10 @@ These endpoints configure identities and policy; they do **not** execute agent p
 | `GET /v2/agents/:agentId/mandates` | List policies and their active/expired/revoked status. |
 | `POST /v2/agents/:agentId/mandates/:mandateId/revoke` | Revoke one policy. Send `{}`. |
 | `GET /v2/agent/identity` | Validate an agent token in `Authorization: Bearer <token>`; limited to 30 requests/minute per request source. |
+| `POST /v2/agent/intents` | Propose a fingerprint-bound request using an agent credential; reserve mandate budget, not wallet funds. |
+| `GET /v2/agent/intents` | List that agent's retained intents and release elapsed holds. |
+| `GET /v2/agents/:agentId/intents` | Owner-only approval queue and retained history. |
+| `POST /v2/agents/:agentId/intents/:intentId/decision` | Owner-only `approve` or `reject` decision bound to `requestFingerprint`. |
 
 Credential scope is currently fixed to `payments:propose`. Default expiry is 24 hours; supplied lifetimes must be 60 seconds to 30 days. Only a SHA-256 hash of the 256-bit random token is persisted. Capture the one-time token response securely, never in browser storage or application logs. If the response is lost, inspect credential metadata, revoke that credential and issue a replacement; issuance itself is not an idempotent payment operation.
 
@@ -366,9 +370,28 @@ Example mandate body:
 }
 ```
 
-`approval_required` is the other supported mode. Amounts use minor units, the per-payment limit cannot exceed the total budget, and 1-20 distinct receivers must already exist in the owner's currency. Self-payment policies are rejected. Both modes return `executionEnabled: false`: exact payment approvals and transactional budget consumption are not enabled yet. Creating a policy reserves no wallet funds. There is no unrestricted mode or agent execution endpoint.
+`approval_required` is the other supported mode. Amounts use minor units, the per-payment limit cannot exceed the total budget, and 1-20 distinct receivers must already exist in the owner's currency. Self-payment policies are rejected. Intents start `pending` in approval-required mode and `approved` under a budgeted mandate. Approval cannot override the policy. Both modes return `executionEnabled: false`: financial execution and budget consumption are not enabled yet. Neither creating a policy nor approving an intent reserves wallet funds. There is no unrestricted mode or agent execution endpoint.
 
-Limits are 50 retained agents per owner and 100 retained credentials/mandates per agent, including revoked or expired rows. These are deliberate storage bounds; no automatic deletion resets them. Each control mutation commits its audit event in the same transaction, and a failed audit write rolls the change back. Apply the database migration before updating hosted API instances.
+Example proposal to `POST /v2/agent/intents`:
+
+```json
+{
+  "mandateId": "<mandate UUID>",
+  "clientRequestId": "invoice_request_001",
+  "receiverWalletId": "receiver_wallet",
+  "amountMinor": 2500,
+  "currency": "INR",
+  "ttlSeconds": 300
+}
+```
+
+The response contains `{ "intent": { ... } }`, including the immutable `requestFingerprint`, `status`, deadline and `executionEnabled: false`. The owner posts `{ "decision": "approve", "requestFingerprint": "<returned fingerprint>" }` to the decision endpoint. Use `reject` to release the hold, including a previously approved hold. Rejected/expired intents cannot be revived; inspect the returned status rather than assuming a repeated decision succeeded.
+
+`clientRequestId` is 8-128 characters and unique within an agent. Identical retries return the existing intent without another hold or a renewed deadline; a changed mandate, receiver, amount, currency or TTL returns `409`. TTL defaults to 300 seconds, accepts 60-900 seconds and is clipped to the mandate deadline. The approval fingerprint binds the exact owner, agent, mandate, recipient, amount, currency and timestamps.
+
+Pending and approved intents hold `reservedBudgetMinor`; PostgreSQL commit constraints require it to equal the sum of live intent amounts and stay within `totalBudgetMinor`. This is policy headroom, not proof of available wallet money. Intent/mandate reads, proposals and decisions lazily release expired holds in a successful audited transaction; there is no expiry worker. A failed operation rolls that cleanup back. Revoking an agent or mandate releases its holds; revoking one credential prevents subsequent token use but does not cancel every intent belonging to the agent.
+
+Agent intent reads/writes share a PostgreSQL-backed 20/minute agent bucket across credentials and IP addresses, plus a 30/minute source bucket. Limits are 50 retained agents per owner, 100 credentials/mandates and 1,000 intents per agent, including revoked, rejected or expired rows. No automatic deletion resets these bounds. Intent bindings/history cannot be edited or deleted through normal SQL updates. Mutations and audit events commit together; failed audit writes roll changes back. Apply migrations before updating hosted API instances. Pending intent fields are relational data, not encrypted payment evidence; the AES/HMAC evidence path below applies to committed payments.
 
 ### `GET /v1/payments/:txId/evidence`
 

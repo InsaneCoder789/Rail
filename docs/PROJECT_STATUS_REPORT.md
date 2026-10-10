@@ -38,6 +38,20 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.1 Bound Intents, Approvals and Budget Holds: 11 October 2026
+
+Added `rail_agent_intents` and a mandate `reserved_budget_minor` counter. Agents can propose requests through `POST /v2/agent/intents` and inspect them through `GET` on the same path. Owners use `GET /v2/agents/:agentId/intents` and `POST /v2/agents/:agentId/intents/:intentId/decision` with a current-version JWT. Agent credentials cannot approve requests or authenticate as owners. A separate 20/minute shared agent bucket spans credentials and source IPs, alongside the 30/minute source guard and existing owner-global quota.
+
+Proposals validate recipient, currency, per-payment limit, live credential and mandate authority inside an agent-locked database transaction. Pending and approved intents reserve policy budget atomically; parallel proposals cannot exceed the mandate. Budgeted mandates preapprove an in-policy intent; approval-required mandates leave it pending for the owner. The approval fingerprint binds immutable identity, owner, mandate, recipient, money fields and timestamps. Reusing an agent-scoped client request ID with different data returns a conflict; identical retries return current state without another hold or extending the deadline.
+
+Intent TTL defaults to 300 seconds, accepts 60-900 seconds and is capped by mandate expiry. Rejection, agent revocation, mandate revocation and transactional expiry cleanup release holds once. Rejected/expired intents cannot be resurrected. Intent/mandate reads and intent mutations clean expired holds lazily; no background expiry job was added, and failed transactions roll cleanup back. Revoking one credential prevents subsequent use of that token but does not cancel every agent intent. At most 1,000 intents are retained per agent, including terminal history.
+
+Database constraints require each mandate's held budget to equal its pending/approved intent sum at commit. Immutable-history triggers reject edits to request bindings, terminal-state resurrection and deletion. State changes and outbox audits commit together; audit failure rolls both state and budget back. These checks assume runtime roles cannot disable triggers. Pending intent fields are not encrypted evidence; AES/HMAC protection still applies to committed payment evidence.
+
+**Financial boundary:** `executionEnabled: false` remains explicit. These holds are mandate policy headroom, not wallet reservations or proof of available funds. No agent execute endpoint, wallet movement, ledger entry, authorization or consumed-budget lifecycle was added. Existing owner and offline execution remains unchanged. Next category is approved-intent execution with credential/mandate rechecks, budget consumption, money state, evidence and replay in one financial transaction. ML enforcement and blockchain publication remain pending.
+
+Verification: the full local PostgreSQL-backed suite passes 127 tests with zero failures/skips. Twelve intent-category tests cover concurrent retries, payload conflicts, exact approval binding, ownership isolation, concurrent headroom, deadline cleanup, revocation races, shared quotas, database invariants and audit rollback. The initial added quota test incorrectly expected a response instead of the route's thrown `RateLimitError`; its assertion was corrected. An intermediate full run also hit a connection timeout in an existing history-protection fixture with a one-second checkout deadline; final verification was rerun without relaxing accounting assertions. GitHub Actions already executes the complete agent test file explicitly on Node 22/24; its step label now includes intents and approvals. This revision has not run remotely or been deployed. Public and ignored private reports were updated. Production key recovery, historical accounting and least-privilege roles remain open gates.
+
 ### V2.1 Agent Control Foundation: 11 October 2026
 
 Implemented owner-managed agents, separate agent credentials and spending-mandate records. The new `rail_agents`, `rail_agent_credentials` and `rail_agent_mandates` tables bind identities and policies to existing wallets. Credentials contain 256 bits of random token material, are returned once, and are persisted only as SHA-256 hashes. Their current scope is fixed to `payments:propose`, with explicit expiry and revocation. Agent tokens cannot authenticate as owner JWTs or wallet API keys.
@@ -374,7 +388,7 @@ This section describes the current TypeScript source layout and the responsibili
   Creates and configures the PostgreSQL connection pool used by the server.
 
 - `src/persistence/agentAuthority.ts`
-  Stores owner-bound agents, hashed expiring credentials and validated mandate records. Serializes revocation/control mutations, enforces retained-record bounds and persists audit events atomically. Does not execute agent payments or consume budgets.
+  Stores owner-bound agents, hashed expiring credentials, mandates and fingerprint-bound intents. Serializes approvals, revocation and policy-budget holds, releases expired holds, enforces retained-record bounds and persists audit events atomically. Does not execute agent payments or consume payment budgets.
 
 - `src/persistence/reconciliation.ts`
   Performs snapshot-consistent accounting checks and validates evidence-referenced, one-time historical opening-balance records.
@@ -461,7 +475,7 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Contains registration and login route handling.
 
 - `src/server/routes/agentRoutes.ts`
-  Handles owner-JWT-only identity, credential and mandate management with a shared owner quota, plus separate scoped-agent introspection. Responses explicitly disable execution until financial authority integration is complete.
+  Handles owner-JWT-only control management and exact intent decisions with a shared owner quota, plus scoped-agent introspection and proposals under source/agent quotas. Responses explicitly disable execution until financial authority integration is complete.
 
 - `src/server/routes/paymentRoutes.ts`
   Contains payment authorization, offline token issuance, payment execution, and sync route handling.

@@ -38,6 +38,14 @@ async function fixture(work) {
   }
 }
 
+async function intentSetup(store, owner, mode = "approval_required", totalBudgetMinor = 1000) {
+  const agent = await store.createAgent(owner, { name: "Intent agent" });
+  const credential = await store.issueCredential(owner, agent.agentId, {});
+  const mandate = await store.createMandate(owner, agent.agentId, { ...policy, mode, totalBudgetMinor });
+  const input = { mandateId: mandate.mandateId, clientRequestId: "intent_request_001", receiverWalletId: "agent_receiver", amountMinor: 100, currency: "INR", ttlSeconds: 300 };
+  return { agent, credential, mandate, input };
+}
+
 test("mandate parsing rejects malformed modes, money, TTL and recipient lists", () => {
   assert.deepEqual(parseMandateInput(policy), policy);
   assert.equal(parseMandateInput({ ...policy, mode: "approval_required" }).mode, "approval_required");
@@ -247,5 +255,229 @@ test("revoked owner JWT versions cannot manage agent controls", { skip: !databas
     await assert.rejects(resolver.resolveOwnerWallet(req), { status: 401 });
     const fresh = { headers: { authorization: `Bearer ${generateToken("agent_user", 1)}` } };
     assert.equal(await resolver.resolveOwnerWallet(fresh), "agent_owner");
+  });
+});
+
+test("concurrent intent retries reserve budget once and preserve the exact request fingerprint", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { credential, mandate, input } = await intentSetup(store, owner);
+    const before = (await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows;
+    const intents = await Promise.all(Array.from({ length: 8 }, () => store.createIntent(credential.token, input)));
+    assert.ok(intents.every(intent => JSON.stringify(intent) === JSON.stringify(intents[0])));
+    assert.equal(intents[0].status, "pending");
+    assert.equal(intents[0].executionEnabled, false);
+    assert.match(intents[0].requestFingerprint, /^[a-f0-9]{64}$/);
+    assert.equal((await pool.query("SELECT reserved_budget_minor FROM rail_agent_mandates WHERE mandate_id = $1", [mandate.mandateId])).rows[0].reserved_budget_minor, "100");
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 1);
+    assert.deepEqual((await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows, before);
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    for (const change of [{ amountMinor: 99 }, { currency: "USD" }, { ttlSeconds: 301 },
+      { receiverWalletId: "other_owner" }, { mandateId: randomUUID() }]) {
+      await assert.rejects(store.createIntent(credential.token, { ...input, ...change }), { status: 409, code: "intent_request_reused" });
+    }
+  });
+});
+
+test("owner decisions bind to the exact intent and never resurrect rejected requests", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner, other }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    const intent = await store.createIntent(credential.token, input);
+    await assert.rejects(store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", requestFingerprint: "a".repeat(64) }), { code: "intent_fingerprint_mismatch" });
+    await assert.rejects(store.decideIntent(other, agent.agentId, intent.intentId, { decision: "approve", requestFingerprint: intent.requestFingerprint }), { status: 404 });
+    const approve = { decision: "approve", requestFingerprint: intent.requestFingerprint };
+    assert.equal((await store.decideIntent(owner, agent.agentId, intent.intentId, approve)).status, "approved");
+    assert.equal((await store.decideIntent(owner, agent.agentId, intent.intentId, approve)).status, "approved");
+    const rejected = await Promise.all(Array.from({ length: 4 }, () => store.decideIntent(owner, agent.agentId, intent.intentId,
+      { decision: "reject", requestFingerprint: intent.requestFingerprint })));
+    assert.ok(rejected.every(item => item.status === "rejected" && item.reason === "owner_rejected"));
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    assert.equal((await store.decideIntent(owner, agent.agentId, intent.intentId, approve)).status, "rejected");
+  });
+});
+
+test("budgeted intents receive preapproval but concurrent proposals cannot exceed mandate headroom", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, input } = await intentSetup(store, owner, "budgeted", 200);
+    const results = await Promise.allSettled(Array.from({ length: 6 }, (_, i) => store.createIntent(credential.token, { ...input, clientRequestId: `budget_intent_${i}` })));
+    assert.equal(results.filter(result => result.status === "fulfilled").length, 2);
+    assert.ok(results.filter(result => result.status === "fulfilled").every(result => result.value.status === "approved"));
+    assert.ok(results.filter(result => result.status === "rejected").every(result => result.reason.code === "mandate_budget_exceeded"));
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 200);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 2);
+  });
+});
+
+test("mandate expiry releases intent budget and cannot renew old request IDs", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, mandate, input } = await intentSetup(store, owner);
+    const intent = await store.createIntent(credential.token, input);
+    // Historical fixture simulates an elapsed mandate deadline, without changing intent history.
+    await pool.query("UPDATE rail_agent_mandates SET created_at = clock_timestamp() - interval '2 hours', expires_at = clock_timestamp() - interval '1 hour' WHERE mandate_id = $1", [mandate.mandateId]);
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "expired");
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    assert.equal((await store.createIntent(credential.token, input)).status, "expired");
+    assert.equal((await store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", requestFingerprint: intent.requestFingerprint })).status, "expired");
+    await assert.rejects(store.createIntent(credential.token, { ...input, clientRequestId: "expired_new_request" }), { code: "mandate_inactive" });
+  });
+});
+
+test("agent and mandate revocation release held intent budgets exactly once", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner }) => {
+    for (const revoke of ["agent", "mandate"]) {
+      const { agent, credential, mandate, input } = await intentSetup(store, owner);
+      await store.createIntent(credential.token, input);
+      if (revoke === "agent") {
+        await store.revokeAgent(owner, agent.agentId);
+        await store.revokeAgent(owner, agent.agentId);
+      } else {
+        await store.revokeMandate(owner, agent.agentId, mandate.mandateId);
+        await store.revokeMandate(owner, agent.agentId, mandate.mandateId);
+      }
+      const intent = (await store.listIntents(owner, agent.agentId))[0];
+      assert.equal(intent.status, "rejected");
+      assert.equal(intent.reason, `${revoke}_revoked`);
+      assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    }
+  });
+});
+
+test("intent creation and decisions roll back budget and state on failed audit writes", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    await pool.query(`CREATE FUNCTION fail_intent_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.type LIKE 'agent.intent%' THEN RAISE EXCEPTION 'injected_intent_audit_failure'; END IF; RETURN NEW; END $$`);
+    await pool.query("CREATE TRIGGER fail_intent_audit BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_intent_audit()");
+    await assert.rejects(store.createIntent(credential.token, input), /injected_intent_audit_failure/);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 0);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    await pool.query("DROP TRIGGER fail_intent_audit ON outbox");
+    const intent = await store.createIntent(credential.token, input);
+    await pool.query("CREATE TRIGGER fail_intent_audit BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_intent_audit()");
+    await assert.rejects(store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "reject", requestFingerprint: intent.requestFingerprint }), /injected_intent_audit_failure/);
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "pending");
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 100);
+  });
+});
+
+test("database rejects intent mutation, deletion and inconsistent budget counters", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { credential, mandate, input } = await intentSetup(store, owner);
+    const intent = await store.createIntent(credential.token, input);
+    await assert.rejects(pool.query("UPDATE rail_agent_intents SET amount_minor = 99 WHERE intent_id = $1", [intent.intentId]), /agent_intent_history_is_immutable/);
+    await assert.rejects(pool.query("UPDATE rail_agent_intents SET request_fingerprint = $2 WHERE intent_id = $1", [intent.intentId, "f".repeat(64)]), /agent_intent_history_is_immutable/);
+    await assert.rejects(pool.query("DELETE FROM rail_agent_intents WHERE intent_id = $1", [intent.intentId]), /agent_intent_history_is_immutable/);
+    await assert.rejects(pool.query("UPDATE rail_agent_mandates SET reserved_budget_minor = 0 WHERE mandate_id = $1", [mandate.mandateId]), /agent_budget_reservation_mismatch/);
+  });
+});
+
+test("revoked credentials and out-of-policy proposals cannot create new reservations", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    for (const change of [{ amountMinor: 101 }, { receiverWalletId: owner }, { currency: "USD" }]) {
+      await assert.rejects(store.createIntent(credential.token, { ...input, ...change }), { code: "mandate_policy_denied" });
+    }
+    for (const change of [{ ttlSeconds: 901 }, { ttlSeconds: null }, { clientRequestId: "bad" }, { amountMinor: -1 }]) {
+      await assert.rejects(store.createIntent(credential.token, { ...input, ...change }), { status: 422 });
+    }
+    await store.revokeCredential(owner, agent.agentId, credential.credentialId);
+    await assert.rejects(store.createIntent(credential.token, input), { status: 401 });
+    await assert.rejects(store.listAgentIntents(credential.token), { status: 401 });
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+  });
+});
+
+test("agent intent endpoints separate proposal credentials from owner approvals", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner, token }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+      authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
+    const call = async (method, path, body, bearer) => {
+      const req = Readable.from(body ? [JSON.stringify(body)] : []);
+      req.method = method;
+      req.headers = { authorization: `Bearer ${bearer}`, "content-type": "application/json" };
+      req.socket = { remoteAddress: "192.0.2.1" };
+      const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
+      assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost${path}`), context), true);
+      return res.body;
+    };
+    const { intent } = await call("POST", "/v2/agent/intents", input, credential.token);
+    assert.equal(intent.status, "pending");
+    assert.equal((await call("GET", "/v2/agent/intents", undefined, credential.token)).intents.length, 1);
+    const path = `/v2/agents/${agent.agentId}/intents/${intent.intentId}/decision`;
+    const decision = { decision: "approve", requestFingerprint: intent.requestFingerprint };
+    await assert.rejects(call("POST", path, decision, credential.token), { status: 401 });
+    assert.equal((await call("POST", path, decision, token)).intent.status, "approved");
+    assert.equal((await call("GET", `/v2/agents/${agent.agentId}/intents`, undefined, token)).intents[0].status, "approved");
+    await assert.rejects(call("POST", "/v2/agent/intents", input, token), { status: 401 });
+  });
+});
+
+test("reading mandates releases elapsed intent deadlines without changing live reservations", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, mandate, input } = await intentSetup(store, owner);
+    const live = await store.createIntent(credential.token, input);
+    const elapsedId = randomUUID();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Insert historical data instead of bypassing the immutable-history trigger.
+      await client.query(`WITH timestamp AS (SELECT clock_timestamp() AS now)
+        INSERT INTO rail_agent_intents(intent_id, agent_id, mandate_id, owner_wallet_id, client_request_id,
+          proposal_fingerprint, request_fingerprint, receiver_wallet_id, amount_minor, currency, status, created_at, expires_at)
+        SELECT $1, agent_id, mandate_id, owner_wallet_id, 'elapsed_intent_request', proposal_fingerprint,
+          request_fingerprint, receiver_wallet_id, amount_minor, currency, 'pending', now - interval '2 minutes', now - interval '1 minute'
+        FROM rail_agent_intents, timestamp WHERE intent_id = $2`, [elapsedId, live.intentId]);
+      await client.query("UPDATE rail_agent_mandates SET reserved_budget_minor = reserved_budget_minor + 100 WHERE mandate_id = $1", [mandate.mandateId]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 100);
+    const intents = await store.listIntents(owner, agent.agentId);
+    assert.equal(intents.find(intent => intent.intentId === live.intentId).status, "pending");
+    assert.equal(intents.find(intent => intent.intentId === elapsedId).status, "expired");
+    assert.equal((await store.decideIntent(owner, agent.agentId, elapsedId,
+      { decision: "approve", requestFingerprint: live.requestFingerprint })).status, "expired");
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 100);
+  });
+});
+
+test("concurrent revocation and proposals leave no live intents or reserved budget", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    const results = await Promise.allSettled([
+      ...Array.from({ length: 6 }, (_, i) => store.createIntent(credential.token, { ...input, clientRequestId: `revocation_race_${i}` })),
+      store.revokeAgent(owner, agent.agentId)
+    ]);
+    assert.equal(results[results.length - 1].status, "fulfilled");
+    assert.ok(results.slice(0, -1).every(result => result.status === "fulfilled" || result.reason.status === 401));
+    assert.ok((await store.listIntents(owner, agent.agentId)).every(intent => intent.status === "rejected"));
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    await assert.rejects(store.createIntent(credential.token, input), { status: 401 });
+  });
+});
+
+test("agent intent quotas remain shared when request source addresses change", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { credential, input } = await intentSetup(store, owner);
+    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool) };
+    for (let i = 0; i < 21; i++) {
+      const req = Readable.from([JSON.stringify(input)]);
+      req.method = "POST";
+      req.headers = { authorization: `Bearer ${credential.token}`, "content-type": "application/json" };
+      req.socket = { remoteAddress: `192.0.2.${i + 1}` };
+      const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
+      const call = () => handleAgentRoutes(req, res, new URL("http://localhost/v2/agent/intents"), context);
+      if (i < 20) {
+        assert.equal(await call(), true);
+        assert.equal(res.status, 200);
+      } else await assert.rejects(call(), { status: 429 });
+    }
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 1);
+    assert.equal((await pool.query("SELECT reserved_budget_minor FROM rail_agent_mandates")).rows[0].reserved_budget_minor, "100");
   });
 });

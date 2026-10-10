@@ -260,6 +260,72 @@ CREATE TABLE IF NOT EXISTS rail_agent_mandates (
   CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
 );
 CREATE INDEX IF NOT EXISTS idx_agent_mandates_agent ON rail_agent_mandates(agent_id, created_at, mandate_id);
+ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS reserved_budget_minor BIGINT NOT NULL DEFAULT 0
+  CHECK (reserved_budget_minor >= 0 AND reserved_budget_minor <= total_budget_minor);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_mandate_owner_binding ON rail_agent_mandates(mandate_id, agent_id, owner_wallet_id);
+CREATE TABLE IF NOT EXISTS rail_agent_intents (
+  intent_id UUID PRIMARY KEY,
+  agent_id UUID NOT NULL,
+  mandate_id UUID NOT NULL,
+  owner_wallet_id TEXT NOT NULL,
+  client_request_id TEXT NOT NULL CHECK (length(client_request_id) BETWEEN 8 AND 128),
+  proposal_fingerprint TEXT NOT NULL CHECK (proposal_fingerprint ~ '^[a-f0-9]{64}$'),
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[a-f0-9]{64}$'),
+  receiver_wallet_id TEXT NOT NULL REFERENCES wallets(wallet_id),
+  amount_minor BIGINT NOT NULL CHECK (amount_minor BETWEEN 1 AND 1000000000000),
+  currency TEXT NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+  terminal_reason TEXT CHECK (terminal_reason IN ('owner_rejected', 'agent_revoked', 'mandate_revoked', 'deadline_expired')),
+  created_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL CHECK (expires_at > created_at AND expires_at <= created_at + interval '15 minutes'),
+  FOREIGN KEY (mandate_id, agent_id, owner_wallet_id) REFERENCES rail_agent_mandates(mandate_id, agent_id, owner_wallet_id),
+  UNIQUE (agent_id, client_request_id),
+  CHECK (receiver_wallet_id <> owner_wallet_id),
+  CHECK ((status IN ('pending','approved') AND terminal_reason IS NULL) OR
+    (status IN ('rejected','expired') AND terminal_reason IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_intents_agent ON rail_agent_intents(agent_id, created_at, intent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_intents_mandate ON rail_agent_intents(mandate_id, status);
+
+CREATE OR REPLACE FUNCTION rail_assert_agent_budget(id UUID) RETURNS VOID
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id = id AND
+      mandate.reserved_budget_minor <> COALESCE((SELECT SUM(intent.amount_minor) FROM rail_agent_intents intent
+        WHERE intent.mandate_id = id AND intent.status IN ('pending','approved')), 0)) THEN
+    RAISE EXCEPTION 'agent_budget_reservation_mismatch' USING ERRCODE = '23514';
+  END IF;
+END $$;
+CREATE OR REPLACE FUNCTION rail_check_agent_budget() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  PERFORM rail_assert_agent_budget(NEW.mandate_id);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_intent_budget_check ON rail_agent_intents;
+CREATE CONSTRAINT TRIGGER rail_agent_intent_budget_check AFTER INSERT OR UPDATE ON rail_agent_intents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_budget();
+DROP TRIGGER IF EXISTS rail_agent_mandate_budget_check ON rail_agent_mandates;
+CREATE CONSTRAINT TRIGGER rail_agent_mandate_budget_check AFTER INSERT OR UPDATE ON rail_agent_mandates
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_budget();
+
+CREATE OR REPLACE FUNCTION rail_protect_agent_intent() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'agent_intent_history_is_immutable' USING ERRCODE = '23514'; END IF;
+  IF ROW(NEW.intent_id, NEW.agent_id, NEW.mandate_id, NEW.owner_wallet_id, NEW.client_request_id,
+      NEW.proposal_fingerprint, NEW.request_fingerprint, NEW.receiver_wallet_id, NEW.amount_minor, NEW.currency, NEW.created_at, NEW.expires_at)
+    IS DISTINCT FROM ROW(OLD.intent_id, OLD.agent_id, OLD.mandate_id, OLD.owner_wallet_id, OLD.client_request_id,
+      OLD.proposal_fingerprint, OLD.request_fingerprint, OLD.receiver_wallet_id, OLD.amount_minor, OLD.currency, OLD.created_at, OLD.expires_at)
+    OR (OLD.status IN ('rejected','expired') AND ROW(NEW.status, NEW.terminal_reason) IS DISTINCT FROM ROW(OLD.status, OLD.terminal_reason))
+    OR (OLD.status = 'approved' AND NEW.status = 'pending') THEN
+    RAISE EXCEPTION 'agent_intent_history_is_immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_intent_immutable ON rail_agent_intents;
+CREATE TRIGGER rail_agent_intent_immutable BEFORE UPDATE OR DELETE ON rail_agent_intents
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_agent_intent();
 
 DO $$
 BEGIN
