@@ -509,6 +509,7 @@ src/
 | Tests | `npm test` |
 | Deliver outbox batch | `npm run outbox:dispatch` |
 | Release expired authorizations | `npm run authorizations:sweep` |
+| Check accounting consistency | `npm run accounting:reconcile` |
 | Train risk baseline | `npm run risk:train -- dataset.json model.json` |
 | Run server | `npm run server` |
 | Demo script | `npm run demo` |
@@ -516,6 +517,10 @@ src/
 `npm run demo` follows the current authorization-first flow. It requires `DATABASE_URL` and `RAIL_SIGNING_SECRET`, creates a real authorization, executes an online payment through the hardened pipeline, and then replays the same request to demonstrate idempotent retry behavior.
 
 Schedule `npm run authorizations:sweep` outside the API process for unattended expiry cleanup. Each run releases at most 1,000 expired reservations; repeat runs drain larger backlogs. Reads and new authorizations also reclaim expired reservations transactionally. Serverless instances do not start background timers. Keep database credentials in the scheduler's secret storage and monitor failed runs.
+
+`npm run accounting:reconcile` is read-only and exits nonzero if it finds problems. It compares available plus reserved funds with the recorded opening balance plus ledger movements, and reserved funds with issued authorizations. It also checks currency, usage, execution and replay consistency in one database snapshot. Reports are bounded; a truncated report is explicitly incomplete, not a clean result.
+
+New wallets record their initial balance; registration starts at zero. This is an accounting baseline, not proof of external funding or settlement. Historical wallets are not automatically backfilled, and money mutations without a baseline fail with `503 accounting_review_required`. An operator must review source records first. With separate maintenance credentials and `RAIL_ACCOUNTING_OPERATOR=true`, the command `npm run accounting:reconcile -- --record-opening WALLET_ID AMOUNT_MINOR EVIDENCE_REFERENCE` records an independently reviewed value once. Unresolved wallet-related findings or an incorrect balance prevent the record from committing. The reference is stored for review; Rail cannot verify the external evidence itself. Do not change wallet balances directly to add funds; a formal funding/reversal lifecycle is still unfinished.
 
 ---
 

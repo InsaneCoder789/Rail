@@ -66,6 +66,21 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_wallets_updated_at ON wallets(updated_at);
 
+ALTER TABLE wallets
+  ADD COLUMN IF NOT EXISTS opening_balance_minor BIGINT,
+  ADD COLUMN IF NOT EXISTS opening_balance_reference TEXT,
+  ADD COLUMN IF NOT EXISTS opening_balance_recorded_at TIMESTAMPTZ;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'wallet_opening_balance_valid' AND conrelid = 'wallets'::regclass) THEN
+    ALTER TABLE wallets ADD CONSTRAINT wallet_opening_balance_valid CHECK (
+      CASE WHEN opening_balance_minor IS NULL THEN opening_balance_reference IS NULL AND opening_balance_recorded_at IS NULL
+      ELSE opening_balance_minor BETWEEN 0 AND 9007199254740991
+        AND opening_balance_reference IS NOT NULL AND length(opening_balance_reference) BETWEEN 1 AND 512
+        AND opening_balance_recorded_at IS NOT NULL END
+    );
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS ledger_entries (
   id SERIAL PRIMARY KEY,
   tx_id TEXT NOT NULL,
@@ -222,6 +237,84 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+CREATE OR REPLACE FUNCTION rail_wallet_baseline() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.opening_balance_minor := NEW.balance + NEW.reserved;
+    NEW.opening_balance_reference := 'wallet_created';
+    NEW.opening_balance_recorded_at := clock_timestamp();
+  ELSE
+    IF NEW.currency IS DISTINCT FROM OLD.currency OR NEW.wallet_id IS DISTINCT FROM OLD.wallet_id THEN
+      RAISE EXCEPTION 'wallet_identity_is_immutable' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.opening_balance_minor IS NOT NULL AND
+       ROW(NEW.opening_balance_minor, NEW.opening_balance_reference, NEW.opening_balance_recorded_at)
+       IS DISTINCT FROM ROW(OLD.opening_balance_minor, OLD.opening_balance_reference, OLD.opening_balance_recorded_at) THEN
+      RAISE EXCEPTION 'wallet_baseline_is_immutable' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_wallet_baseline_capture ON wallets;
+CREATE TRIGGER rail_wallet_baseline_capture BEFORE INSERT OR UPDATE ON wallets
+  FOR EACH ROW EXECUTE FUNCTION rail_wallet_baseline();
+
+CREATE OR REPLACE FUNCTION rail_assert_wallet(payment_wallet_id TEXT) RETURNS VOID
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE
+  wallet_record wallets%ROWTYPE;
+  movement NUMERIC;
+  reservation NUMERIC;
+BEGIN
+  SELECT * INTO wallet_record FROM wallets WHERE wallet_id = payment_wallet_id;
+  IF NOT FOUND THEN RETURN; END IF;
+  IF wallet_record.currency IS NULL OR wallet_record.currency !~ '^[A-Z]{3}$' THEN
+    RAISE EXCEPTION 'wallet_currency_invalid' USING ERRCODE = '23514';
+  END IF;
+  IF wallet_record.opening_balance_minor IS NULL THEN
+    RAISE EXCEPTION 'accounting_baseline_required' USING ERRCODE = '23514';
+  END IF;
+  IF wallet_record.balance IS NULL OR wallet_record.reserved IS NULL OR wallet_record.balance < 0 OR wallet_record.reserved < 0 THEN
+    RAISE EXCEPTION 'wallet_amount_invalid' USING ERRCODE = '23514';
+  END IF;
+  IF EXISTS (SELECT 1 FROM ledger_entries WHERE wallet_id = payment_wallet_id AND currency <> wallet_record.currency) THEN
+    RAISE EXCEPTION 'wallet_ledger_currency_mismatch' USING ERRCODE = '23514';
+  END IF;
+  SELECT COALESCE(SUM(CASE entry_type WHEN 'credit' THEN amount_minor ELSE -amount_minor END), 0)
+    INTO movement FROM ledger_entries WHERE wallet_id = payment_wallet_id;
+  SELECT COALESCE(SUM(amount_minor), 0) INTO reservation FROM authorizations
+    WHERE sender_wallet_id = payment_wallet_id AND status = 'issued';
+  IF wallet_record.balance::numeric + wallet_record.reserved <> wallet_record.opening_balance_minor::numeric + movement
+     OR wallet_record.balance::numeric + wallet_record.reserved > 9007199254740991 THEN
+    RAISE EXCEPTION 'wallet_balance_equation_failed' USING ERRCODE = '23514';
+  END IF;
+  IF wallet_record.reserved <> reservation THEN
+    RAISE EXCEPTION 'wallet_reservation_equation_failed' USING ERRCODE = '23514';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION rail_check_wallet_commit() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  PERFORM rail_assert_wallet(NEW.wallet_id);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_wallet_commit_check ON wallets;
+CREATE CONSTRAINT TRIGGER rail_wallet_commit_check AFTER INSERT OR UPDATE ON wallets
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_wallet_commit();
+
+CREATE OR REPLACE FUNCTION rail_check_authorization_wallet() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP <> 'DELETE' THEN PERFORM rail_assert_wallet(NEW.sender_wallet_id); END IF;
+  IF TG_OP <> 'INSERT' THEN PERFORM rail_assert_wallet(OLD.sender_wallet_id); END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_authorization_wallet_check ON authorizations;
+CREATE CONSTRAINT TRIGGER rail_authorization_wallet_check AFTER INSERT OR UPDATE OR DELETE ON authorizations
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_authorization_wallet();
+
 -- Defer complete-payment validation until every stage has written its rows.
 CREATE OR REPLACE FUNCTION rail_assert_payment(payment_tx_id TEXT) RETURNS VOID
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
@@ -241,6 +334,8 @@ BEGIN
   IF entry_count <> 2 OR entries_match IS DISTINCT FROM TRUE THEN
     RAISE EXCEPTION 'payment_ledger_pair_invalid' USING ERRCODE = '23514';
   END IF;
+  PERFORM rail_assert_wallet(auth_record.sender_wallet_id);
+  PERFORM rail_assert_wallet(auth_record.receiver_wallet_id);
   IF NOT EXISTS (SELECT 1 FROM authorization_usage WHERE tx_id = payment_tx_id AND auth_id = auth_record.auth_id)
      OR NOT EXISTS (
        SELECT 1 FROM rail_payment_executions execution

@@ -226,6 +226,9 @@ export function toErrorResponse(
   err: unknown,
   exposeInternalErrors: boolean,
 ): { status: number; body: Record<string, unknown> } {
+  if (err instanceof Error && "code" in err && err.code === "23514" && err.message === "accounting_baseline_required") {
+    return { status: 503, body: { error: "accounting_review_required" } };
+  }
   if (err instanceof PipelineError) {
     const conflicts = ["IDEMPOTENCY_KEY_REUSED", "PAYMENT_ALREADY_EXECUTED", "AUTH_NOT_EXECUTABLE", "COMMITTED_PAYMENT_MISMATCH",
       "unknown_or_expired_token", "token_expired", "wallet_mismatch", "device_mismatch", "currency_mismatch", "insufficient_token_headroom"];

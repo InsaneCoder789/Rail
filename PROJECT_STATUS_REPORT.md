@@ -38,6 +38,14 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Accounting Review: 10 October 2026
+
+Wallet accounting now has explicit opening balances and immutable baseline/identity fields. New wallets capture their starting state; registration remains zero-funded. Historical wallets retain a missing baseline rather than receiving an inferred value. Deferred database checks enforce both equations: available plus reserved equals opening balance plus ledger credits minus debits; reserved equals all still-issued authorization amounts, including expired reservations awaiting release. Baseline-less financial mutations fail closed with a safe `503 accounting_review_required` response. A maintenance command can record an independently reviewed opening amount and reference once, but refuses unresolved wallet-related findings or a value that does not satisfy the equations. This is not verification of external bank funding.
+
+Reconciliation now checks wallet drift, reservation totals, currency, authorization-bound ledger entries, usage, execution and replay records in one read-only MVCC snapshot. It uses transaction deadlines and bounded reports with an explicit truncation finding. The `npm run accounting:reconcile` job exits nonzero on findings and never repairs money. Tests cover concurrent payment snapshots, rejected drift/baseline edits, preserved legacy baselines and cross-currency historical errors. The current local suite passes 62 tests with no skips; dependency audit reports zero known advisories.
+
+The existing local development database is not a clean acceptance dataset: a read-only scan produced 161 findings across unmatched authorization/ledger state, orphan usage, a reservation discrepancy and three missing opening balances. Findings can overlap on a transaction; they are not a count of successful exploits. Existing financial history has not been deleted or rewritten. Dataset disposition and evidence-based reconciliation require an explicit decision. V1 acceptance is still pending; controlled funding/refunds/reversals, authentication lifecycle, event delivery/resource limits, device trust and deployment permissions also remain open before V2 enhancement work.
+
 New payments now have database-enforced commit checks: the used authorization, debit/credit pair, currency, amount, sender/receiver, usage identity, execution record and matching completed replay result must agree before commit. Posted ledger, usage and execution rows reject update/delete, and used authorization financial fields cannot be rewritten or reset for reuse. Two unused wallet stores with conflicting accounting conventions were removed; live wallet mutations remain in the typed authorization helpers inside the shared payment transaction. Builds regenerate `dist` from scratch so removed source files do not leave stale executable modules. Payment integration tests now use disposable schemas rather than deleting financial history. Fault-injection tests verify rollback for incomplete/mismatched commits and rejection of posted-history edits. Opening-balance reconciliation, controlled reversal/refund lifecycle and production database-role permissions remain required work.
 
 Schema migrations now identify constraints by relation, not merely by a database-wide name. Legacy API-key detection is scoped to the current schema. Runtime and outbox migrations execute under a shared transaction-scoped advisory lock, with lock/statement deadlines, rollback and failed-client disposal. PostgreSQL regression tests prove local constraints are enforced even when another schema has the same names, unrelated legacy tables remain untouched, concurrent migrators complete safely and invalid historical data does not leave partially installed runtime tables. The full local suite passes 53 tests without skips.
@@ -267,6 +275,12 @@ This section describes the current TypeScript source layout and the responsibili
 
 - `src/persistence/postgresPool.ts`
   Creates and configures the PostgreSQL connection pool used by the server.
+
+- `src/persistence/reconciliation.ts`
+  Performs snapshot-consistent accounting checks and validates evidence-referenced, one-time historical opening-balance records.
+
+- `src/persistence/runReconciliation.ts`
+  Runs the bounded read-only accounting report or the explicitly enabled operator baseline-recording command. Findings cause a nonzero exit for monitoring.
 
 The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were removed during accounting hardening. They used incompatible balance conventions and had no runtime callers. Wallet mutations now have one implementation in the typed helpers in `src/stages/authorizationStage.ts`.
 

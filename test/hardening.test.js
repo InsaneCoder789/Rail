@@ -6,7 +6,7 @@ import { signTransactionHmac, verifyTransactionHmac, canonicalTransactionPayload
 import { OfflineTokenStore } from "../dist/rail/offlineTokenStore.js";
 import { PipelineError } from "../dist/pipeline/errors.js";
 import { withRetry } from "../dist/pipeline/retry.js";
-import { applyCors, getClientIp } from "../dist/server/http.js";
+import { applyCors, getClientIp, toErrorResponse } from "../dist/server/http.js";
 
 dotenv.config();
 
@@ -123,6 +123,12 @@ test("does not expose mutable offline token state", async () => {
 
   stored.remainingMinor = 1;
   assert.equal((await store.getToken(token.tokenId)).remainingMinor, 5000);
+});
+
+test("missing accounting baselines return a safe review-required response", () => {
+  const error = Object.assign(new Error("accounting_baseline_required"), { code: "23514" });
+  assert.deepEqual(toErrorResponse(error, false), { status: 503, body: { error: "accounting_review_required" } });
+  assert.deepEqual(toErrorResponse(new Error("accounting_baseline_required"), false), { status: 500, body: { error: "internal_error" } });
 });
 
 test("uses trusted proxy headers only when explicitly enabled", () => {

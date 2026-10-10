@@ -19,6 +19,7 @@ import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
 import { createHash } from "node:crypto";
 import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
 import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
+import { findReconciliationIssues, recordWalletOpeningBalance } from "../dist/persistence/reconciliation.js";
 
 dotenv.config();
 
@@ -84,6 +85,33 @@ test("failed schema migrations roll back new objects instead of leaving a partia
     await pool.query("UPDATE wallets SET balance = 0");
     await runMigrations(pool);
     await ensureOutboxSchema(pool);
+  } finally {
+    await pool.end();
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+test("legacy wallet baselines require explicit evidence and cannot be guessed or overwritten", { skip: !databaseUrl }, async () => {
+  const schema = `ci_baseline_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 1, options: `-c search_path=${schema}` });
+  try {
+    await pool.query("CREATE TABLE wallets (wallet_id TEXT PRIMARY KEY, balance BIGINT NOT NULL, reserved BIGINT DEFAULT 0, currency TEXT DEFAULT 'INR', updated_at TIMESTAMPTZ DEFAULT NOW())");
+    await pool.query("INSERT INTO wallets (wallet_id, balance) VALUES ('legacy_wallet', 5000)");
+    await runMigrations(pool);
+    assert.equal((await findReconciliationIssues(pool))[0].type, "missing_opening_balance");
+    await assert.rejects(pool.query("UPDATE wallets SET balance = balance + 1"), /accounting_baseline_required/);
+    await assert.rejects(recordWalletOpeningBalance(pool, "legacy_wallet", 4999, "statement:test"), /wallet_balance_equation_failed/);
+    assert.equal((await pool.query("SELECT opening_balance_minor FROM wallets")).rows[0].opening_balance_minor, null);
+    await recordWalletOpeningBalance(pool, "legacy_wallet", 5000, "statement:test");
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+    const wallet = (await pool.query("SELECT balance, opening_balance_reference FROM wallets")).rows[0];
+    assert.equal(wallet.balance, "5000");
+    assert.equal(wallet.opening_balance_reference, "operator:statement:test");
+    await assert.rejects(recordWalletOpeningBalance(pool, "legacy_wallet", 5000, "second:reference"), /baseline_already_recorded/);
+    await assert.rejects(recordWalletOpeningBalance(pool, "legacy_wallet", NaN, "statement:test"), /invalid_opening_balance_record/);
   } finally {
     await pool.end();
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -185,8 +213,15 @@ test("concurrent authorization retries reserve once and reject mismatched engine
       client.release();
     }
   } finally {
-    await pool.query("DELETE FROM authorizations WHERE tx_id = $1", [input.txId]);
-    await pool.query("DELETE FROM wallets WHERE wallet_id = ANY($1::text[])", [[sender, receiver]]);
+    const cleanup = await pool.connect();
+    try {
+      await cleanup.query("BEGIN");
+      await cleanup.query("DELETE FROM authorizations WHERE tx_id = $1", [input.txId]);
+      await cleanup.query("DELETE FROM wallets WHERE wallet_id = ANY($1::text[])", [[sender, receiver]]);
+      await cleanup.query("COMMIT");
+    } finally {
+      cleanup.release();
+    }
     await pool.end();
     if (previousSecret === undefined) delete process.env.RAIL_SIGNING_SECRET;
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
@@ -343,6 +378,59 @@ test("posted payment history and used authorization financial fields cannot be r
       "UPDATE authorizations SET status = 'issued' WHERE tx_id = $1",
     ]) await assert.rejects(pool.query(sql, [txn.txId]), { code: "23514" });
     assert.deepEqual(await engine.execute(txn), result);
+  });
+});
+
+test("wallet equations prevent unrecorded credits, unmatched reservations and baseline rewrites", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+    for (const sql of [
+      "UPDATE wallets SET balance = balance + 1 WHERE wallet_id = $1",
+      "UPDATE wallets SET balance = balance - 1, reserved = reserved + 1 WHERE wallet_id = $1",
+      "UPDATE wallets SET opening_balance_minor = opening_balance_minor + 1 WHERE wallet_id = $1",
+      "UPDATE wallets SET currency = 'USD' WHERE wallet_id = $1",
+    ]) await assert.rejects(pool.query(sql, [txn.senderWalletId]), { code: "23514" });
+    assert.equal((await makeEngine().execute(txn)).status, "accepted");
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+  });
+});
+
+test("reconciliation sees coherent snapshots while payment execution commits", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const readers = new Pool({ connectionString: databaseUrl, max: 4, options: pool.options.options });
+    try {
+      const results = await Promise.all([makeEngine().execute(txn), ...Array.from({ length: 12 }, () => findReconciliationIssues(readers))]);
+      assert.equal(results[0].status, "accepted");
+      assert.ok(results.slice(1).every(issues => issues.length === 0));
+    } finally {
+      await readers.end();
+    }
+  });
+});
+
+test("reconciliation flags historical wallet drift and truncation without repairing data", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    await makeEngine().execute(txn);
+    await pool.query("ALTER TABLE wallets DISABLE TRIGGER rail_wallet_commit_check");
+    await pool.query("UPDATE wallets SET balance = balance + 1");
+    await pool.query("ALTER TABLE wallets ENABLE TRIGGER rail_wallet_commit_check");
+    const issues = await findReconciliationIssues(pool);
+    assert.equal(issues.filter(issue => issue.type === "wallet_balance_mismatch").length, 2);
+    assert.equal((await findReconciliationIssues(pool, 1)).at(-1).type, "scan_truncated");
+    assert.equal(Number((await pool.query("SELECT balance FROM wallets WHERE wallet_id = $1", [txn.senderWalletId])).rows[0].balance), 7501);
+    await assert.rejects(findReconciliationIssues(pool, 0), /invalid_reconciliation_limit/);
+  });
+});
+
+test("historical cross-currency ledger pairs are reported even when their numeric totals balance", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    await makeEngine().execute(txn);
+    await pool.query("ALTER TABLE ledger_entries DISABLE TRIGGER rail_ledger_immutable");
+    await pool.query("UPDATE ledger_entries SET currency = 'USD' WHERE entry_type = 'credit'");
+    await pool.query("ALTER TABLE ledger_entries ENABLE TRIGGER rail_ledger_immutable");
+    const types = (await findReconciliationIssues(pool)).map(issue => issue.type);
+    for (const type of ["unbalanced_ledger", "wallet_currency_mismatch", "authorization_ledger_mismatch", "incomplete_payment"]) assert.ok(types.includes(type), type);
+    await assert.rejects(recordWalletOpeningBalance(pool, txn.receiverWalletId, 0, "statement:test"), /historical_accounting_review_required/);
   });
 });
 
@@ -520,7 +608,10 @@ test("wallet reservation helpers reject invalid money and cannot over-release fu
 
 test("failed expiry release rolls back instead of marking inconsistent reservations expired", { skip: !databaseUrl }, async () => {
   await authorizationExpiryFixture(async ({ pool, auth }) => {
+    // Simulate legacy corruption only in this disposable schema, using its owner role.
+    await pool.query("ALTER TABLE wallets DISABLE TRIGGER rail_wallet_commit_check");
     await pool.query("UPDATE wallets SET balance = 10000, reserved = 0 WHERE wallet_id = 'expiry_sender'");
+    await pool.query("ALTER TABLE wallets ENABLE TRIGGER rail_wallet_commit_check");
     await assert.rejects(getAuthorizationById(auth.authId, pool), /RESERVATION_WALLET_NOT_FOUND/);
     const stored = (await pool.query("SELECT status, released_at FROM authorizations WHERE auth_id = $1", [auth.authId])).rows[0];
     assert.equal(stored.status, "issued");
