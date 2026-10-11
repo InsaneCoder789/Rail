@@ -3,7 +3,8 @@ import { RequestError, RateLimitError, applyRateLimit, json, readAndParseJson, r
 import type { ServerContext } from "../types.js";
 
 export async function handleAgentRoutes(req: http.IncomingMessage, res: http.ServerResponse, url: URL, context: ServerContext): Promise<boolean> {
-  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/intents") {
+  const execution = req.method === "POST" ? /^\/v2\/agent\/intents\/([^/]+)\/execute$/.exec(url.pathname) : null;
+  if (((req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/intents") || execution) {
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_requests", limit: 30, windowMs: 60_000,
       trustProxyHeaders: context.config.trustProxyHeaders });
     const header = req.headers.authorization;
@@ -17,7 +18,8 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     else {
       if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
       const body = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
-      json(res, 200, { intent: await context.agentStore.createIntent(token, body) });
+      if (execution) json(res, 200, await context.agentStore.executeIntent(token, execution[1], body));
+      else json(res, 200, { intent: await context.agentStore.createIntent(token, body) });
     }
     return true;
   }

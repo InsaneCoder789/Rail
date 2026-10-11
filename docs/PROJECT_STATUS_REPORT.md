@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.1 Atomic Agent Execution: 11 October 2026
+
+Approved agent intents now execute online through `POST /v2/agent/intents/:intentId/execute`. The owner must explicitly issue a `payments:execute` credential; existing proposal credentials remain proposal-only. Execution requires the exact stored request fingerprint and rejects extra payload fields. Financial identities, amount, currency and generated transaction/replay identifiers come from the immutable intent, not agent instructions. The server signs the transaction with its private HMAC secret. Execution fails closed without a protected composable engine or a signing secret of at least 32 characters after trimming.
+
+One PostgreSQL transaction now includes bound authorization, wallet movement, balanced ledger, mandatory AES/HMAC evidence, durable replay, mandate consumption, executed-intent receipt and outbox audit. Held budget moves into `spentBudgetMinor`; deferred constraints match both counters to intent state, require held plus spent within the total, and bind executed intents to accepted protected payments. The `rail_agent:` transaction namespace cannot commit without its corresponding executed intent. Terminal receipts cannot be edited, revived or rejected to restore consumed budget. Sorted wallet locks avoid sweeping unrelated expiry rows inside the agent payment scope; ordinary authorization cleanup remains operationally required.
+
+Execution checks live credential, active agent, live mandate, exact approval, policy and funds before money movement, then rechecks deadlines after financial work. Revocation serializes against execution. Concurrent retries return one committed receipt without duplicating money, budget or evidence; replay also requires live authority. Owners retain historical visibility after revocation. Responses are emitted only after final commit, not after a provisional accepted engine result. Source and agent-global quotas also cover execution. Capability flags are state/runtime hints, not permission or funds guarantees. Existing device-bound offline/reconnect behavior is unchanged; agents execute online internal wallet transfers only, with no bank/UPI adapter.
+
+Verification: 149 local tests pass with zero failures or skips, including live PostgreSQL. Thirteen added cases cover explicit scope, fail-closed signing configuration, exact approval/payload binding, concurrent one-connection replay, evidence/audit rollback, final deferred-commit rejection, deadline expiry during financial work, insufficient funds, ownership/revocation, HTTP quotas and database receipt/budget invariants. Migration rerun with executed history is covered. An intermediate run failed because fixtures inherited a short development signing secret; fixtures now use isolated test credentials and restore the original environment. The local development secret still needs an operator-managed replacement before agent execution is available; it was not silently changed. GitHub Actions runs the full agent file on its existing matrix, but this revision has not run remotely or been deployed. Public and ignored private reports track the change. ML is still synthetic/shadow-only; persisted blockchain anchoring, production key recovery, historical accounting, least-privilege roles and provider acceptance remain open.
+
 ### Transaction Composition and Offline Scope Review: 11 October 2026
 
 Reviewed FlowPay's public description and two focused Kotlin components, not its complete application or a live bank transaction. Its repository describes a no-internet Android interface over existing USSD and voice rails. The [dial builder](https://raw.githubusercontent.com/Flowpayup/Payments-Without-Internet/main/app/src/main/java/com/flowpay/app/payment/Upi123CallStringBuilder.kt) constructs an IVR DTMF call, and the [session manager](https://raw.githubusercontent.com/Flowpayup/Payments-Without-Internet/main/app/src/main/java/com/flowpay/app/payment/PaymentSessionManager.kt) waits for SMS evidence rather than treating call duration as success. [NPCI's 123Pay booklet](https://www.npci.org.in/PDF/npci/upi-123pay/Product-Booklet.pdf) documents the underlying no-internet service. Carrier/bank coverage and FlowPay's live reliability were not verified. No third-party code was copied or integration implied.
@@ -403,7 +413,7 @@ This section describes the current TypeScript source layout and the responsibili
   Creates and configures the PostgreSQL connection pool used by the server.
 
 - `src/persistence/agentAuthority.ts`
-  Stores owner-bound agents, hashed expiring credentials, mandates and fingerprint-bound intents. Serializes approvals, revocation and policy-budget holds, releases expired holds, enforces retained-record bounds and persists audit events atomically. Does not execute agent payments or consume payment budgets.
+  Stores owner-bound agents, hashed scoped credentials, mandates and fingerprint-bound intents. Serializes approvals, revocation and held/consumed budgets. Coordinates approved online execution with authorization, money, evidence, replay and audits in one transaction, returning receipts only after final commit.
 
 - `src/persistence/reconciliation.ts`
   Performs snapshot-consistent accounting checks and validates evidence-referenced, one-time historical opening-balance records.
@@ -490,7 +500,7 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Contains registration and login route handling.
 
 - `src/server/routes/agentRoutes.ts`
-  Handles owner-JWT-only control management and exact intent decisions with a shared owner quota, plus scoped-agent introspection and proposals under source/agent quotas. Responses explicitly disable execution until financial authority integration is complete.
+  Handles owner-JWT-only control management and exact intent decisions with a shared owner quota, plus scoped-agent introspection, proposals and execution under source/agent quotas. Execution accepts only the bound fingerprint and returns the committed intent/payment receipt.
 
 - `src/server/routes/paymentRoutes.ts`
   Contains payment authorization, offline token issuance, payment execution, and sync route handling.

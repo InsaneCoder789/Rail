@@ -340,16 +340,16 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 
 ## API Overview
 
-### Agent control APIs (V2.1 foundation)
+### Owner-Controlled Agent Payments (V2.1)
 
-These endpoints configure identities, policy and exact-request approvals; they do **not** execute agent payments. Owner management requires a user JWT, not a wallet/service API key or agent credential. All owner control reads/writes share a PostgreSQL-backed limit of 20 requests per minute per owner, independent of source IP or agent ID.
+These endpoints configure agent identities, spending policy and exact-request approvals, then execute approved online wallet transfers through the existing protected engine. Owner management requires a user JWT, not a wallet/service API key or agent credential. All owner control reads/writes share a PostgreSQL-backed limit of 20 requests per minute per owner, independent of source IP or agent ID. This is internal wallet accounting, not a live UPI or bank settlement connector.
 
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /v2/agents` | Create an owned agent using `{ "name": "Invoice assistant" }`. |
 | `GET /v2/agents` | List the owner's agents. |
 | `POST /v2/agents/:agentId/revoke` | Permanently revoke the agent through the API and revoke its credentials/mandates. Send `{}`. |
-| `POST /v2/agents/:agentId/credentials` | Issue a random credential with optional `ttlSeconds`; its token is returned once. |
+| `POST /v2/agents/:agentId/credentials` | Issue a random credential with optional `ttlSeconds` and explicit `scope`; its token is returned once. |
 | `GET /v2/agents/:agentId/credentials` | List credential metadata without tokens or hashes. |
 | `POST /v2/agents/:agentId/credentials/:credentialId/revoke` | Revoke one credential. Send `{}`. |
 | `POST /v2/agents/:agentId/mandates` | Create a bounded, recipient-specific policy. |
@@ -358,10 +358,11 @@ These endpoints configure identities, policy and exact-request approvals; they d
 | `GET /v2/agent/identity` | Validate an agent token in `Authorization: Bearer <token>`; limited to 30 requests/minute per request source. |
 | `POST /v2/agent/intents` | Propose a fingerprint-bound request using an agent credential; reserve mandate budget, not wallet funds. |
 | `GET /v2/agent/intents` | List that agent's retained intents and release elapsed holds. |
+| `POST /v2/agent/intents/:intentId/execute` | Execute an approved intent with an execution-scoped credential and its exact fingerprint. |
 | `GET /v2/agents/:agentId/intents` | Owner-only approval queue and retained history. |
 | `POST /v2/agents/:agentId/intents/:intentId/decision` | Owner-only `approve` or `reject` decision bound to `requestFingerprint`. |
 
-Credential scope is currently fixed to `payments:propose`. Default expiry is 24 hours; supplied lifetimes must be 60 seconds to 30 days. Only a SHA-256 hash of the 256-bit random token is persisted. Capture the one-time token response securely, never in browser storage or application logs. If the response is lost, inspect credential metadata, revoke that credential and issue a replacement; issuance itself is not an idempotent payment operation.
+Credential scope defaults to `payments:propose`, which cannot execute payments. The owner must explicitly request `payments:execute` to grant execution authority; existing credentials are not upgraded by migration. Execution credentials can also propose and inspect intents. Issuance and execution fail closed unless the engine supports durable transactional replay and required evidence, and `RAIL_SIGNING_SECRET` contains at least 32 non-padding characters after trimming. Use securely generated material, not a human password. Default expiry is 24 hours; supplied lifetimes must be 60 seconds to 30 days. Only a SHA-256 hash of the 256-bit random token is persisted. Capture the one-time token response securely, never in browser storage or application logs. If the response is lost, inspect credential metadata, revoke that credential and issue a replacement; issuance itself is not an idempotent payment operation.
 
 Example mandate body:
 
@@ -376,7 +377,7 @@ Example mandate body:
 }
 ```
 
-`approval_required` is the other supported mode. Amounts use minor units, the per-payment limit cannot exceed the total budget, and 1-20 distinct receivers must already exist in the owner's currency. Self-payment policies are rejected. Intents start `pending` in approval-required mode and `approved` under a budgeted mandate. Approval cannot override the policy. Both modes return `executionEnabled: false`: financial execution and budget consumption are not enabled yet. Neither creating a policy nor approving an intent reserves wallet funds. There is no unrestricted mode or agent execution endpoint.
+`approval_required` is the other supported mode. Amounts use minor units, the per-payment limit cannot exceed the total budget, and 1-20 distinct receivers must already exist in the owner's currency. Self-payment policies are rejected. Intents start `pending` in approval-required mode and `approved` under a budgeted mandate. Approval cannot override the policy. Neither creating a policy nor approving an intent reserves wallet funds. There is no unrestricted mode. `executionEnabled` describes runtime/state capability, not proof of credentials, funds or permission; execution rechecks them transactionally.
 
 Example proposal to `POST /v2/agent/intents`:
 
@@ -391,13 +392,32 @@ Example proposal to `POST /v2/agent/intents`:
 }
 ```
 
-The response contains `{ "intent": { ... } }`, including the immutable `requestFingerprint`, `status`, deadline and `executionEnabled: false`. The owner posts `{ "decision": "approve", "requestFingerprint": "<returned fingerprint>" }` to the decision endpoint. Use `reject` to release the hold, including a previously approved hold. Rejected/expired intents cannot be revived; inspect the returned status rather than assuming a repeated decision succeeded.
+The response contains `{ "intent": { ... } }`, including the immutable `requestFingerprint`, `status`, deadline and capability flag. The owner posts `{ "decision": "approve", "requestFingerprint": "<returned fingerprint>" }` to the decision endpoint. Use `reject` to release an unexecuted hold, including a previously approved hold. Rejected/expired intents cannot be revived. Executed intents retain their receipt and consumed budget; a later rejection cannot refund money or restore budget. Inspect the returned status rather than assuming a repeated decision succeeded.
 
 `clientRequestId` is 8-128 characters and unique within an agent. Identical retries return the existing intent without another hold or a renewed deadline; a changed mandate, receiver, amount, currency or TTL returns `409`. TTL defaults to 300 seconds, accepts 60-900 seconds and is clipped to the mandate deadline. The approval fingerprint binds the exact owner, agent, mandate, recipient, amount, currency and timestamps.
 
-Pending and approved intents hold `reservedBudgetMinor`; PostgreSQL commit constraints require it to equal the sum of live intent amounts and stay within `totalBudgetMinor`. This is policy headroom, not proof of available wallet money. Intent/mandate reads, proposals and decisions lazily release expired holds in a successful audited transaction; there is no expiry worker. A failed operation rolls that cleanup back. Revoking an agent or mandate releases its holds; revoking one credential prevents subsequent token use but does not cancel every intent belonging to the agent.
+Pending and approved intents hold `reservedBudgetMinor`; executed intents consume `spentBudgetMinor`. PostgreSQL commit constraints require each counter to equal its corresponding intent sum, with held plus spent not exceeding `totalBudgetMinor`. This is policy headroom, not proof of available wallet money. Intent/mandate reads and intent mutations lazily release expired holds in a successful audited transaction; there is no intent expiry worker. A failed operation rolls that cleanup back. Revoking an agent or mandate releases unexecuted holds, not spent budget; revoking one credential prevents subsequent token use but does not cancel every intent belonging to the agent.
 
-The engine now supports trusted server-side composition through `executeInTransaction`, alongside `createAuthorizationInTransaction` and PostgreSQL `dedupeInTransaction`. These methods use an existing client and refuse autocommit execution before writes. They let a future agent executor commit authority, budget and payment state together without nested pool checkouts. They are not authentication APIs and do not enable agent execution. Results are provisional until the caller's outer `COMMIT`, including deferred database checks. The caller must own deadlines, rollback, connection disposal and authority checks before both new execution and cached replay; do not expose a provisional result to the frontend.
+Send only `{ "requestFingerprint": "<returned fingerprint>" }` to the agent execution endpoint with an execution-scoped bearer token. Extra money or recipient fields are rejected. The server constructs the transaction from the immutable intent, creates a bound authorization and signs it with the server-only HMAC secret. It uses `executeInTransaction`, `createAuthorizationInTransaction` and PostgreSQL `dedupeInTransaction` on one client. Authorization, wallet/ledger changes, evidence, replay, budget consumption, executed-intent linkage and audit events commit together. Failed work rolls back; the HTTP receipt is returned only after final `COMMIT`, including deferred checks.
+
+Successful responses contain `{ "intent": { ... }, "result": { ... } }`; the executed intent includes `paymentTxId` and `executedAt`. Concurrent retries return the original committed result without another transfer or evidence record. Live execution credentials, agent and mandate authority are required even for replay; after revocation, owners can still inspect retained history. `rail_agent:` transaction IDs and `rail_agent_intent:` replay keys are reserved for this server-generated path. Agent execution is online-only; existing device-bound offline/reconnect processing is unchanged.
+
+```mermaid
+flowchart TD
+  Owner[Owner JWT] --> Mandate[Recipient and budget policy]
+  Mandate --> Proposal[Agent proposes immutable intent]
+  Proposal --> Mode{Mandate mode}
+  Mode -->|Approval required| Decision[Owner approves exact fingerprint]
+  Mode -->|Budgeted| Approved[Approved intent with policy hold]
+  Decision --> Approved
+  Approved --> Guard[Execution credential and live authority checks]
+  Guard --> Atomic[One database transaction: payment, evidence, replay, budget and audit]
+  Atomic --> Commit{Final commit}
+  Commit -->|Success| Receipt[Committed receipt or identical replay]
+  Commit -->|Failure| Rollback[Rollback all changes; no success receipt]
+```
+
+The coordinator locks both wallets in sorted order and does not sweep unrelated expired wallet authorizations inside that lock scope. Existing authorization reads/sweeps release those reservations separately; policy headroom does not guarantee immediately available wallet funds. This implementation has local regression coverage, not hosted or real-money acceptance.
 
 Agent intent reads/writes share a PostgreSQL-backed 20/minute agent bucket across credentials and IP addresses, plus a 30/minute source bucket. Limits are 50 retained agents per owner, 100 credentials/mandates and 1,000 intents per agent, including revoked, rejected or expired rows. No automatic deletion resets these bounds. Intent bindings/history cannot be edited or deleted through normal SQL updates. Mutations and audit events commit together; failed audit writes roll changes back. Apply migrations before updating hosted API instances. Pending intent fields are relational data, not encrypted payment evidence; the AES/HMAC evidence path below applies to committed payments.
 

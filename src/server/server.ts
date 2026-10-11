@@ -96,7 +96,7 @@ export async function createServerContext(options: {
     idempotency,
     engine,
     evidenceStore,
-    agentStore: new AgentAuthorityStore(pool),
+    agentStore: new AgentAuthorityStore(pool, engine),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,

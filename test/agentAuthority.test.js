@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import dotenv from "dotenv";
 import { Pool } from "pg";
@@ -11,27 +11,38 @@ import { generateToken } from "../dist/auth/jwt.js";
 import { handleAgentRoutes } from "../dist/server/routes/agentRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { PostgresRateLimiter } from "../dist/persistence/postgresRateLimiter.js";
+import { PaymentPipelineEngine } from "../dist/pipeline/engine.js";
+import { PostgresIdempotencyStore } from "../dist/persistence/postgresIdempotency.js";
+import { MemoryDeadLetterQueue } from "../dist/pipeline/dlq.js";
+import { noopTracer } from "../dist/pipeline/tracing.js";
+import { buildHardenedPaymentPipeline } from "../dist/stages/paymentPipeline.js";
+import { TransactionKeyRing } from "../dist/crypto/transactionProtection.js";
+import { TransactionEvidenceStore } from "../dist/persistence/transactionEvidence.js";
+import { findReconciliationIssues } from "../dist/persistence/reconciliation.js";
 
 dotenv.config();
 const databaseUrl = process.env.DATABASE_URL;
 const policy = { mode: "budgeted", currency: "INR", perPaymentLimitMinor: 100, totalBudgetMinor: 1000,
   allowedReceiverWalletIds: ["agent_receiver"], ttlSeconds: 3600 };
 
-async function fixture(work) {
+async function fixture(work, max = 2, ownerBalance = 10000) {
   const schema = `ci_agents_${randomUUID().replaceAll("-", "")}`;
   const admin = new Pool({ connectionString: databaseUrl, max: 1 });
   await admin.query(`CREATE SCHEMA ${schema}`);
-  const pool = new Pool({ connectionString: databaseUrl, max: 2, options: `-c search_path=${schema}` });
+  const pool = new Pool({ connectionString: databaseUrl, max, options: `-c search_path=${schema}` });
   const secret = process.env.JWT_SECRET;
+  const signingSecret = process.env.RAIL_SIGNING_SECRET;
   process.env.JWT_SECRET = secret || "agent_test_jwt_secret_01234567890123456789";
+  process.env.RAIL_SIGNING_SECRET = "agent_signing_secret_01234567890123456789";
   try {
     await runMigrations(pool);
     await ensureOutboxSchema(pool);
-    await pool.query("INSERT INTO wallets(wallet_id, balance) VALUES ('agent_owner', 10000), ('other_owner', 10000), ('agent_receiver', 0)");
+    await pool.query("INSERT INTO wallets(wallet_id, balance) VALUES ('agent_owner', $1), ('other_owner', 10000), ('agent_receiver', 0)", [ownerBalance]);
     await pool.query("INSERT INTO users(user_id, password_hash, wallet_id) VALUES ('agent_user', 'unused_fixture_hash', 'agent_owner')");
     await work({ pool, store: new AgentAuthorityStore(pool), owner: "agent_owner", other: "other_owner", token: generateToken("agent_user") });
   } finally {
     if (secret === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = secret;
+    if (signingSecret === undefined) delete process.env.RAIL_SIGNING_SECRET; else process.env.RAIL_SIGNING_SECRET = signingSecret;
     await pool.end();
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
     await admin.end();
@@ -76,7 +87,8 @@ test("agent credentials are hashed, narrowly scoped, returned once and excluded 
     assert.equal(metadata[0].credentialId, credential.credentialId);
     assert.ok(!JSON.stringify(metadata).includes(credential.token));
     assert.ok(!JSON.stringify((await pool.query("SELECT payload FROM outbox")).rows).includes(credential.token));
-    await assert.rejects(store.issueCredential(owner, agent.agentId, { scope: "payments:execute" }), { status: 422 });
+    await assert.rejects(store.issueCredential(owner, agent.agentId, { scope: "payments:admin" }), { status: 422 });
+    await assert.rejects(store.issueCredential(owner, agent.agentId, { scope: "payments:execute" }), { status: 503 });
     const resolver = createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] });
     await assert.rejects(resolver.resolveAuthenticatedWallet({ headers: { authorization: `Bearer ${credential.token}` } }), { status: 401 });
     await assert.rejects(resolver.resolveOwnerWallet({ headers: { "x-rail-api-key": credential.token } }), { status: 401 });
@@ -239,7 +251,7 @@ test("database constraints reject cross-owner mandates and overlong credential l
       VALUES ($1, $2, $3, 'payments:propose', now(), now() + interval '31 days')`,
       [randomUUID(), agent.agentId, "a".repeat(64)]), { code: "23514" });
     await assert.rejects(pool.query(`INSERT INTO rail_agent_credentials(credential_id, agent_id, token_hash, scope, created_at, expires_at)
-      VALUES ($1, $2, $3, 'payments:execute', now(), now() + interval '1 day')`,
+      VALUES ($1, $2, $3, 'payments:admin', now(), now() + interval '1 day')`,
       [randomUUID(), agent.agentId, "b".repeat(64)]), { code: "23514" });
     assert.equal((await pool.query("SELECT * FROM rail_agent_mandates")).rowCount, 0);
     assert.equal((await pool.query("SELECT * FROM rail_agent_credentials")).rowCount, 0);
@@ -479,5 +491,266 @@ test("agent intent quotas remain shared when request source addresses change", {
     }
     assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 1);
     assert.equal((await pool.query("SELECT reserved_budget_minor FROM rail_agent_mandates")).rows[0].reserved_budget_minor, "100");
+  });
+});
+
+function executionStore(pool, afterPayment, failEvidence = false) {
+  const key = { keyId: "agent_execution_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+  const evidence = new TransactionEvidenceStore(new TransactionKeyRing(key.keyId, [key]));
+  const pipeline = buildHardenedPaymentPipeline(noopTracer);
+  const engine = new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
+    dlq: new MemoryDeadLetterQueue(), pipeline: async ctx => { await pipeline(ctx); await afterPayment?.(ctx); },
+    evidence: failEvidence ? { async persist(client, txn) { await evidence.persist(client, txn); throw new Error("injected_agent_evidence_failure"); } } : evidence });
+  return new AgentAuthorityStore(pool, engine);
+}
+
+async function executionSetup(pool, owner, mode = "approval_required", budget = 1000, store = executionStore(pool)) {
+  const setup = await intentSetup(store, owner, mode, budget);
+  const executionCredential = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+  const intent = await store.createIntent(setup.credential.token, setup.input);
+  const request = { requestFingerprint: intent.requestFingerprint };
+  return { ...setup, store, executionCredential, intent, request };
+}
+
+test("agent execution fails closed with a missing or short signing secret", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const store = executionStore(pool);
+    const agent = await store.createAgent(owner, { name: "Secret guard agent" });
+    const secret = process.env.RAIL_SIGNING_SECRET;
+    try {
+      for (const value of [undefined, "short", " ".repeat(40)]) {
+        if (value === undefined) delete process.env.RAIL_SIGNING_SECRET;
+        else process.env.RAIL_SIGNING_SECRET = value;
+        await assert.rejects(store.issueCredential(owner, agent.agentId, { scope: "payments:execute" }),
+          { status: 503, code: "agent_execution_unavailable" });
+        assert.equal((await store.listAgents(owner))[0].executionEnabled, false);
+      }
+    } finally {
+      process.env.RAIL_SIGNING_SECRET = secret;
+    }
+    assert.equal((await pool.query("SELECT count(*) FROM rail_agent_credentials")).rows[0].count, "0");
+  });
+});
+
+test("agent execution requires an explicit spend scope and exact owner approval", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, credential, executionCredential, intent, request } = await executionSetup(pool, owner);
+    assert.equal(executionCredential.executionEnabled, true);
+    assert.equal(credential.executionEnabled, false);
+    await assert.rejects(store.executeIntent(credential.token, intent.intentId, request), { status: 403 });
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { code: "intent_not_approved" });
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, { ...request, amountMinor: 1 }), { status: 422 });
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, { requestFingerprint: "f".repeat(64) }), { code: "intent_fingerprint_mismatch" });
+    await store.decideIntent(owner, agent.agentId, intent.intentId, { ...request, decision: "approve" });
+    const signaturePolicy = process.env.RAIL_REQUIRE_TX_SIGNATURE;
+    try {
+      process.env.RAIL_REQUIRE_TX_SIGNATURE = "true";
+      assert.equal((await store.executeIntent(executionCredential.token, intent.intentId, request)).result.status, "accepted");
+    } finally {
+      if (signaturePolicy === undefined) delete process.env.RAIL_REQUIRE_TX_SIGNATURE; else process.env.RAIL_REQUIRE_TX_SIGNATURE = signaturePolicy;
+    }
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+  });
+});
+
+test("agent execution and concurrent replay consume money and total budget exactly once", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, executionCredential, intent, request, credential, input } = await executionSetup(pool, owner, "budgeted", 100);
+    const results = await Promise.all(Array.from({ length: 8 }, () => store.executeIntent(executionCredential.token, intent.intentId, request)));
+    assert.ok(results.every(result => JSON.stringify(result) === JSON.stringify(results[0])));
+    assert.equal(results[0].intent.status, "executed");
+    assert.equal(results[0].intent.paymentTxId, `rail_agent:${intent.intentId}`);
+    const mandate = (await store.listMandates(owner, agent.agentId))[0];
+    assert.equal(mandate.reservedBudgetMinor, 0);
+    assert.equal(mandate.spentBudgetMinor, 100);
+    for (const table of ["authorizations", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 1, table);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+    assert.deepEqual((await pool.query("SELECT wallet_id, balance, reserved FROM wallets WHERE wallet_id <> 'other_owner' ORDER BY wallet_id")).rows,
+      [{ wallet_id: "agent_owner", balance: "9900", reserved: "0" }, { wallet_id: "agent_receiver", balance: "100", reserved: "0" }]);
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE type = 'agent.intent_executed'")).rowCount, 1);
+    await assert.rejects(store.createIntent(credential.token, { ...input, clientRequestId: "after_budget_consumed" }), { code: "mandate_budget_exceeded" });
+    assert.equal((await store.decideIntent(owner, agent.agentId, intent.intentId, { ...request, decision: "reject" })).status, "executed");
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+  }, 1);
+});
+
+test("agent evidence failure rolls back authority, ledger and consumed budget", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const failing = executionStore(pool, undefined, true);
+    const { agent, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted", 1000, failing);
+    await assert.rejects(failing.executeIntent(executionCredential.token, intent.intentId, request), /injected_agent_evidence_failure/);
+    const mandate = (await failing.listMandates(owner, agent.agentId))[0];
+    assert.equal(mandate.reservedBudgetMinor, 100);
+    assert.equal(mandate.spentBudgetMinor, 0);
+    assert.equal((await failing.listIntents(owner, agent.agentId))[0].status, "approved");
+    for (const table of ["authorizations", "ledger_entries", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    assert.equal((await executionStore(pool).executeIntent(executionCredential.token, intent.intentId, request)).result.status, "accepted");
+  });
+});
+
+test("agent execution audit failure rolls back the whole payment and permits retry", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
+    await pool.query(`CREATE FUNCTION reject_agent_execution_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.type = 'agent.intent_executed' THEN RAISE EXCEPTION 'injected_agent_audit_failure'; END IF; RETURN NEW; END $$`);
+    await pool.query("CREATE TRIGGER reject_agent_execution_audit BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION reject_agent_execution_audit()");
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), /injected_agent_audit_failure/);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 0);
+    for (const table of ["authorizations", "ledger_entries", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    await pool.query("DROP TRIGGER reject_agent_execution_audit ON outbox");
+    assert.equal((await store.executeIntent(executionCredential.token, intent.intentId, request)).intent.status, "executed");
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+  });
+});
+
+test("agent execution isolates agents and rejects revoked credentials even for completed replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner, other }) => {
+    const first = await executionSetup(pool, owner, "budgeted");
+    const second = await executionSetup(pool, other, "budgeted");
+    await assert.rejects(second.store.executeIntent(second.executionCredential.token, first.intent.intentId, first.request), { status: 404 });
+    await first.store.executeIntent(first.executionCredential.token, first.intent.intentId, first.request);
+    await first.store.revokeCredential(owner, first.agent.agentId, first.executionCredential.credentialId);
+    await assert.rejects(first.store.executeIntent(first.executionCredential.token, first.intent.intentId, first.request), { status: 401 });
+    assert.equal((await first.store.listIntents(owner, first.agent.agentId))[0].status, "executed");
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+  });
+});
+
+test("agent execution rechecks credential and mandate deadlines after financial work", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    for (const target of ["credential", "mandate"]) {
+      let setup;
+      const store = executionStore(pool, async ctx => {
+        if (target === "credential") await ctx.dbClient.query("UPDATE rail_agent_credentials SET expires_at = clock_timestamp() - interval '1 millisecond' WHERE credential_id = $1", [setup.executionCredential.credentialId]);
+        else await ctx.dbClient.query("UPDATE rail_agent_mandates SET expires_at = clock_timestamp() - interval '1 millisecond' WHERE mandate_id = $1", [setup.mandate.mandateId]);
+      });
+      setup = await executionSetup(pool, owner, "budgeted", 1000, store);
+      await assert.rejects(store.executeIntent(setup.executionCredential.token, setup.intent.intentId, setup.request), { status: target === "credential" ? 401 : 409 });
+      assert.equal((await store.listMandates(owner, setup.agent.agentId))[0].spentBudgetMinor, 0);
+      assert.equal((await store.listIntents(owner, setup.agent.agentId))[0].status, "approved");
+    }
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+  });
+});
+
+test("agent policy headroom cannot substitute for available wallet funds", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { code: "insufficient_funds" });
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 100);
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+  }, 2, 0);
+});
+
+test("database prevents unbacked agent execution and rewriting consumed budget or receipts", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, mandate, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
+    await assert.rejects(pool.query("UPDATE rail_agent_mandates SET spent_budget_minor = 1 WHERE mandate_id = $1", [mandate.mandateId]), /agent_budget_reservation_mismatch/);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE rail_agent_mandates SET reserved_budget_minor = 0, spent_budget_minor = 100 WHERE mandate_id = $1", [mandate.mandateId]);
+      await client.query("UPDATE rail_agent_intents SET status = 'executed', payment_tx_id = $2, executed_at = clock_timestamp() WHERE intent_id = $1", [intent.intentId, `rail_agent:${intent.intentId}`]);
+      await assert.rejects(client.query("COMMIT"));
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    await store.executeIntent(executionCredential.token, intent.intentId, request);
+    await assert.rejects(pool.query("UPDATE rail_agent_intents SET status = 'approved', payment_tx_id = NULL, executed_at = NULL WHERE intent_id = $1", [intent.intentId]), /agent_intent_history_is_immutable/);
+    await assert.rejects(pool.query("UPDATE rail_agent_mandates SET spent_budget_minor = 0 WHERE mandate_id = $1", [mandate.mandateId]), /agent_budget_reservation_mismatch/);
+    await runMigrations(pool);
+    assert.equal((await store.executeIntent(executionCredential.token, intent.intentId, request)).intent.status, "executed");
+  });
+});
+
+test("agent execution HTTP endpoint returns only committed receipts under agent quotas", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner, token }) => {
+    const { store, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
+    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool) };
+    const call = async bearer => {
+      const req = Readable.from([JSON.stringify(request)]);
+      req.method = "POST";
+      req.headers = { authorization: `Bearer ${bearer}`, "content-type": "application/json" };
+      req.socket = { remoteAddress: "192.0.2.40" };
+      const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
+      assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost/v2/agent/intents/${intent.intentId}/execute`), context), true);
+      return res;
+    };
+    await assert.rejects(call(token), { status: 401 });
+    const response = await call(executionCredential.token);
+    assert.equal(response.status, 200);
+    assert.equal(response.body.intent.status, "executed");
+    assert.equal((await pool.query("SELECT * FROM rail_transaction_evidence")).rowCount, 1);
+    assert.deepEqual((await call(executionCredential.token)).body, response.body);
+    for (let i = 2; i < 20; i++) assert.equal((await call(executionCredential.token)).status, 200);
+    await assert.rejects(call(executionCredential.token), { status: 429 });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+  });
+});
+
+test("concurrent agent revocation and execution produce either one committed payment or none", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
+    const [execution, revocation] = await Promise.allSettled([
+      store.executeIntent(executionCredential.token, intent.intentId, request), store.revokeAgent(owner, agent.agentId)
+    ]);
+    assert.equal(revocation.status, "fulfilled");
+    if (execution.status === "rejected") assert.equal(execution.reason.status, 401);
+    const committed = execution.status === "fulfilled";
+    const mandate = (await store.listMandates(owner, agent.agentId))[0];
+    assert.equal(mandate.spentBudgetMinor, committed ? 100 : 0);
+    assert.equal(mandate.reservedBudgetMinor, 0);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, committed ? 2 : 0);
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { status: 401 });
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+  });
+});
+
+test("agent intent expiry during financial work rolls back money before releasing its hold", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    let financialWorkRan = false;
+    const store = executionStore(pool, async ctx => {
+      financialWorkRan = ctx.result.status === "accepted";
+      await ctx.dbClient.query("SELECT pg_sleep(1.1)");
+    });
+    const setup = await executionSetup(pool, owner, "budgeted", 1000, store);
+    const id = randomUUID(), createdAt = new Date().toISOString(), expiresAt = new Date(Date.now() + 1000).toISOString();
+    const fingerprint = createHash("sha256").update(JSON.stringify(["rail:agent-intent:v1", id, setup.agent.agentId,
+      setup.mandate.mandateId, owner, "agent_receiver", 100, "INR", createdAt, expiresAt])).digest("hex");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // A short-lived fixture avoids changing immutable intent timestamps or waiting a minute.
+      await client.query(`INSERT INTO rail_agent_intents(intent_id, agent_id, mandate_id, owner_wallet_id, client_request_id,
+        proposal_fingerprint, request_fingerprint, receiver_wallet_id, amount_minor, currency, status, created_at, expires_at)
+        VALUES ($1,$2,$3,$4,'short_deadline_fixture',$5,$5,'agent_receiver',100,'INR','approved',$6,$7)`,
+        [id, setup.agent.agentId, setup.mandate.mandateId, owner, fingerprint, createdAt, expiresAt]);
+      await client.query("UPDATE rail_agent_mandates SET reserved_budget_minor = reserved_budget_minor + 100 WHERE mandate_id = $1", [setup.mandate.mandateId]);
+      await client.query("COMMIT");
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    await assert.rejects(store.executeIntent(setup.executionCredential.token, id, { requestFingerprint: fingerprint }), { code: "intent_expired" });
+    assert.equal(financialWorkRan, true);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 0);
+    assert.equal((await store.listIntents(owner, setup.agent.agentId)).find(intent => intent.intentId === id).status, "expired");
+    assert.equal((await store.listMandates(owner, setup.agent.agentId))[0].spentBudgetMinor, 0);
+  });
+});
+
+test("agent final commit failures never return an accepted receipt or consume budget", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
+    await pool.query(`CREATE FUNCTION reject_agent_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.type = 'agent.intent_executed' THEN RAISE EXCEPTION 'injected_agent_commit_failure'; END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE CONSTRAINT TRIGGER reject_agent_commit AFTER INSERT ON outbox
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_agent_commit()`);
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), /injected_agent_commit_failure/);
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "approved");
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 0);
+    for (const table of ["authorizations", "ledger_entries", "rail_payment_executions", "rail_transaction_evidence", "rail_idempotency"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
   });
 });

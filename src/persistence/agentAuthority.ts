@@ -2,6 +2,10 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { isCurrency, isRecord, isSafeText, isValidAmountMinor } from "../server/validation.js";
 import { RequestError } from "../server/http.js";
+import type { PaymentPipelineEngine } from "../pipeline/engine.js";
+import type { PaymentTransaction } from "../domain/types.js";
+import { createAuthorizationInTransaction } from "../stages/authorizationStage.js";
+import { signTransactionHmac } from "../crypto/transactionSigning.js";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -36,30 +40,38 @@ export function parseMandateInput(value: unknown): MandateInput {
 }
 
 function date(value: unknown): string { return (value instanceof Date ? value : new Date(String(value))).toISOString(); }
-function mapAgent(row: Record<string, unknown>) {
+function mapAgent(row: Record<string, unknown>, enabled = false) {
   return { agentId: String(row.agent_id), name: String(row.name), status: String(row.status),
-    createdAt: date(row.created_at), revokedAt: row.revoked_at ? date(row.revoked_at) : null, executionEnabled: false };
+    createdAt: date(row.created_at), revokedAt: row.revoked_at ? date(row.revoked_at) : null, executionEnabled: enabled && row.status === "active" };
 }
-function mapMandate(row: Record<string, unknown>) {
+function mapMandate(row: Record<string, unknown>, enabled = false) {
   return { mandateId: String(row.mandate_id), agentId: String(row.agent_id), mode: String(row.mode), currency: String(row.currency),
     status: row.revoked_at ? "revoked" : row.expired === true ? "expired" : "active",
     perPaymentLimitMinor: Number(row.per_payment_limit_minor), totalBudgetMinor: Number(row.total_budget_minor),
     reservedBudgetMinor: Number(row.reserved_budget_minor),
+    spentBudgetMinor: Number(row.spent_budget_minor),
     allowedReceiverWalletIds: row.allowed_receiver_wallet_ids as string[], createdAt: date(row.created_at),
-    expiresAt: date(row.expires_at), revokedAt: row.revoked_at ? date(row.revoked_at) : null, executionEnabled: false };
+    expiresAt: date(row.expires_at), revokedAt: row.revoked_at ? date(row.revoked_at) : null,
+    executionEnabled: enabled && !row.revoked_at && row.expired !== true };
 }
 
-function mapIntent(row: Record<string, unknown>) {
+function mapIntent(row: Record<string, unknown>, enabled = false) {
   return { intentId: String(row.intent_id), agentId: String(row.agent_id), mandateId: String(row.mandate_id),
     clientRequestId: String(row.client_request_id), requestFingerprint: String(row.request_fingerprint),
     senderWalletId: String(row.owner_wallet_id), receiverWalletId: String(row.receiver_wallet_id), amountMinor: Number(row.amount_minor),
     currency: String(row.currency), status: String(row.status), reason: row.terminal_reason ? String(row.terminal_reason) : null,
-    createdAt: date(row.created_at), expiresAt: date(row.expires_at), executionEnabled: false };
+    createdAt: date(row.created_at), expiresAt: date(row.expires_at),
+    paymentTxId: row.payment_tx_id ? String(row.payment_tx_id) : null, executedAt: row.executed_at ? date(row.executed_at) : null,
+    executionEnabled: enabled && row.status === "approved" };
 }
 
-/** Control-plane only: credentials never resolve to an owner JWT or wallet API key. */
+/** Agent credentials never resolve to owner JWTs or wallet API keys. */
 export class AgentAuthorityStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, private readonly engine?: PaymentPipelineEngine) {}
+
+  private get executionEnabled(): boolean {
+    return this.engine?.supportsProtectedTransactions === true && (process.env.RAIL_SIGNING_SECRET ?? "").trim().length >= 32;
+  }
 
   private async transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
@@ -103,7 +115,7 @@ export class AgentAuthorityStore {
       const count = await client.query("SELECT count(*) FROM rail_agents WHERE owner_wallet_id = $1", [owner]);
       if (Number(count.rows[0].count) >= 50) throw new RequestError(409, "agent_capacity", "owner agent capacity reached");
       const result = await client.query("INSERT INTO rail_agents(agent_id, owner_wallet_id, name) VALUES ($1, $2, $3) RETURNING *", [randomUUID(), owner, name]);
-      const agent = mapAgent(result.rows[0]);
+      const agent = mapAgent(result.rows[0], this.executionEnabled);
       await this.audit(client, "agent.created", owner, { agentId: agent.agentId });
       return agent;
     });
@@ -111,13 +123,15 @@ export class AgentAuthorityStore {
 
   async listAgents(owner: string) {
     const result = await this.pool.query("SELECT * FROM rail_agents WHERE owner_wallet_id = $1 ORDER BY created_at, agent_id LIMIT 50", [owner]);
-    return result.rows.map(mapAgent);
+    return result.rows.map(row => mapAgent(row, this.executionEnabled));
   }
 
   async issueCredential(owner: string, agentId: string, input: unknown) {
     if (!isRecord(input)) invalid();
     const seconds = ttl(input.ttlSeconds);
-    if (input.scope !== undefined && input.scope !== "payments:propose") invalid();
+    const scope = input.scope ?? "payments:propose";
+    if (scope !== "payments:propose" && scope !== "payments:execute") invalid();
+    if (scope === "payments:execute" && !this.executionEnabled) throw new RequestError(503, "agent_execution_unavailable", "protected agent execution is unavailable");
     return this.transaction(async client => {
       await this.ownedAgent(client, owner, agentId);
       const count = await client.query("SELECT count(*) FROM rail_agent_credentials WHERE agent_id = $1", [agentId]);
@@ -126,10 +140,10 @@ export class AgentAuthorityStore {
       const credentialId = randomUUID();
       const result = await client.query(`WITH timestamp AS (SELECT clock_timestamp() AS now)
         INSERT INTO rail_agent_credentials(credential_id, agent_id, token_hash, scope, created_at, expires_at)
-        SELECT $1, $2, $3, 'payments:propose', now, now + $4 * interval '1 second' FROM timestamp RETURNING expires_at`,
-        [credentialId, agentId, createHash("sha256").update(token).digest("hex"), seconds]);
-      await this.audit(client, "agent.credential_issued", owner, { agentId, credentialId });
-      return { credentialId, agentId, scope: "payments:propose", expiresAt: date(result.rows[0].expires_at), token, executionEnabled: false };
+        SELECT $1, $2, $3, $5, now, now + $4 * interval '1 second' FROM timestamp RETURNING expires_at`,
+        [credentialId, agentId, createHash("sha256").update(token).digest("hex"), seconds, scope]);
+      await this.audit(client, "agent.credential_issued", owner, { agentId, credentialId, scope });
+      return { credentialId, agentId, scope, expiresAt: date(result.rows[0].expires_at), token, executionEnabled: scope === "payments:execute" && this.executionEnabled };
     });
   }
 
@@ -142,7 +156,7 @@ export class AgentAuthorityStore {
     if (!result.rows[0]) throw new RequestError(401, "invalid_agent_credentials", "invalid agent credentials");
     const row = result.rows[0];
     return { credentialId: String(row.credential_id), agentId: String(row.agent_id), scope: String(row.scope),
-      expiresAt: date(row.expires_at), executionEnabled: false };
+      expiresAt: date(row.expires_at), executionEnabled: row.scope === "payments:execute" && this.executionEnabled };
   }
 
   async listCredentials(owner: string, agentId: string) {
@@ -173,7 +187,7 @@ export class AgentAuthorityStore {
       await client.query("UPDATE rail_agent_credentials SET revoked_at = COALESCE(revoked_at, clock_timestamp()) WHERE agent_id = $1", [agentId]);
       await client.query("UPDATE rail_agent_mandates SET revoked_at = COALESCE(revoked_at, clock_timestamp()) WHERE agent_id = $1", [agentId]);
       await this.audit(client, "agent.revoked", owner, { agentId });
-      return mapAgent(result.rows[0]);
+      return mapAgent(result.rows[0], this.executionEnabled);
     });
   }
 
@@ -191,7 +205,7 @@ export class AgentAuthorityStore {
           total_budget_minor, allowed_receiver_wallet_ids, created_at, expires_at)
         SELECT $1, $2, $3, $4, $5, $6, $7, $8, now, now + $9 * interval '1 second' FROM timestamp RETURNING *`,
         [randomUUID(), agentId, owner, input.mode, input.currency, input.perPaymentLimitMinor, input.totalBudgetMinor, input.allowedReceiverWalletIds, input.ttlSeconds]);
-      const mandate = mapMandate(result.rows[0]);
+      const mandate = mapMandate(result.rows[0], this.executionEnabled);
       await this.audit(client, "agent.mandate_created", owner, { agentId, mandateId: mandate.mandateId });
       return mandate;
     });
@@ -202,7 +216,7 @@ export class AgentAuthorityStore {
       await this.ownedAgent(client, owner, agentId, false);
       await this.releaseIntents(client, agentId, "expired", "deadline_expired");
       const result = await client.query("SELECT *, expires_at <= clock_timestamp() AS expired FROM rail_agent_mandates WHERE agent_id = $1 ORDER BY created_at, mandate_id LIMIT 100", [agentId]);
-      return result.rows.map(mapMandate);
+      return result.rows.map(row => mapMandate(row, this.executionEnabled));
     });
   }
 
@@ -214,11 +228,11 @@ export class AgentAuthorityStore {
       const result = await client.query("UPDATE rail_agent_mandates SET revoked_at = COALESCE(revoked_at, clock_timestamp()) WHERE mandate_id = $1 AND agent_id = $2 RETURNING *", [mandateId, agentId]);
       if (!result.rowCount) throw new RequestError(404, "mandate_not_found", "mandate not found");
       await this.audit(client, "agent.mandate_revoked", owner, { agentId, mandateId });
-      return mapMandate(result.rows[0]);
+      return mapMandate(result.rows[0], this.executionEnabled);
     });
   }
 
-  private async credentialForMutation(client: PoolClient, token: unknown) {
+  private async credentialForMutation(client: PoolClient, token: unknown, requireExecution = false) {
     if (typeof token !== "string" || !/^rail_agent_[A-Za-z0-9_-]{43}$/.test(token)) throw new RequestError(401, "invalid_agent_credentials", "invalid agent credentials");
     const hash = createHash("sha256").update(token).digest("hex");
     const lookup = await client.query(`SELECT agent.agent_id, agent.owner_wallet_id FROM rail_agent_credentials credential
@@ -226,9 +240,10 @@ export class AgentAuthorityStore {
     if (!lookup.rows[0]) throw new RequestError(401, "invalid_agent_credentials", "invalid agent credentials");
     // Same agent-first lock order as owner revocation and credential issuance.
     const agent = await this.ownedAgent(client, lookup.rows[0].owner_wallet_id, lookup.rows[0].agent_id, false);
-    const credential = await client.query(`SELECT credential_id FROM rail_agent_credentials WHERE token_hash = $1
-      AND agent_id = $2 AND scope = 'payments:propose' AND revoked_at IS NULL AND expires_at > clock_timestamp() FOR UPDATE`, [hash, agent.agent_id]);
+    const credential = await client.query(`SELECT credential_id, scope FROM rail_agent_credentials WHERE token_hash = $1
+      AND agent_id = $2 AND revoked_at IS NULL AND expires_at > clock_timestamp() FOR UPDATE`, [hash, agent.agent_id]);
     if (agent.status !== "active" || !credential.rowCount) throw new RequestError(401, "invalid_agent_credentials", "invalid agent credentials");
+    if (requireExecution && credential.rows[0].scope !== "payments:execute") throw new RequestError(403, "agent_execution_scope_required", "execution scope is required");
     return agent;
   }
 
@@ -262,7 +277,7 @@ export class AgentAuthorityStore {
       const previous = await client.query("SELECT * FROM rail_agent_intents WHERE agent_id = $1 AND client_request_id = $2", [agent.agent_id, input.clientRequestId]);
       if (previous.rows[0]) {
         if (previous.rows[0].proposal_fingerprint !== proposal) throw new RequestError(409, "intent_request_reused", "intent request ID is already bound to different data");
-        return mapIntent(previous.rows[0]);
+        return mapIntent(previous.rows[0], this.executionEnabled);
       }
       const policy = await client.query(`SELECT *, expires_at > clock_timestamp() AS valid FROM rail_agent_mandates
         WHERE mandate_id = $1 AND agent_id = $2 AND owner_wallet_id = $3 FOR UPDATE`, [input.mandateId, agent.agent_id, agent.owner_wallet_id]);
@@ -278,7 +293,7 @@ export class AgentAuthorityStore {
       const count = await client.query("SELECT count(*) FROM rail_agent_intents WHERE agent_id = $1", [agent.agent_id]);
       if (Number(count.rows[0].count) >= 1000) throw new RequestError(409, "intent_capacity", "retained intent capacity reached");
       const reservation = await client.query(`UPDATE rail_agent_mandates SET reserved_budget_minor = reserved_budget_minor + $2
-        WHERE mandate_id = $1 AND reserved_budget_minor + $2 <= total_budget_minor RETURNING mandate_id`, [input.mandateId, input.amountMinor]);
+        WHERE mandate_id = $1 AND reserved_budget_minor + spent_budget_minor + $2 <= total_budget_minor RETURNING mandate_id`, [input.mandateId, input.amountMinor]);
       if (reservation.rowCount !== 1) throw new RequestError(409, "mandate_budget_exceeded", "insufficient mandate budget headroom");
       const time = await client.query("WITH timestamp AS (SELECT clock_timestamp() AS now) SELECT now AS created_at, LEAST(now + $1 * interval '1 second', $2::timestamptz) AS expires_at FROM timestamp", [input.ttlSeconds, mandate.expires_at]);
       const createdAt = date(time.rows[0].created_at), expiresAt = date(time.rows[0].expires_at), intentId = randomUUID();
@@ -291,7 +306,7 @@ export class AgentAuthorityStore {
           input.receiverWalletId, input.amountMinor, input.currency, mandate.mode === "budgeted" ? "approved" : "pending", createdAt, expiresAt]);
       await this.audit(client, "agent.intent_created", agent.owner_wallet_id, { agentId: agent.agent_id, intentId, mandateId: input.mandateId,
         status: result.rows[0].status, requestFingerprint: fingerprint });
-      return mapIntent(result.rows[0]);
+      return mapIntent(result.rows[0], this.executionEnabled);
     });
   }
 
@@ -299,7 +314,7 @@ export class AgentAuthorityStore {
     return this.transaction(async client => {
       await this.ownedAgent(client, owner, agentId, false);
       await this.releaseIntents(client, agentId, "expired", "deadline_expired");
-      return (await client.query("SELECT * FROM rail_agent_intents WHERE agent_id = $1 ORDER BY created_at, intent_id LIMIT 1000", [agentId])).rows.map(mapIntent);
+      return (await client.query("SELECT * FROM rail_agent_intents WHERE agent_id = $1 ORDER BY created_at, intent_id LIMIT 1000", [agentId])).rows.map(row => mapIntent(row, this.executionEnabled));
     });
   }
 
@@ -307,7 +322,7 @@ export class AgentAuthorityStore {
     return this.transaction(async client => {
       const agent = await this.credentialForMutation(client, token);
       await this.releaseIntents(client, agent.agent_id, "expired", "deadline_expired");
-      return (await client.query("SELECT * FROM rail_agent_intents WHERE agent_id = $1 ORDER BY created_at, intent_id LIMIT 1000", [agent.agent_id])).rows.map(mapIntent);
+      return (await client.query("SELECT * FROM rail_agent_intents WHERE agent_id = $1 ORDER BY created_at, intent_id LIMIT 1000", [agent.agent_id])).rows.map(row => mapIntent(row, this.executionEnabled));
     });
   }
 
@@ -322,13 +337,64 @@ export class AgentAuthorityStore {
       const intent = result.rows[0];
       if (!intent) throw new RequestError(404, "intent_not_found", "intent not found");
       if (intent.request_fingerprint !== fingerprint) throw new RequestError(409, "intent_fingerprint_mismatch", "approval does not match the exact intent");
-      if (intent.status === "expired" || intent.status === "rejected") return mapIntent(intent);
-      if (decision === "approve" && intent.status === "approved") return mapIntent(intent);
+      if (intent.status === "expired" || intent.status === "rejected" || intent.status === "executed") return mapIntent(intent, this.executionEnabled);
+      if (decision === "approve" && intent.status === "approved") return mapIntent(intent, this.executionEnabled);
       const status = decision === "approve" ? "approved" : "rejected";
       await client.query("UPDATE rail_agent_intents SET status = $2, terminal_reason = $3 WHERE intent_id = $1", [intentId, status, decision === "reject" ? "owner_rejected" : null]);
       if (decision === "reject") await client.query("UPDATE rail_agent_mandates SET reserved_budget_minor = reserved_budget_minor - $2 WHERE mandate_id = $1", [intent.mandate_id, intent.amount_minor]);
       await this.audit(client, `agent.intent_${status}`, owner, { agentId, intentId, requestFingerprint: fingerprint });
-      return mapIntent({ ...intent, status, terminal_reason: decision === "reject" ? "owner_rejected" : null });
+      return mapIntent({ ...intent, status, terminal_reason: decision === "reject" ? "owner_rejected" : null }, this.executionEnabled);
+    });
+  }
+
+  async executeIntent(token: unknown, intentId: string, value: unknown) {
+    if (!isAgentId(intentId) || !isRecord(value) || Object.keys(value).length !== 1 ||
+        typeof value.requestFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.requestFingerprint)) invalid();
+    const fingerprint = value.requestFingerprint;
+    if (!this.executionEnabled) throw new RequestError(503, "agent_execution_unavailable", "protected agent execution is unavailable");
+    const signingSecret = process.env.RAIL_SIGNING_SECRET!;
+    return this.transaction(async client => {
+      const agent = await this.credentialForMutation(client, token, true);
+      await this.releaseIntents(client, agent.agent_id, "expired", "deadline_expired");
+      const found = await client.query("SELECT * FROM rail_agent_intents WHERE intent_id = $1 AND agent_id = $2 AND owner_wallet_id = $3 FOR UPDATE", [intentId, agent.agent_id, agent.owner_wallet_id]);
+      const intent = found.rows[0];
+      if (!intent) throw new RequestError(404, "intent_not_found", "intent not found");
+      if (intent.request_fingerprint !== fingerprint) throw new RequestError(409, "intent_fingerprint_mismatch", "execution does not match the exact intent");
+      const policy = await client.query("SELECT *, expires_at > clock_timestamp() AS valid FROM rail_agent_mandates WHERE mandate_id = $1 FOR UPDATE", [intent.mandate_id]);
+      const mandate = policy.rows[0];
+      if (!mandate?.valid || mandate.revoked_at) throw new RequestError(409, "mandate_inactive", "mandate is inactive");
+      if (intent.status === "executed") {
+        const replay = await client.query(`SELECT execution.result_json FROM rail_payment_executions execution
+          JOIN rail_idempotency replay ON replay.idempotency_key = execution.idempotency_key AND replay.status = 'completed'
+            AND replay.request_fingerprint = execution.request_fingerprint AND replay.result_json = execution.result_json
+          WHERE execution.tx_id = $1 AND execution.idempotency_key = $2`, [intent.payment_tx_id, `rail_agent_intent:${intentId}`]);
+        if (!replay.rows[0]) throw new Error("agent_replay_missing");
+        return { intent: mapIntent(intent, this.executionEnabled), result: replay.rows[0].result_json };
+      }
+      if (intent.status !== "approved") throw new RequestError(409, "intent_not_approved", "intent is not approved for execution");
+      if (mandate.currency !== intent.currency || Number(intent.amount_minor) > Number(mandate.per_payment_limit_minor) ||
+          !mandate.allowed_receiver_wallet_ids.includes(intent.receiver_wallet_id)) throw new RequestError(403, "mandate_policy_denied", "intent is outside mandate policy");
+      const wallets = await client.query("SELECT wallet_id, currency, balance FROM wallets WHERE wallet_id = ANY($1::text[]) ORDER BY wallet_id FOR UPDATE", [[intent.owner_wallet_id, intent.receiver_wallet_id]]);
+      if (wallets.rowCount !== 2 || wallets.rows.some(row => row.currency !== intent.currency)) throw new RequestError(409, "mandate_currency_changed", "wallet currency no longer matches mandate");
+      if (BigInt(wallets.rows.find(row => row.wallet_id === intent.owner_wallet_id).balance) < BigInt(intent.amount_minor)) throw new RequestError(409, "insufficient_funds", "insufficient available wallet funds");
+      const auth = await createAuthorizationInTransaction({ txId: `rail_agent:${intentId}`, senderWalletId: intent.owner_wallet_id,
+        receiverWalletId: intent.receiver_wallet_id, amountMinor: Number(intent.amount_minor), currency: intent.currency }, client, { cleanupExpired: false });
+      const payment: PaymentTransaction = { txId: auth.txId, idempotencyKey: `rail_agent_intent:${intentId}`, authorizationId: auth.authId,
+        senderWalletId: intent.owner_wallet_id, receiverWalletId: intent.receiver_wallet_id, amountMinor: Number(intent.amount_minor),
+        currency: intent.currency, channel: "online", createdAt: date(intent.created_at) };
+      const result = await this.engine!.executeInTransaction({ ...payment, paymentSignature: signTransactionHmac(payment, signingSecret) }, client);
+      if (result.status !== "accepted") throw new Error("agent_payment_not_accepted");
+      // Recheck live deadlines after waiting for financial locks and running the engine.
+      await this.credentialForMutation(client, token, true);
+      const spent = await client.query(`UPDATE rail_agent_mandates SET reserved_budget_minor = reserved_budget_minor - $2,
+        spent_budget_minor = spent_budget_minor + $2 WHERE mandate_id = $1 AND reserved_budget_minor >= $2
+          AND revoked_at IS NULL AND expires_at > clock_timestamp() RETURNING mandate_id`, [intent.mandate_id, intent.amount_minor]);
+      if (spent.rowCount !== 1) throw new RequestError(409, "mandate_inactive", "mandate is inactive");
+      const executed = await client.query(`UPDATE rail_agent_intents SET status = 'executed', payment_tx_id = $2, executed_at = clock_timestamp()
+        WHERE intent_id = $1 AND status = 'approved' AND expires_at > clock_timestamp() RETURNING *`, [intentId, payment.txId]);
+      if (executed.rowCount !== 1) throw new RequestError(409, "intent_expired", "intent expired before execution completed");
+      await this.audit(client, "agent.intent_executed", agent.owner_wallet_id, { agentId: agent.agent_id, intentId, txId: payment.txId, requestFingerprint: fingerprint });
+      return { intent: mapIntent(executed.rows[0], this.executionEnabled), result };
     });
   }
 }

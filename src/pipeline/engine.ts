@@ -32,6 +32,10 @@ export interface PaymentPipelineEngineOptions {
 export class PaymentPipelineEngine {
   constructor(private readonly opts: PaymentPipelineEngineOptions) {}
 
+  get supportsProtectedTransactions(): boolean {
+    return Boolean(this.opts.evidence && this.opts.idempotency.dedupeInTransaction);
+  }
+
   async execute(txn: PaymentTransaction): Promise<PipelineResult> {
     return this.executeBoundary(Object.freeze({ ...txn }));
   }

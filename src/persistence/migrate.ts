@@ -243,6 +243,8 @@ CREATE TABLE IF NOT EXISTS rail_agent_credentials (
   CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
 );
 CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON rail_agent_credentials(agent_id);
+ALTER TABLE rail_agent_credentials DROP CONSTRAINT IF EXISTS rail_agent_credentials_scope_check;
+ALTER TABLE rail_agent_credentials ADD CONSTRAINT rail_agent_credentials_scope_check CHECK (scope IN ('payments:propose','payments:execute'));
 CREATE TABLE IF NOT EXISTS rail_agent_mandates (
   mandate_id UUID PRIMARY KEY,
   agent_id UUID NOT NULL,
@@ -286,13 +288,34 @@ CREATE TABLE IF NOT EXISTS rail_agent_intents (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_intents_agent ON rail_agent_intents(agent_id, created_at, intent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_intents_mandate ON rail_agent_intents(mandate_id, status);
+ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS spent_budget_minor BIGINT NOT NULL DEFAULT 0
+  CHECK (spent_budget_minor >= 0 AND spent_budget_minor + reserved_budget_minor <= total_budget_minor);
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS payment_tx_id TEXT UNIQUE
+  REFERENCES rail_payment_executions(tx_id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ;
+DO $$
+DECLARE constraint_name TEXT;
+BEGIN
+  FOR constraint_name IN SELECT conname FROM pg_constraint WHERE conrelid = 'rail_agent_intents'::regclass
+      AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%status%' LOOP
+    EXECUTE format('ALTER TABLE rail_agent_intents DROP CONSTRAINT %I', constraint_name);
+  END LOOP;
+END $$;
+ALTER TABLE rail_agent_intents ADD CONSTRAINT rail_agent_intent_state_check CHECK (
+  (status IN ('pending','approved') AND terminal_reason IS NULL AND payment_tx_id IS NULL AND executed_at IS NULL) OR
+  (status IN ('rejected','expired') AND terminal_reason IS NOT NULL AND payment_tx_id IS NULL AND executed_at IS NULL) OR
+  (status = 'executed' AND terminal_reason IS NULL AND payment_tx_id = 'rail_agent:' || intent_id::text
+    AND payment_tx_id IS NOT NULL AND executed_at IS NOT NULL AND executed_at >= created_at AND executed_at < expires_at)
+);
 
 CREATE OR REPLACE FUNCTION rail_assert_agent_budget(id UUID) RETURNS VOID
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id = id AND
-      mandate.reserved_budget_minor <> COALESCE((SELECT SUM(intent.amount_minor) FROM rail_agent_intents intent
-        WHERE intent.mandate_id = id AND intent.status IN ('pending','approved')), 0)) THEN
+      (mandate.reserved_budget_minor <> COALESCE((SELECT SUM(intent.amount_minor) FROM rail_agent_intents intent
+        WHERE intent.mandate_id = id AND intent.status IN ('pending','approved')), 0) OR
+       mandate.spent_budget_minor <> COALESCE((SELECT SUM(intent.amount_minor) FROM rail_agent_intents intent
+        WHERE intent.mandate_id = id AND intent.status = 'executed'), 0))) THEN
     RAISE EXCEPTION 'agent_budget_reservation_mismatch' USING ERRCODE = '23514';
   END IF;
 END $$;
@@ -317,8 +340,9 @@ BEGIN
       NEW.proposal_fingerprint, NEW.request_fingerprint, NEW.receiver_wallet_id, NEW.amount_minor, NEW.currency, NEW.created_at, NEW.expires_at)
     IS DISTINCT FROM ROW(OLD.intent_id, OLD.agent_id, OLD.mandate_id, OLD.owner_wallet_id, OLD.client_request_id,
       OLD.proposal_fingerprint, OLD.request_fingerprint, OLD.receiver_wallet_id, OLD.amount_minor, OLD.currency, OLD.created_at, OLD.expires_at)
-    OR (OLD.status IN ('rejected','expired') AND ROW(NEW.status, NEW.terminal_reason) IS DISTINCT FROM ROW(OLD.status, OLD.terminal_reason))
-    OR (OLD.status = 'approved' AND NEW.status = 'pending') THEN
+    OR (OLD.status IN ('rejected','expired','executed') AND ROW(NEW.status, NEW.terminal_reason, NEW.payment_tx_id, NEW.executed_at)
+      IS DISTINCT FROM ROW(OLD.status, OLD.terminal_reason, OLD.payment_tx_id, OLD.executed_at))
+    OR (OLD.status = 'approved' AND NEW.status = 'pending') OR (OLD.status = 'pending' AND NEW.status = 'executed') THEN
     RAISE EXCEPTION 'agent_intent_history_is_immutable' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -326,6 +350,38 @@ END $$;
 DROP TRIGGER IF EXISTS rail_agent_intent_immutable ON rail_agent_intents;
 CREATE TRIGGER rail_agent_intent_immutable BEFORE UPDATE OR DELETE ON rail_agent_intents
   FOR EACH ROW EXECUTE FUNCTION rail_protect_agent_intent();
+
+CREATE OR REPLACE FUNCTION rail_assert_agent_payment(id UUID) RETURNS VOID
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM rail_agent_intents intent WHERE intent.intent_id = id AND intent.status = 'executed' AND NOT EXISTS (
+    SELECT 1 FROM rail_payment_executions execution JOIN authorizations auth ON auth.tx_id = execution.tx_id
+    WHERE execution.tx_id = intent.payment_tx_id AND execution.idempotency_key = 'rail_agent_intent:' || id::text
+      AND execution.evidence_required AND execution.result_json->>'status' = 'accepted' AND auth.status = 'used'
+      AND auth.sender_wallet_id = intent.owner_wallet_id AND auth.receiver_wallet_id = intent.receiver_wallet_id
+      AND auth.amount_minor = intent.amount_minor AND auth.currency = intent.currency)) THEN
+    RAISE EXCEPTION 'agent_payment_binding_mismatch' USING ERRCODE = '23514';
+  END IF;
+END $$;
+CREATE OR REPLACE FUNCTION rail_check_agent_payment() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE id UUID;
+BEGIN
+  IF TG_TABLE_NAME = 'rail_agent_intents' THEN id := NEW.intent_id;
+  ELSIF NEW.tx_id LIKE 'rail_agent:%' THEN
+    SELECT intent_id INTO id FROM rail_agent_intents WHERE payment_tx_id = NEW.tx_id AND status = 'executed';
+    IF id IS NULL THEN RAISE EXCEPTION 'agent_payment_binding_mismatch' USING ERRCODE = '23514'; END IF;
+  ELSE RETURN NULL;
+  END IF;
+  PERFORM rail_assert_agent_payment(id);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_payment_check ON rail_agent_intents;
+CREATE CONSTRAINT TRIGGER rail_agent_payment_check AFTER INSERT OR UPDATE ON rail_agent_intents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_payment();
+DROP TRIGGER IF EXISTS rail_execution_agent_check ON rail_payment_executions;
+CREATE CONSTRAINT TRIGGER rail_execution_agent_check AFTER INSERT ON rail_payment_executions
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_payment();
 
 DO $$
 BEGIN

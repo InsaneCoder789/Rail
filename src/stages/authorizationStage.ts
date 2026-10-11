@@ -203,7 +203,7 @@ export async function createAuthorization(input: AuthorizationInput, db: Pool): 
 }
 
 /** Trusted server composition only; no BEGIN, COMMIT or separate pool checkout. */
-export async function createAuthorizationInTransaction(value: AuthorizationInput, client: PoolClient): Promise<PaymentAuthorization> {
+export async function createAuthorizationInTransaction(value: AuthorizationInput, client: PoolClient, options: { cleanupExpired?: boolean } = {}): Promise<PaymentAuthorization> {
   const input = { ...value };
   validateMoney(input.amountMinor, input.currency);
   for (const [id, minimum] of [[input.txId, 8], [input.senderWalletId, 3], [input.receiverWalletId, 3]] as const) {
@@ -231,7 +231,8 @@ export async function createAuthorizationInTransaction(value: AuthorizationInput
        FOR UPDATE`,
       [input.txId],
     );
-    await expireReservations(client, 1000, input.senderWalletId);
+    // A coordinator that already locks both wallets must not acquire unrelated expiry rows afterwards.
+    if (options.cleanupExpired !== false) await expireReservations(client, 1000, input.senderWalletId);
     if (existing.rowCount && existing.rowCount > 0) {
       existing = await client.query("SELECT * FROM authorizations WHERE tx_id = $1", [input.txId]);
       const current = mapStoredAuthorization(existing.rows[0] as Record<string, unknown>);
