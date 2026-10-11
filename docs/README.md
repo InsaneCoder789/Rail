@@ -203,7 +203,7 @@ flowchart TD
 
 ## Project Status
 
-Security and correctness development continues directly on `main`. ML expansion is deferred; the existing optional baseline runs only in shadow mode when explicitly configured. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
+Development continues directly on `main`. Agent execution and trusted behavioural observations now build on the protected payment foundation. The optional logistic model remains shadow-only; no model can override financial authority. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
 
 Salted Merkle commitments and inclusion proofs provide a tested foundation for future audit anchoring. Blockchain publication and durable audit storage are not yet implemented.
 
@@ -420,6 +420,14 @@ flowchart TD
 The coordinator locks both wallets in sorted order and does not sweep unrelated expired wallet authorizations inside that lock scope. Existing authorization reads/sweeps release those reservations separately; policy headroom does not guarantee immediately available wallet funds. This implementation has local regression coverage, not hosted or real-money acceptance.
 
 Agent intent reads/writes share a PostgreSQL-backed 20/minute agent bucket across credentials and IP addresses, plus a 30/minute source bucket. Limits are 50 retained agents per owner, 100 credentials/mandates and 1,000 intents per agent, including revoked, rejected or expired rows. No automatic deletion resets these bounds. Intent bindings/history cannot be edited or deleted through normal SQL updates. Mutations and audit events commit together; failed audit writes roll changes back. Apply migrations before updating hosted API instances. Pending intent fields are relational data, not encrypted payment evidence; the AES/HMAC evidence path below applies to committed payments.
+
+### `GET /v1/payments/:txId/risk`
+
+Authenticated sender/receiver access to the payment's retained shadow assessment. The response contains observation time, policy version, explanation codes, model availability/version and synthetic-data status, not raw history, feature values or inference probabilities. Unknown and inaccessible payments both return 404. Reads use a 30/minute wallet/source bucket and `Cache-Control: no-store`. Older payments without snapshots return `legacy_unobserved`, not an invented score.
+
+New payments using the standard pipeline retain one immutable, fingerprint-bound observation in the financial transaction. Collection occurs after authority/token checks and sorted wallet locks, before posting the current payment. It uses database time and up to 1,000 prior visible payments from the last 30 days in the same wallet/currency. Truncated history is explicit; sampled five-minute velocity is a lower bound and recipient familiarity is sample-local. Cold start and missing device-verification history are not treated as proof of safety. Agent budget exposure comes from persisted held plus spent budget, not agent claims.
+
+The versioned deterministic policy reports amount deviation, velocity and budget pressure for explanation only. `review` is a shadow observation, not a suspended payment; `normal` does not mean fraud-free. The optional existing ML still uses amount/channel, with its artifact hash and prediction retained privately. It does not yet consume the expanded features. Observation writes and required-observation commit checks must succeed with payment accounting; retry returns the same snapshot rather than rescoring history. Feature records are relational data, not part of the encrypted transaction envelope. Full retention/privacy approval, expanded-model evaluation and production fraud enforcement remain open.
 
 ### `GET /v1/payments/:txId/evidence`
 

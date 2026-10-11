@@ -5,6 +5,7 @@ import { processSyncBatch } from "../../rail/syncBatch.js";
 import { createAuthorization, getAuthorizationById } from "../../stages/authorizationStage.js";
 import { RequestError, applyRateLimit, json, readAndParseJson, requireJsonContentType, toErrorResponse } from "../http.js";
 import type { ServerContext } from "../types.js";
+import { readBehaviourObservation } from "../../risk/behaviourRisk.js";
 import {
   isCurrency,
   isRecord,
@@ -96,6 +97,20 @@ export async function handlePaymentRoutes(
   url: URL,
   context: ServerContext,
 ): Promise<boolean> {
+  const riskRoute = /^\/v1\/payments\/([^/]+)\/risk$/.exec(url.pathname);
+  if (req.method === "GET" && riskRoute) {
+    const walletId = await context.authResolver.resolveAuthenticatedWallet(req);
+    let txId: string;
+    try { txId = decodeURIComponent(riskRoute[1]); } catch { throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID"); }
+    if (!isSafeText(txId, 8, 128)) throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID");
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "risk_read", discriminator: walletId,
+      limit: 30, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
+    const risk = await readBehaviourObservation(context.pool, txId, walletId);
+    if (!risk) throw new RequestError(404, "payment_not_found", "payment not found");
+    res.setHeader("Cache-Control", "no-store");
+    json(res, 200, { risk });
+    return true;
+  }
   const evidenceRoute = /^\/v1\/payments\/([^/]+)\/evidence$/.exec(url.pathname);
   if (req.method === "GET" && evidenceRoute) {
     const walletId = await context.authResolver.resolveAuthenticatedWallet(req);

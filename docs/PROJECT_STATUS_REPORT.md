@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.2 Trusted Behavioural Observation Foundation: 11 October 2026
+
+Added `src/risk/behaviourRisk.ts` and immutable, fingerprint-bound `rail_risk_observations`. The standard online/offline/agent pipeline now captures database-derived history after authority/token verification and sorted wallet locks, before the current ledger posting. A database-clock 30-day window and indexed 1,001-row query produce a maximum 1,000-sample snapshot with explicit truncation. Client event timestamps, confidence/history claims and unverified device identity cannot create trusted history. Earlier rows visible in the same supplied-client transaction are included; stored execution timestamps are not exact outer-commit times.
+
+Features record sampled five-minute velocity, sample-local recipient familiarity, mean amount, amount ratio/deviation and persisted agent held-plus-spent exposure. Welford statistics avoid artificial variance for identical amounts. Cold start, truncated history and unassessed device changes are explicit. A versioned deterministic shadow policy produces explanation codes; it does not block, authorize or fund a payment. The existing optional logistic model remains amount/channel-only, now snapshotted at pipeline construction with version, artifact hash, synthetic status and prediction retained privately. Missing configuration and currency mismatch store explicit statuses, not fabricated probabilities. Expanded model training/evaluation is still pending.
+
+New standard-pipeline executions require their observation at final commit, so observation failure rolls back money and replay. Immutable snapshots survive retries and model changes without rescoring. `GET /v1/payments/:txId/risk` exposes only a participant-authorized, non-cacheable summary with safe explanation codes and model availability. Missing/inaccessible payments both return 404; reads use a 30/minute wallet/source quota. Historical payments remain `legacy_unobserved`. Feature records are sensitive relational data, not currently covered by the AES/HMAC transaction envelope; this distinction and retention/access requirements are documented.
+
+Verification: 159 local tests pass with zero failures/skips, including PostgreSQL. Ten new policy/collector/integration cases cover database time, ignored client claims, bounded samples, velocity/deviation, model snapshot/replay immutability, currency mismatch, concurrent predecessors, write rollback, deferred missing-observation rejection and participant/privacy/quota handling. Existing agent tests additionally check mandate exposure, one snapshot on concurrent replay and observation rollback with evidence failure. The first integration run found an artificial constant-amount variance caused by floating-point mean accumulation; Welford's algorithm fixed the defect without relaxing the assertions. GitHub Actions has an explicit behavioural observation step, but remote CI and deployment have not run for this revision. No real fraud dataset, automatic enforcement or blockchain publication is claimed. Next code category is expanded explainable ML with reproducible temporal evaluation, while production key/recovery, historical accounting and provider gates remain open.
+
 ### V2.1 Atomic Agent Execution: 11 October 2026
 
 Approved agent intents now execute online through `POST /v2/agent/intents/:intentId/execute`. The owner must explicitly issue a `payments:execute` credential; existing proposal credentials remain proposal-only. Execution requires the exact stored request fingerprint and rejects extra payload fields. Financial identities, amount, currency and generated transaction/replay identifiers come from the immutable intent, not agent instructions. The server signs the transaction with its private HMAC secret. Execution fails closed without a protected composable engine or a signing secret of at least 32 characters after trimming.
@@ -357,6 +367,8 @@ The repository is small and focused. The major code areas are:
   PostgreSQL migrations and durable store implementations.
 - `src/crypto/`
   HMAC signing and HSM integration boundary hooks.
+- `src/risk/`
+  Validated logistic models, training/evaluation and trusted behavioural feature/observation collection.
 - `src/auth/`
   JWT generation and verification.
 - `src/domain/`
@@ -507,6 +519,17 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
 
 - `src/server/routes/eventRoutes.ts`
   Contains the event listing and SSE stream endpoints.
+
+### Risk Modules
+
+- `src/risk/behaviourRisk.ts`
+  Collects bounded database history, derives statistical/velocity/budget observations and persists immutable shadow assessments inside financial execution. Provides participant-filtered summary reads without raw features.
+- `src/risk/logisticRisk.ts`
+  Validates and copies the amount/channel logistic artifact; implements training, prediction and evaluation. Synthetic demonstration results do not prove real-world fraud performance.
+- `src/risk/trainRisk.ts`
+  Loads private supplied training/validation arrays, writes a new artifact without overwriting existing files and prints evaluation metrics.
+- `test/behaviourRisk.integration.test.js`
+  Tests collection bounds, clock/provenance, history/concurrency, immutable replay, rollback, commit enforcement and participant-safe HTTP summaries.
 
 ### Business Stages
 

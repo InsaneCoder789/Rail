@@ -139,7 +139,31 @@ CREATE TABLE IF NOT EXISTS rail_payment_executions (
 );
 
 ALTER TABLE rail_payment_executions ADD COLUMN IF NOT EXISTS evidence_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE rail_payment_executions ADD COLUMN IF NOT EXISTS risk_required BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_evidence_binding ON rail_payment_executions(tx_id, request_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_ledger_risk_history ON ledger_entries(wallet_id, currency, created_at DESC, id DESC) WHERE entry_type = 'debit';
+CREATE TABLE IF NOT EXISTS rail_risk_observations (
+  tx_id TEXT PRIMARY KEY,
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^[a-f0-9]{64}$'),
+  observed_at TIMESTAMPTZ NOT NULL,
+  feature_snapshot JSONB NOT NULL CHECK ((jsonb_typeof(feature_snapshot) = 'object'
+    AND feature_snapshot->>'schemaVersion' = '1' AND feature_snapshot->>'source' = 'postgres_posted_payments'
+    AND feature_snapshot->>'historyWindowDays' = '30' AND feature_snapshot->>'deviceChange' = 'not_assessed'
+    AND (feature_snapshot->>'historyCount')::integer BETWEEN 0 AND 1000
+    AND (feature_snapshot->>'recentCount')::integer BETWEEN 0 AND (feature_snapshot->>'historyCount')::integer
+    AND jsonb_typeof(feature_snapshot->'historyTruncated') = 'boolean'
+    AND jsonb_typeof(feature_snapshot->'receiverSeen') = 'boolean') IS TRUE),
+  assessment JSONB NOT NULL CHECK ((assessment->>'mode' = 'shadow' AND assessment->>'policyVersion' = 'behaviour-shadow-v1'
+    AND assessment->>'level' IN ('normal','review','insufficient_history') AND jsonb_typeof(assessment->'reasons') = 'array') IS TRUE),
+  model_status TEXT NOT NULL CHECK (model_status IN ('available','currency_mismatch','not_configured')),
+  model_version TEXT,
+  model_hash TEXT CHECK (model_hash ~ '^[a-f0-9]{64}$'),
+  synthetic BOOLEAN,
+  prediction JSONB,
+  FOREIGN KEY (tx_id, request_fingerprint) REFERENCES rail_payment_executions(tx_id, request_fingerprint) DEFERRABLE INITIALLY DEFERRED,
+  CHECK ((model_status = 'available' AND model_version IS NOT NULL AND model_hash IS NOT NULL AND synthetic IS NOT NULL AND prediction IS NOT NULL)
+    OR (model_status <> 'available' AND model_version IS NULL AND model_hash IS NULL AND synthetic IS NULL AND prediction IS NULL))
+);
 CREATE TABLE IF NOT EXISTS rail_evidence_key_usage (
   encryption_key_fingerprint TEXT PRIMARY KEY CHECK (encryption_key_fingerprint ~ '^[a-f0-9]{64}$'),
   record_count BIGINT NOT NULL CHECK (record_count BETWEEN 1 AND 1000000)
@@ -537,6 +561,11 @@ BEGIN
           WHERE evidence.tx_id = execution.tx_id AND evidence.request_fingerprint = execution.request_fingerprint)) THEN
     RAISE EXCEPTION 'payment_evidence_missing' USING ERRCODE = '23514';
   END IF;
+  IF EXISTS (SELECT 1 FROM rail_payment_executions execution WHERE execution.tx_id = payment_tx_id AND execution.risk_required
+      AND NOT EXISTS (SELECT 1 FROM rail_risk_observations observation WHERE observation.tx_id = execution.tx_id
+        AND observation.request_fingerprint = execution.request_fingerprint)) THEN
+    RAISE EXCEPTION 'payment_risk_observation_missing' USING ERRCODE = '23514';
+  END IF;
 END $$;
 
 CREATE OR REPLACE FUNCTION rail_check_payment_commit() RETURNS TRIGGER
@@ -575,6 +604,9 @@ CREATE TRIGGER rail_execution_immutable BEFORE UPDATE OR DELETE ON rail_payment_
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 DROP TRIGGER IF EXISTS rail_evidence_immutable ON rail_transaction_evidence;
 CREATE TRIGGER rail_evidence_immutable BEFORE UPDATE OR DELETE ON rail_transaction_evidence
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_risk_immutable ON rail_risk_observations;
+CREATE TRIGGER rail_risk_immutable BEFORE UPDATE OR DELETE ON rail_risk_observations
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 
 CREATE OR REPLACE FUNCTION rail_protect_used_authorization() RETURNS TRIGGER

@@ -39,7 +39,8 @@ export function validateRiskModel(value: unknown): LogisticRiskModel {
       !model.weights.every((weight) => typeof weight === "number" && Number.isFinite(weight) && Math.abs(weight) <= 1_000_000)) {
     throw new Error("INVALID_RISK_MODEL");
   }
-  return { ...model, weights: [model.weights[0], model.weights[1], model.weights[2]] };
+  return { schemaVersion: 1, modelVersion: model.modelVersion, datasetId: model.datasetId, currency: model.currency,
+    synthetic: model.synthetic, trainingRows: model.trainingRows, weights: [model.weights[0], model.weights[1], model.weights[2]] };
 }
 
 export function predictRisk(model: LogisticRiskModel, example: Pick<RiskExample, "amountMinor" | "channel">): {

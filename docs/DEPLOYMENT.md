@@ -101,7 +101,13 @@ No extra deployment secret is introduced. Monitor owner-global and agent-global 
 
 Authorization issuance, PostgreSQL replay protection and the engine support supplied-client composition. These helpers are not permission APIs. The agent store is now a trusted coordinator: it begins one transaction, configures SQL deadlines, checks live authority, calls the helpers, performs budget/state writes and awaits outer `COMMIT` before returning success. Deferred constraints can fail that final commit. On any failure, roll back the whole operation and discard unusable clients; an inner savepoint only undoes its own scope. Never run overlapping operations on the same checked-out client. Preserve consistent lock ordering and check authority before cached replay. Existing owner HTTP execute/sync paths retain their normal self-contained engine boundary.
 
-### Durable external event delivery
+### Trusted Risk Observations
+
+Apply the observation schema migration before rolling out the updated pipeline. New standard-pipeline executions require an immutable feature/assessment record at commit; old execution rows remain explicitly legacy/unobserved. Wallet-history queries use the same SQL deadlines and client as the payment, with a 30-day window and 1,000-sample cap. Monitor query latency, observation failures and sample truncation; a required-observation write failure rolls back the payment attempt rather than returning an unaudited result.
+
+Optional `RAIL_RISK_MODEL_PATH` still loads the amount/channel model in shadow mode. Model validation/copying fixes the runtime artifact; matching predictions and its hash are retained with the observation, not exposed through the participant summary API. No model does not mean unavailable funds or rejected payment, and `review` is only explanatory. Do not enable fraud enforcement based on these demonstration thresholds. Feature snapshots are sensitive relational records, not encrypted transaction evidence; production retention, least-privilege access, label provenance and model evaluation remain required.
+
+### Durable External Event Delivery
 
 Configure `RAIL_OUTBOX_WEBHOOK_URL` as a trusted HTTPS receiver and `RAIL_OUTBOX_WEBHOOK_SECRET` as a separate random secret of at least 32 characters. The worker refuses redirects and URL credentials. Run `npm run outbox:dispatch` from a scheduled worker/cron environment after applying migrations; each invocation claims a bounded batch and exits. The command is not run during API requests or serverless cold starts.
 

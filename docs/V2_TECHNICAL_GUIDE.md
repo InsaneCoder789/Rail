@@ -1,6 +1,6 @@
 # Rail V2 Foundation
 
-Development continues directly on `main`, starting 8 October 2026. Security and correctness fixes take priority; further ML development is deferred. This document describes existing modules and their limits. The complete platform roadmap remains in the ignored private scope file. [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) tracks the remaining defects.
+Development continues directly on `main`, starting 8 October 2026. Protected evidence and owner-controlled agent execution are implemented, followed by trusted behavioural observations. This document describes existing modules and their limits. The complete platform roadmap remains in the ignored private scope file. [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) tracks the remaining defects.
 
 ## Payment behavior
 
@@ -61,9 +61,36 @@ Log loss measures confidence in the correct label. Brier score measures squared 
 
 `RAIL_RISK_MODEL_PATH` points to a validated model JSON loaded once at server-context creation. An invalid configured model stops initialization. Without this variable, there is no ML inference. No default trained model is shipped because this repository contains no validated real fraud dataset.
 
-For a matching currency, the pipeline appends `risk.shadow_assessed` with mode, probability, model version, synthetic-data status and contributions. The event is visible only to the sender under the existing event filter. It does not alter execution decisions. The existing outbox durability gap still applies to this observation; it must be fixed before depending on it for audit or training capture.
+For a matching currency, the pipeline appends `risk.shadow_assessed` with mode, probability, model version, synthetic-data status and contributions. The event is visible only to the sender under the existing event filter. It does not alter execution decisions. Database event insertion now shares the financial transaction and the existing worker delivers at least once; consumers must deduplicate delivery IDs. External acknowledgement and production delivery acceptance remain separate from event persistence.
 
 The tests use synthetic examples to verify learning, evaluation, validation and independence from transaction IDs. Their results say nothing about fraud detection accuracy on real transactions.
+
+## Trusted Behavioural Observations
+
+`src/risk/behaviourRisk.ts` collects point-in-time feature snapshots through the supplied financial client after authorization/offline-token checks and sorted wallet locks. History uses posted sender debits joined to persisted executions and used authorizations, restricted to wallet/currency and a 30-day database-clock window. The current transaction is excluded. The query returns at most 1,001 rows; only 1,000 are used and the extra row marks truncation. An indexed sender/currency/time path supports the query, but production latency/load testing remains required.
+
+Features include sampled five-minute payment count, sample-local recipient familiarity, historical mean amount, current-to-mean ratio, statistical amount deviation and optional mandate exposure. Welford's running mean/variance avoids false deviations from constant amounts. Fewer than five samples or zero variance yields no z-score. Features are observations, not fraud probabilities. The fixed thresholds are demonstration policy choices: five recent payments, three-times mean amount, a z-score of three or exposure of 80 percent produce explanation codes without blocking money.
+
+History describes rows visible at the collection statement, including earlier work in a caller-owned transaction. `committed_at` is a stored database transaction timestamp, not proof of the exact instant an outer commit completed. Concurrent normal transfers from the same wallet serialize under wallet locks, so subsequently collected snapshots include their visible predecessors. Offline histories measure reconnect/server processing, not claimed disconnected-device event times. Client timestamps, confidence, history and device-change claims do not enter the trusted feature calculation. Device changes explicitly remain `not_assessed` until enrollment/revocation history is implemented.
+
+`rail_risk_observations` binds one immutable observation to the execution fingerprint. It retains schema/policy versions, database observation time, feature snapshot, explanation and model status; matching models also retain their artifact hash, synthetic flag and prediction/contributions. The pipeline validates/copies its model at construction so caller mutation cannot change the captured version or weights. These features do not yet feed an expanded trained model; the existing model still uses amount/channel. No model configured or a currency mismatch stores an explicit status and no fabricated probability.
+
+New standard-pipeline execution rows set `risk_required`; deferred commit checks reject missing observations. Observation failure rolls back the financial attempt, and retry is allowed. Successful replay does not overwrite observations or re-run a new model. Legacy records are not silently backfilled. These safeguards do not prevent a privileged database owner from disabling triggers. Feature snapshots are relational/private data; AES/HMAC transaction evidence currently protects the canonical payment, not these feature records. Retention, label provenance, encryption of risk records and access auditing require further work before production.
+
+`GET /v1/payments/:txId/risk` returns only a participant-authorized summary: `observed` or `legacy_unobserved`, time, shadow policy level/reasons and model availability/version/synthetic status. Raw historical feature values, probabilities and model hashes are not exposed. Missing and unauthorized payments share 404, responses are non-cacheable and reads have a 30/minute wallet/source quota. `review` does not create a pending money state; `normal` does not certify safety.
+
+```mermaid
+flowchart LR
+  Authority[Verified financial authority] --> Locks[Sorted wallet locks]
+  Locks --> History[Bounded database history]
+  History --> Features[Trusted feature snapshot]
+  Features --> Reasons[Versioned shadow explanations]
+  Reasons --> Commit[Observation and money commit together]
+  Commit --> API[Participant-only summary]
+  Features -. next milestone .-> Model[Expanded evaluated model]
+```
+
+Next: trusted outcome labels, temporal independent evaluation, expanded logistic features, drift/calibration checks and explicit unavailable-model behavior. Automated fraud enforcement is not enabled by collecting these observations.
 
 ## Audit commitment foundation
 

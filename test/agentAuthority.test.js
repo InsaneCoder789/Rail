@@ -563,8 +563,11 @@ test("agent execution and concurrent replay consume money and total budget exact
     const mandate = (await store.listMandates(owner, agent.agentId))[0];
     assert.equal(mandate.reservedBudgetMinor, 0);
     assert.equal(mandate.spentBudgetMinor, 100);
-    for (const table of ["authorizations", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence"])
+    for (const table of ["authorizations", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence", "rail_risk_observations"])
       assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 1, table);
+    const risk = (await pool.query("SELECT * FROM rail_risk_observations")).rows[0];
+    assert.equal(risk.feature_snapshot.agentBudgetExposure, 1);
+    assert.ok(risk.assessment.reasons.includes("high_agent_budget_exposure"));
     assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
     assert.deepEqual((await pool.query("SELECT wallet_id, balance, reserved FROM wallets WHERE wallet_id <> 'other_owner' ORDER BY wallet_id")).rows,
       [{ wallet_id: "agent_owner", balance: "9900", reserved: "0" }, { wallet_id: "agent_receiver", balance: "100", reserved: "0" }]);
@@ -584,7 +587,7 @@ test("agent evidence failure rolls back authority, ledger and consumed budget", 
     assert.equal(mandate.reservedBudgetMinor, 100);
     assert.equal(mandate.spentBudgetMinor, 0);
     assert.equal((await failing.listIntents(owner, agent.agentId))[0].status, "approved");
-    for (const table of ["authorizations", "ledger_entries", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence"])
+    for (const table of ["authorizations", "ledger_entries", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence", "rail_risk_observations"])
       assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
     assert.equal((await executionStore(pool).executeIntent(executionCredential.token, intent.intentId, request)).result.status, "accepted");
   });

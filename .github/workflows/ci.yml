@@ -70,3 +70,5 @@ jobs:
         run: node --test test/resources.test.js
       - name: Verify authentication and existing shadow-risk and audit regressions
         run: node --test test/authRoutes.test.js test/risk.test.js test/auditCommitment.test.js
+      - name: Verify trusted behavioural observations, privacy, rollback and replay
+        run: node --test test/behaviourRisk.integration.test.js

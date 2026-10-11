@@ -9,8 +9,9 @@ import type { Tracer } from "../pipeline/tracing.js";
 import { canonicalTransactionPayload, verifyTransactionSignatureIfRequired } from "../crypto/transactionSigning.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
 import { claimAuthorizationForExecution, consumeReservation, creditWallet, verifyCommittedAuthorization } from "./authorizationStage.js";
-import { predictRisk, type LogisticRiskModel } from "../risk/logisticRisk.js";
+import { predictRisk, validateRiskModel, type LogisticRiskModel } from "../risk/logisticRisk.js";
 import { isPaymentTransaction } from "../server/validation.js";
+import { persistBehaviourObservation } from "../risk/behaviourRisk.js";
 
 function emitStage(ctx: PaymentContext, stage: string, status: "start" | "ok" | "error"): void {
   const sequence = Number(ctx.state.eventSequence ?? 0) + 1;
@@ -46,7 +47,7 @@ function riskScoreStage(model?: LogisticRiskModel): Stage {
 }
 
 /** Mutations use only the transaction supplied by the durable idempotency boundary. */
-function transferAndLedger(tokenStore?: IOfflineTokenStore): Stage {
+function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel): Stage {
   return async (ctx) => {
     const client = ctx.dbClient;
     if (!client) throw new Error("db_not_initialized");
@@ -76,6 +77,7 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore): Stage {
       const gate = await tokenStore.beginOfflineSpend(txn, client);
       if (!gate.ok) throw new PipelineError(gate.reason, gate.reason);
     }
+    await persistBehaviourObservation(client, txn, riskModel);
     await consumeReservation(client, txn.senderWalletId, txn.amountMinor, txn.currency);
     await creditWallet(client, txn.receiverWalletId, txn.amountMinor, txn.currency);
     emitStage(ctx, "wallet.transfer", "ok");
@@ -87,8 +89,8 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore): Stage {
     if (txn.channel !== "online") await tokenStore!.finalizeOfflineSpend(txn, client);
     const result = { status: "accepted" as const, ledgerEntryId: `leg_${txn.txId}` };
     await client.query(
-      `INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json, evidence_required)
-       VALUES ($1, $2, $3, $4::jsonb, $5)`, [txn.txId, txn.idempotencyKey, fingerprint, JSON.stringify(result), ctx.state.requireEvidence === true]);
+      `INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json, evidence_required, risk_required)
+       VALUES ($1, $2, $3, $4::jsonb, $5, TRUE)`, [txn.txId, txn.idempotencyKey, fingerprint, JSON.stringify(result), ctx.state.requireEvidence === true]);
     ctx.outbox.append({ type: "payments.ledger_posted", payload: {
       txId: txn.txId, amountMinor: txn.amountMinor, currency: txn.currency, channel: txn.channel,
       offline: txn.channel !== "online", senderWalletId: txn.senderWalletId, receiverWalletId: txn.receiverWalletId,
@@ -100,14 +102,15 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore): Stage {
 }
 
 export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel): Stage {
+  const model = riskModel ? validateRiskModel(riskModel) : undefined;
   const limiter = new Semaphore(4);
   const parallelChecks: Stage = (ctx) => runParallelBounded([
     withSpan(tracer, "verify.signatures", async (context) => verifyTransactionSignatureIfRequired(context.txn)),
-    withSpan(tracer, "risk.score", riskScoreStage(riskModel)),
+    withSpan(tracer, "risk.score", riskScoreStage(model)),
   ], ctx, limiter);
   return (ctx) => runSequential([
     withSpan(tracer, "validate.core", validateBasics),
     withSpan(tracer, "prechecks.parallel", parallelChecks),
-    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore)),
+    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model)),
   ], ctx);
 }
