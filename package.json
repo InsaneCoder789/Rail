@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "license": "AGPL-3.0-only",
-  "description": "Rail — offline-first payment orchestration (PostgreSQL, HMAC/HSM hooks, sync API)",
+  "description": "Owner-controlled payment execution for AI agents and people, with offline-aware orchestration and protected audit evidence",
   "type": "module",
   "scripts": {
     "prebuild": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",

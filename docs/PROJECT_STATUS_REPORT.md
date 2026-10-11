@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Approach-First README and Milestone Commits: 12 October 2026
+
+Reordered the README narrative around the owner's approach: delegate payment tasks to AI agents without delegating unrestricted financial authority. The opening now explains owner-defined boundaries, both consent modes, a concrete invoice-assistant example, restriction/retry defenses and owner visibility before implementation details. Human payments and offline orchestration remain explicit. Agent controls lead the implementation table; package metadata and the agent security guide use the same positioning.
+
+Corrected the next-work ordering: protected mandate/decision authority receipts must precede claims of blockchain-verifiable consent; then add independent anchoring and owner-facing integrations. Current roots remain local/unanchored, ML remains shadow-only and external settlement/production acceptance remain unfinished. This adjustment adds no runtime feature and changes no financial or API contracts.
+
+At the owner's request, automatic category-by-category commits stop. Accumulate reviewed, related work into coherent milestone-sized changes and commit only when explicitly requested. Do not rewrite, squash or amend existing history merely to reduce the count. The prior authority-hardening commit remains local and unpushed; this documentation/metadata increment is left uncommitted. Preserve descriptive commit messages when a commit is requested.
+
+Verification: reran `npm test`; all 249 tests pass with zero failures/skips, including live PostgreSQL. README relative targets, balanced code fences, package JSON and `git diff --check` pass. Existing Mermaid diagrams are unchanged. Private reports remain ignored. No commit, push or remote CI run was performed for this increment.
+
 ### Agent-First Direction and Immutable Authority: 12 October 2026
 
 At the owner's request, Rail now leads with owner-controlled AI-agent transaction execution while preserving human payments and its offline-aware foundation. PostgreSQL still enforces money and policy; ML remains shadow-only and audit roots remain unanchored.

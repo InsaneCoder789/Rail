@@ -2,28 +2,49 @@
 
 # Rail
 
-**Owner-controlled payment execution for AI agents, with human payments on the same accounting foundation.**
+**Let agents handle the task. Keep the owner in control of the payment.**
 
 [![Rail CI](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml/badge.svg)](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](../LICENSE)
 
-Rail started with a question: how should a payment backend behave when connectivity disappears, requests repeat, or a process fails halfway through a transfer?
+Rail is a payment control and execution backend for AI agents and people. Its central idea is simple: delegating a task should not mean handing over unrestricted financial authority. An agent may decide that an invoice needs paying or a purchase needs completing; the owner still defines who can be paid, how much can be spent, when permission expires and which requests need approval.
 
-The answer is not another transfer endpoint. It is a controlled execution path: permission before spending, durable accounting, one committed result for an identical retry, and evidence of what actually happened. Rail's main direction is now delegated AI-agent payments: an agent can request a transfer, but cannot grant itself spending authority. Owners define recipients, budgets, expiry and exact-request approvals. Human payments and the original offline-aware foundation remain supported.
+I built Rail around that separation: **an agent can request a payment, but it cannot grant itself permission to make one.** The payment boundary belongs in the backend, not just in an agent's prompt. A request to ignore instructions, change a recipient or bypass approval must still meet the same stored authority checks as any other request.
 
-**PostgreSQL is the financial source of truth. ML supplies shadow risk observations, not spending authority. Audit proofs establish local inclusion, not bank settlement.** Rail does not replace UPI, card networks or PSPs, and has no live settlement connector. It is an engineering project with tested internal guarantees and explicit production-release gates.
+The direction is owner-controlled agent payments with an understandable record of what happened. Human transactions use the same accounting foundation, and the original offline-aware token and synchronization features remain part of the project.
 
-[Runtime flow](#runtime-flow) / [Offline boundaries](#offline-boundaries) / [Agent payments](#agent-payments) / [Run locally](#run-locally) / [API](#api) / [Documentation](#documentation)
+[The approach](#the-approach) / [Agent payments](#agent-payments) / [Runtime flow](#runtime-flow) / [Offline boundaries](#offline-boundaries) / [Run locally](#run-locally) / [API](#api)
+
+## The Approach
+
+**Delegate within a boundary, rather than trust an agent with the control panel.** Owners create a mandate: approved recipients, currency, a per-payment limit, a total budget and an expiry. Agents receive their own scoped, revocable credentials, never the owner's login or server keys.
+
+An owner can require approval for every exact request, or grant advance permission for payments within a fixed budget. These are different forms of consent: a budgeted payment does not imply that a human acknowledged it again at execution time. Agents cannot use approval to override the mandate or expand its limits.
+
+For example, an invoice assistant may be allowed to pay specified suppliers within an owner-defined allowance. A proposal for another recipient is denied; parallel requests cannot exceed the remaining mandate budget; a retry cannot debit the wallet twice. Revocation prevents subsequent authorized execution, but does not reverse money already committed.
+
+| Owner concern | Rail's implemented response |
+| --- | --- |
+| An agent spends outside its assignment | Separate credentials, fixed recipients/currency, bounded amounts and expiring mandates. |
+| An agent skips an approval or rewrites restrictions | Exact-request decisions, owner-only management endpoints and database guards against ordinary policy rewrites. |
+| Concurrent requests or retries spend more than intended | Locked budget accounting and fingerprint-bound replay inside atomic payment execution. |
+| The owner cannot see what the agent did | Owner-scoped mandate/intent APIs, wallet events and participant-only payment/risk evidence and audit proofs. |
+
+ML adds behavioural risk observations alongside these controls; it does not grant payment authority. The planned blockchain role is independently verifiable audit evidence, not a replacement for owner consent or server-side enforcement. **Current Merkle proofs are local and unanchored; protected policy/approval receipts and chain publication are still upcoming work.**
+
+Rail began with offline-aware payment orchestration. That work supplies the reliability foundation for this approach: signed authorizations, device-bound tokens, durable accounting, reconnect synchronization and recovery from repeated or interrupted requests. It is not being discarded to make agent payments the primary focus.
+
+**Current scope:** a tested engineering backend, not a licensed settlement network or production-certified payment service. PostgreSQL is the financial source of truth. Rail has no live UPI, card-network or PSP settlement connector, and cannot prevent a compromised administrator from disabling backend controls.
 
 ## What Is Implemented
 
 | Area | Current behavior |
 | --- | --- |
+| Agent control | Owner-managed identities, hashed expiring credentials, immutable authority policies and intents, permanent revocation and atomic budget consumption. |
 | Payment authority | Persisted, signed authorizations bind the transaction, wallets, amount, currency and expiry; issuance reserves available funds. |
 | Transaction safety | Execution coordinates authorization use, token accounting, wallets, ledger, risk, evidence, events and replay through one PostgreSQL transaction. |
 | Retry protection | Durable idempotency binds a key to a canonical request fingerprint and committed result; changed payloads cannot reuse that key. |
 | Offline foundation | Wallet/device/currency-bound tokens, bounded spend headroom and reconnect synchronization through the same execution engine. |
-| Agent control | Owner-managed identities, hashed expiring credentials, immutable authority policies and intents, permanent revocation and atomic budget consumption. |
 | Protected records | Required HTTP payment evidence and detailed risk records use independently keyed AES-256-GCM and HMAC-SHA256 envelopes. |
 | Risk diagnostics | Optional behavioural logistic regression, robust median/MAD anomaly assessment and bounded offline drift diagnostics. All remain shadow-only. |
 | Audit evidence | Durable pending queue, verified Merkle batches, immutable inclusion proofs and participant-only reads. Roots remain unanchored. |
@@ -291,7 +312,9 @@ Rail is a modular monolith. Keeping financial state in one transactional databas
 
 ## Remaining Work
 
-The next audit milestone is a minimal contract and an isolated durable publisher with duplicate, ambiguous-response, crash, confirmation and reorganization handling. It is not deployed today. Operator visibility/alerts, legitimate labelled datasets, reviewed risk-policy enforcement, secure mobile offline transport, external funding/refund/reversal lifecycles, provider settlement and hosted recovery acceptance remain unfinished.
+The next agent-transparency milestone is a protected authority receipt binding the mandate policy and exact approval/execution provenance to the payment. Current payment/risk commitments do not prove full policy consent. Those receipts must be incorporated into audit batches before claiming blockchain-verifiable owner controls.
+
+After that, the chain milestone is a minimal contract and an isolated durable publisher with duplicate, ambiguous-response, crash, confirmation and reorganization handling. Neither is deployed today. An owner control panel/SDK, stronger owner authentication, operator visibility/alerts, legitimate labelled datasets, reviewed risk-policy enforcement, secure mobile offline transport, external funding/refund/reversal lifecycles, provider settlement and hosted recovery acceptance remain unfinished.
 
 Historical accounting issues require reviewed evidence, not inferred opening balances. Database owners can bypass triggers, so least-privilege runtime roles matter. Production key custody/restore, retention, capacity testing and compliance review are not supplied by passing fixtures. There is no claim of zero vulnerabilities, proven fraud accuracy or production readiness.
 

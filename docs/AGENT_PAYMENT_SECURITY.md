@@ -4,6 +4,8 @@
 
 Rail is a payment authorization and execution backend for owner-controlled AI agents and humans. It does not run a language model or assume that an agent's reasoning is trustworthy. Any software agent can submit a request; deterministic server-side policy decides whether it has authority to execute it.
 
+The public positioning is: "Let agents handle the task. Keep the owner in control of the payment." An agent prompt is not the enforcement boundary. Stored authority and transactional accounting are. This is not a claim that Rail prevents every agent compromise or operator backdoor.
+
 Human transfers retain their existing authenticated authorization path. Agent transfers use separate credentials and mandates, then share the same atomic financial engine. Offline token/device bindings remain supported; agent execution itself is online-only.
 
 ## Authority Boundaries
