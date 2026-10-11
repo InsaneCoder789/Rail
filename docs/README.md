@@ -1,694 +1,295 @@
+![Rail: Payments with permission. Offline-aware, retry-safe, owner-controlled.](assets/rail-banner-v2.png)
+
 # Rail
 
-Rail is an offline-capable payment orchestration service built to explore how a fintech backend can safely handle authorization, offline headroom, replay-safe execution, and reconnect-time synchronization.
+**A payment control and execution backend for people and owner-approved software agents.**
 
-In practical terms, Rail is a payment control and execution backend. It is designed to sit between an application experience and the underlying money-movement rails, where it can enforce authorization rules, protect retries, coordinate offline-capable flows, and keep payment state observable.
+[![Rail CI](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml/badge.svg)](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](../LICENSE)
 
-The project is intentionally positioned as a control and execution layer, not as a bank settlement rail. It does not replace UPI, card networks, or PSP settlement systems. Instead, it focuses on the part of the problem where a backend must:
+Rail started with a question: how should a payment backend behave when connectivity disappears, requests repeat, or a process fails halfway through a transfer?
 
-- issue bounded authorization to spend
-- reserve funds before final execution
-- support offline-capable payment initiation
-- process retries safely
-- replay queued offline transactions consistently
-- record ledger activity and emit operational events
+The answer is not another transfer endpoint. It is a controlled execution path: permission before spending, durable accounting, one committed result for an identical retry, and evidence of what actually happened. Rail now applies the same foundation to delegated agent payments, with owner-defined recipients, budgets, expiry and exact-request approvals.
 
-The HTTP application requires PostgreSQL for authentication, wallet accounting, replay protection and events. Memory components remain available for isolated tests and examples, not as an alternate payment-server runtime.
+**PostgreSQL is the financial source of truth. ML supplies shadow risk observations, not spending authority. Audit proofs establish local inclusion, not bank settlement.** Rail does not replace UPI, card networks or PSPs, and has no live settlement connector. It is an engineering project with tested internal guarantees and explicit production-release gates.
 
-The current `main` branch focuses on transaction safety, explainable architecture and security-conscious backend design. The [V1 acceptance record](V1_SIGN_OFF.md) distinguishes verified demonstration behavior from outstanding data and production-release gates.
+[Runtime flow](#runtime-flow) / [Offline boundaries](#offline-boundaries) / [Agent payments](#agent-payments) / [Run locally](#run-locally) / [API](#api) / [Documentation](#documentation)
 
-**Repository:** [github.com/InsaneCoder789/Rail](https://github.com/InsaneCoder789/Rail)
+## What Is Implemented
 
+| Area | Current behavior |
+| --- | --- |
+| Payment authority | Persisted, signed authorizations bind the transaction, wallets, amount, currency and expiry; issuance reserves available funds. |
+| Transaction safety | Execution coordinates authorization use, token accounting, wallets, ledger, risk, evidence, events and replay through one PostgreSQL transaction. |
+| Retry protection | Durable idempotency binds a key to a canonical request fingerprint and committed result; changed payloads cannot reuse that key. |
+| Offline foundation | Wallet/device/currency-bound tokens, bounded spend headroom and reconnect synchronization through the same execution engine. |
+| Agent control | Owner-managed identities, hashed expiring credentials, scoped permissions, spending mandates, immutable intents and atomic budget consumption. |
+| Protected records | Required HTTP payment evidence and detailed risk records use independently keyed AES-256-GCM and HMAC-SHA256 envelopes. |
+| Risk diagnostics | Optional behavioural logistic regression, robust median/MAD anomaly assessment and bounded offline drift diagnostics. All remain shadow-only. |
+| Audit evidence | Durable pending queue, verified Merkle batches, immutable inclusion proofs and participant-only reads. Roots remain unanchored. |
+| Event delivery | Transactional outbox with leases, retries, acknowledgement and dead letters; wallet-scoped REST history and advisory SSE on persistent servers. |
+| Operational checks | Accounting reconciliation, authorization expiry cleanup, bounded request parsing and shared source/identity quotas. |
 
-
-<img width="1752" height="897" alt="image" src="https://github.com/user-attachments/assets/343a760c-a171-4fa7-b06c-35b03984ee89" />
-
-
-
----
-
-## What Rail Does
-
-At a high level, Rail supports the following flow:
-
-1. A user authenticates and is mapped to a wallet.
-2. The sender requests a payment authorization.
-3. Rail reserves the sender’s funds and persists an authorization record.
-4. For offline use cases, Rail can issue a device-bound offline token with limited spend headroom.
-5. A payment is executed through validation and prechecks; authorization, wallets, offline headroom, ledger, events and replay results commit in one PostgreSQL transaction.
-6. If the device was offline, queued transactions can later be replayed through the sync endpoint using the same stored authorization model.
-7. The backend emits wallet-visible events for dashboards and operational visibility.
-
-That makes Rail more than a simple transfer API. It behaves like a controlled payment runtime with explicit lifecycle state, replay protection, offline-aware constraints, and ledger-visible execution.
-
-### What Offline Means Here
-
-Rail supports preissued authority, device-bound spend headroom and reconnect-time processing of queued requests. Server-side verification and final ledger posting require connectivity to Rail. The `nfc`, `ble` and `qr` channel values model payment inputs; this repository does not implement the mobile transport, secure device storage or a protocol proving final settlement while both devices are disconnected. A queued offline attempt must not be displayed as confirmed settlement.
-
-No-internet UPI through USSD or voice is a different mechanism: it still reaches a payment service over a telecom network. Rail has no bank, NPCI, USSD or IVR connector today. Its useful upgrade path is enforceable delegated authority and recovery, not claiming to replace those networks.
-
----
-
-## Why This Project Exists
-
-Most payment demos stop at a simple request-response transfer. Rail goes further and models the harder problems that show up in real financial systems:
-
-- offline-capable payment initiation
-- bounded spend headroom
-- authorization lifecycle tracking
-- retry safety and anti-replay controls
-- transaction-aware ledger posting
-- event-driven visibility into execution state
-
-The goal of the project is not to claim production readiness. The goal is to build a system that demonstrates real fintech backend thinking in a way that is technically serious, explainable, and extensible.
-
----
-
-## Current Architecture
-
-```mermaid
-flowchart LR
-  Client["Client / Frontend / Device"]
-  Auth["Auth Routes\nregister / login / logout-all"]
-  Authorize["Authorize Route\nreserve funds + persist authorization"]
-  Token["Offline Token Route\nissue device-bound headroom"]
-  Execute["Execute Route\nvalidate + idempotent pipeline run"]
-  Sync["Sync Route\nreplay queued offline transactions"]
-  Events["Event Routes\nrecent events + SSE stream"]
-
-  Engine["PaymentPipelineEngine"]
-  Validation["Validation Stage"]
-  Prechecks["Parallel Prechecks\nsignature + risk"]
-  Commit["Single PostgreSQL Transaction"]
-
-  Wallets[("wallets")]
-  Authorizations[("authorizations")]
-  Tokens[("rail_offline_tokens")]
-  Idempotency[("rail_idempotency")]
-  Ledger[("ledger_entries")]
-  Outbox[("outbox")]
-
-  Client --> Auth
-  Client --> Authorize
-  Client --> Token
-  Client --> Execute
-  Client --> Sync
-  Client --> Events
-
-  Authorize --> Authorizations
-  Authorize --> Wallets
-  Token --> Tokens
-
-  Execute --> Engine
-  Sync --> Engine
-
-  Engine --> Idempotency
-  Engine --> Validation
-  Engine --> Prechecks
-  Engine --> Commit
-
-  Commit --> Wallets
-  Commit --> Authorizations
-  Commit --> Tokens
-  Commit --> Ledger
-  Commit --> Outbox
-  Commit --> Idempotency
-```
-
----
-
-## Payment Flow
-
-The most important design decision in the current system is that payment execution is authorization-first.
-
-### Authorization flow
-
-When a sender requests authorization:
-
-- identity is checked using JWT or API key
-- sender and receiver details are validated
-- sender funds are reserved
-- an authorization record is persisted
-- a signed authorization object is returned
-
-The key improvement here is that authorization is no longer just a client-carried signed blob. The server keeps a durable source of truth in PostgreSQL and tracks authorization status over time.
-
-### Execute flow
-
-When a payment is executed:
-
-- the request is authenticated
-- the transaction is validated
-- the stored `authorizationId` is loaded and matched against the transaction
-- the idempotency layer protects retries
-- the pipeline runs validation and prechecks using a single durable payment transaction
-- the authorization is claimed inside the payment transaction
-- the sender reservation is consumed
-- the receiver balance is credited
-- ledger rows are written
-- ledger entries, execution fingerprints, replay results and outbox events commit with the wallet changes
-
-### Sync flow
-
-When offline transactions reconnect:
-
-- sync accepts offline transactions only
-- each transaction must include `authorizationId`
-- each transaction must use the same outer `deviceId`
-- transactions are validated against stored authorization state before execution
-- the same engine path is reused instead of inventing a separate replay system
-
-That keeps offline replay consistent with direct execution instead of making it a weaker side path.
-
----
+The latest backend verification passed **244 tests with zero failures or skips**, including real PostgreSQL integration tests, on 12 October 2026. The badge links to live CI results; that local count is not a statement that every future revision or deployment has passed. The suite includes concurrent requests, response-loss recovery, backend termination, tampering, revocation races and failed final commits.
 
 ## Runtime Flow
 
+The HTTP layer authenticates the caller and validates the request. The engine and persistence layer enforce the financial invariants again inside the transaction; correctness does not depend on a route handler having remembered every check.
+
 ```mermaid
 flowchart TD
-  A["POST /v1/payments/authorize"] --> B["Reserve sender funds"]
-  B --> C["Persist authorization record"]
-  C --> D["Return signed authorization"]
-
-  D --> E["POST /v1/payments/execute"]
-  E --> F["Load stored authorization"]
-  F --> G["Idempotency check"]
-  G --> H["Pipeline validation"]
-  H --> I["Parallel prechecks"]
-  I --> J["Claim authorization in DB transaction"]
-  J --> K["Consume reserved funds"]
-  K --> L["Credit receiver"]
-  L --> M["Write ledger entries"]
-  M --> N["Insert durable outbox events"]
-  N --> O["Store execution + replay result"]
-  O --> P["Commit once; rollback all effects on failure"]
+    Caller["Person / application / trusted service"] --> Gate["Source quota, authentication and identity quota"]
+    Gate --> Authorize["Authorize exact transfer and reserve funds"]
+    Authorize --> Execute["Execute with authorization ID and idempotency key"]
+    Sync["Reconnect: queued offline requests"] --> Execute
+    Agent["Approved agent intent"] --> Execute
+    Execute --> Transaction["One PostgreSQL execution transaction, including replay check"]
+    Transaction --> Replay{"Matching committed replay?"}
+    Replay -->|Yes| Original["Commit replay transaction; return original result without another transfer"]
+    Replay -->|No| Checks["Claim authority, lock wallets, check offline bindings and collect trusted risk features"]
+    Checks --> Writes["Wallets, ledger, protected records, outbox, replay and audit pending job"]
+    Writes --> Commit{"Final commit succeeds?"}
+    Commit -->|Yes| Receipt["Return accepted internal payment receipt"]
+    Commit -->|No| Rollback["Roll back execution effects; retry or resolve the error"]
+    Receipt --> Workers["Separate event-delivery and audit-batching jobs"]
 ```
 
----
+### Authorization and Accounting
 
-## Main Features
+Amounts are validated integer minor units: INR 300 is `30000`, not a floating-point `300.00`. In Rail, wallet `balance` means available funds and `reserved` means held funds.
 
-| Area | Current behavior |
-|---|---|
-| Authentication | User registration, password hashing, JWT login, wallet resolution |
-| Authorization | Durable authorization lifecycle with reserve-before-execute behavior |
-| Offline tokens | Device-bound spend headroom with expiry and remaining balance tracking |
-| Execution pipeline | Validation, bounded prechecks and one atomic financial/replay commit |
-| Sync replay | Offline-only batch replay with stored `authorizationId` enforcement |
-| Idempotency | PostgreSQL-backed in the HTTP application; bounded memory store for isolated tests |
-| Event visibility | Authenticated wallet-scoped events via REST and SSE |
-| Rate limiting | Route-specific limits for login, authorize, execute, sync, and token issue |
+| Example: INR 1,000 available, authorize INR 300 | Available | Reserved |
+| --- | --- | --- |
+| Before authorization | 1,000 | 0 |
+| Authorization issued | 700 | 300 |
+| Payment executed | 700 | 0 |
+| Unused authorization expires instead | 1,000 | 0 |
 
----
+Execution credits the receiver and posts a matching debit/credit ledger pair. Database uniqueness, foreign keys, immutable posted history and deferred commit guards complement application validation. Reconciliation checks recorded accounting baselines, ledger movements and reservations in a consistent snapshot.
 
-## Project Status
+Ordinary authorization creation precedes the execution transaction. Failed execution restores the state at execution start; it does not erase that earlier reservation. Retry or expiry resolves it. Agent execution composes authorization creation into its larger transaction with the intent and budget writes.
 
-Development continues directly on `main`. Agent execution and trusted behavioural observations now build on the protected payment foundation. The optional logistic model remains shadow-only; no model can override financial authority. Offline initiation and reconnect synchronization remain part of the system. See [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) for open findings and [V2_TECHNICAL_GUIDE.md](./V2_TECHNICAL_GUIDE.md) for implementation details.
+### Retry and Crash Recovery
 
-Salted Merkle commitments and inclusion proofs provide a tested foundation for future audit anchoring. Blockchain publication and durable audit storage are not yet implemented.
+The canonical fingerprint includes transaction and authorization IDs, wallets, amount, currency, channel, offline bindings, creation time and idempotency key. Versioned JSON encoding avoids ambiguous delimiter-based signatures.
 
-The project has already gone through several important improvements:
+- Same key and canonical payment: return the stored committed result.
+- Same key with changed payment data: reject the request.
+- Concurrent identical requests: coordinate through transaction-scoped database locks.
+- Failure before commit: execution effects and replay writes roll back together.
+- Commit succeeds but the response is lost: retry the original payload/key to recover its result.
 
-- Phase 1 introduced persisted authorization lifecycle management and transactional reserve-plus-issue behavior.
-- Phase 2 aligned sync replay with the same stored-authorization model used by direct execution.
-- Security hardening added stricter JWT behavior, protected event access, fail-closed API-key routes, cleaner auth responses, and route-specific rate limiting.
-- The HTTP layer was refactored so `src/server/server.ts` remains the bootstrap entrypoint while route families and shared concerns live in focused modules.
+This is an effectively-once internal financial effect, not a promise of exactly-once network delivery. Never change the key merely because a response timed out.
 
-For the full technical history, architecture notes, and file-by-file source map, see [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS_REPORT.md).
+## Offline Boundaries
 
----
+Rail preserves its original offline-aware scope. A privileged service can issue a bounded token while online; later synchronization validates wallet, device, currency, token headroom and stored authorization before posting a payment. Token reservations/finalization share the financial transaction and cannot be refunded repeatedly through rollback.
 
-## Tech Stack
+The important boundary: **a token is not a blanket permission to spend, and an offline attempt is not confirmed settlement.** Exact payment authorizations must already exist and remain usable. Sync accepts offline channels only, checks the outer device binding, and processes items in order with individual outcomes rather than one all-or-nothing batch commit.
 
-- Node.js
-- TypeScript
-- PostgreSQL
-- `pg`
-- `bcryptjs`
-- `jsonwebtoken`
-- Server-Sent Events for live event streaming
+`nfc`, `ble` and `qr` are supported transaction channel values. This repository does not implement mobile transport, secure device storage, hardware attestation or a protocol proving final settlement while both devices are disconnected. Device-ID matching is a backend binding, not proof that a physical device is uncompromised. There is no NPCI, USSD, IVR or bank connector.
 
----
+## Agent Payments
 
-## Requirements
+An agent receives its own scoped credential, not the owner's login or a server encryption key. Owners manage agents using a current user JWT. Random credentials are stored as hashes, expire and can be revoked; proposal-only credentials cannot execute payments.
 
-- Node.js 20 or newer
-- npm
-- PostgreSQL 14 or newer for durable mode
-- Docker is optional if you want a local Postgres container
+```mermaid
+flowchart LR
+    Owner["Owner"] --> Mandate["Recipient, currency, payment limit, total budget and expiry"]
+    Mandate --> Proposal["Agent proposes an immutable intent"]
+    Proposal --> Mode{"Mandate mode"}
+    Mode -->|approval_required| Review["Owner decision bound to exact fingerprint"]
+    Mode -->|budgeted| Preapproval["Preapproval within existing policy"]
+    Review --> Authority["Recheck live credential, agent, mandate, expiry and funds"]
+    Preapproval --> Authority
+    Authority --> Commit["Commit payment, spent budget, executed intent and audit together"]
+```
 
----
+Pending/approved intents hold mandate budget, not wallet funds. Execution consumes that held policy allowance only with the committed payment. Expiry, rejection and revocation release unexecuted holds; they do not restore already spent budget. Approvals cannot override recipient/currency/budget restrictions, and changing a request invalidates its fingerprint. Agent execution is online-only and requires explicit `payments:execute` scope. Fresh execution and agent replay both check live authority.
 
-## Getting Started
+## Risk and Protected Evidence
 
-### 1. Clone and install
+### Explainable Intelligence, Without Payment Authority
+
+Trusted behavioural observations use committed wallet history and persisted agent exposure inside the financial transaction. History is bounded to a 30-day window and up to 1,000 samples. Features include recent velocity, amount deviation, recipient familiarity, budget exposure and explicit missing-history indicators; verified device-change detection is not implemented.
+
+The expanded logistic model uses ten vector entries including its intercept. Training supports chronological training/validation/test splits, label-availability guards, artifact provenance and held-out calibration/ranking metrics. An optional median/MAD reference baseline measures unusualness alongside logistic inference. Offline drift checks report aggregate distribution changes and insufficient-data states.
+
+Models are optional and validated before runtime startup. Wrong currency, future cutoffs and insufficient anomaly history produce explicit unavailable states rather than invented certainty. Detailed predictions remain encrypted; completed replay retains the original observation. A `review` reason is a shadow diagnostic, not an enforced challenge. Synthetic fixtures demonstrate mechanics, not real-world fraud accuracy. No default production model, automatic retraining or live drift scheduler is supplied.
+
+### Confidentiality and Integrity
+
+The HTTP runtime requires separate payment-evidence and risk-record key rings. AES-256-GCM protects the records; independently keyed HMAC-SHA256 authenticates each versioned envelope. Trusted transaction/purpose bindings reject records attached to the wrong payment. Retained key versions support verification after rotation; missing keys or tampering return unavailable verification, not a successful audit.
+
+These are server-side symmetric keys, not client signing credentials or public-key signatures. GCM already authenticates ciphertext; the separate HMAC adds an explicit envelope-verification layer. Incoming transaction HMAC enforcement is a distinct configurable check. Relational financial fields, pending intents and remaining lifecycle events are not encrypted by these evidence envelopes. KMS/HSM custody and independently verified production restore remain release gates.
+
+## Audit Proofs
+
+```mermaid
+flowchart LR
+    Evidence["Protected evidence committed with payment"] --> Pending["Durable pending audit job"]
+    Pending --> Verify["Authenticate selected payment and required risk records"]
+    Verify --> Batch["Build bounded Merkle root and proofs"]
+    Batch --> Store["Atomically persist immutable membership and consume jobs"]
+    Store --> Participant["Participant-only locally verified inclusion proof"]
+    Store -. "Future work, not deployed" .-> Chain["Independent chain publication and finality tracking"]
+```
+
+The finite `audit:batch` worker handles 1-256 pending records per run, default 128. It does not run inside a payment request. Missing historical keys or corrupt records stop batching instead of silently omitting evidence. Participant reads disclose only that payment's commitments, inclusion path and batch metadata after verification.
+
+**Current proof status is local-only and unanchored.** No contract, signer, publisher, finality/reorg tracker or independent checkpoint has been implemented. Inclusion does not establish complete historical coverage, truthful original inputs or external settlement.
+
+## Run Locally
+
+The HTTP application requires PostgreSQL; memory components are isolated test/library utilities, not another server mode. CI covers Node.js **22 and 24** with **PostgreSQL 16**. Use a development database, npm, and optionally Docker Compose.
+
+### 1. Install and Start PostgreSQL
 
 ```bash
 git clone https://github.com/InsaneCoder789/Rail.git
 cd Rail
-npm install
+npm ci
+docker compose up -d postgres
 ```
 
-### 2. Configure environment
+Docker Compose uses `rail` / `rail_dev_password` and database `rail` on port 5432. Those are local development credentials only. If using another PostgreSQL instance, configure its connection string instead.
 
-Create a `.env` file from the project example and fill in the values you want to use.
+### 2. Configure Private Runtime Values
 
-At minimum, a serious local run should define:
+Copy `.env_example` to `.env` only if you do not already have a local configuration. Replace its demonstration secrets; they are not suitable runtime keys. At minimum configure:
 
-```bash
+```dotenv
 PORT=8787
-DATABASE_URL=postgres://rail:rail_dev_password@127.0.0.1:5432/rail
-JWT_SECRET=replace_this_with_a_real_secret
-RAIL_SIGNING_SECRET=replace_this_with_a_real_secret
-RAIL_API_KEY=replace_this_with_a_real_secret
-RAIL_EVIDENCE_KEY_RING=<private JSON key ring; see DEPLOYMENT.md>
-RAIL_RISK_RECORD_KEY_RING=<separate private JSON key ring; see DEPLOYMENT.md>
+DATABASE_URL=postgresql://rail:rail_dev_password@127.0.0.1:5432/rail
+JWT_SECRET=<independent securely generated secret>
+RAIL_SIGNING_SECRET=<independent securely generated secret>
+RAIL_API_KEY=<independent securely generated service key>
+RAIL_API_KEY_SCOPES=offline_tokens:issue,sync:write
+RAIL_ALLOWED_ORIGINS=http://localhost:3000
+RAIL_TRUST_PROXY_HEADERS=false
+RAIL_EVIDENCE_KEY_RING=<private payment key-ring JSON>
+RAIL_RISK_RECORD_KEY_RING=<independent private risk key-ring JSON>
 ```
 
-### 3. Start PostgreSQL
+Angle-bracket values are placeholders, not runnable configuration. Generate independent random secrets, for example with `openssl rand -base64 32`. Each key ring needs its own 32-byte AES key and different 32-byte HMAC key encoded as base64; use the JSON shape and rotation procedure in [DEPLOYMENT.md](DEPLOYMENT.md). Agent execution requires a signing secret with at least 32 non-padding characters. Never commit secrets, print them in CI or distribute server keys to clients. No model artifact is required to start the server.
 
-If you are using Docker:
-
-```bash
-docker compose up -d
-```
-
-### 4. Start the server
+### 3. Migrate, Start and Check Liveness
 
 ```bash
+npm run migrate
 npm run server
 ```
 
-### 5. Check health
+In another terminal:
 
 ```bash
 curl -s http://127.0.0.1:8787/health
 ```
 
-Example response:
+Local startup can also initialize the schema; explicit migrations are the release step for hosted runtimes. `/health` reports liveness/configuration, not database readiness, reconciliation acceptance or settlement. Registration creates a zero-funded wallet. Do not edit balances to manufacture funds: the external funding/reversal lifecycle is unfinished.
 
-```json
-{
-  "ok": true,
-  "service": "rail",
-  "persistence": "postgresql",
-  "offline": {
-    "tokenIssue": "POST /v1/offline/tokens/issue",
-    "execute": "POST /v1/payments/execute",
-    "sync": "POST /v1/sync/transactions"
-  }
-}
+### 4. Test or Demonstrate Safely
+
+```bash
+DATABASE_URL=postgresql://rail:rail_dev_password@127.0.0.1:5432/rail npm test
+RAIL_DEMO_MODE=true RAIL_REQUIRE_TX_SIGNATURE=false npm run demo
 ```
 
-### PostgreSQL Is Required
+Use development credentials with schema create/drop permissions for integration tests and the demo, not production runtime credentials. PostgreSQL tests skip if `DATABASE_URL` is absent, so a passing unit-only run is not full integration verification. The demo requires a non-production environment, `DATABASE_URL` and `RAIL_SIGNING_SECRET`. Its signature override applies only to that isolated invocation, not the running HTTP server.
 
-The server refuses startup if `DATABASE_URL` is missing or blank. It does not start an incomplete in-memory application. Memory idempotency and offline-token components can still be tested independently. `/health` is a process-liveness/configuration response, not proof of database readiness, successful reconciliation or external settlement; production verification must check those separately.
+The demo creates a fresh temporary schema, seeds synthetic opening funds, authorizes and executes an online payment, repeats it, checks balances/reconciliation, then removes only its own schema. It demonstrates the core financial/replay path; it does not exercise every protected V2 HTTP feature or an external settlement provider. The complete test suite covers those implemented V2 integrations separately.
 
----
+## API
 
-## Environment Variables
+JSON writes require `Content-Type: application/json` by default. Use credentials in headers, never query strings. User JWTs map to their stored wallet and credential version; database wallet API keys are a separate existing mechanism. The configured privileged service key is not a user's wallet credential and must stay on a trusted backend.
 
-| Variable | Purpose |
-|---|---|
-| `PORT` | HTTP port. Default `8787`. |
-| `DATABASE_URL` | Required for the HTTP application's PostgreSQL-backed persistence. |
-| `RAIL_API_KEY` | Shared secret for restricted routes such as offline token issue and sync. |
-| `KYLR_API_KEY` | Legacy alias if `RAIL_API_KEY` is not set. |
-| `JWT_SECRET` | JWT signing and verification secret. |
-| `RAIL_SIGNING_SECRET` | HMAC signing secret for transaction and authorization integrity helpers. |
-| `RAIL_EVIDENCE_KEY_RING` | Required HTTP-runtime JSON key ring for AES-256-GCM evidence and separate HMAC authentication. See the rotation/setup procedure in `DEPLOYMENT.md`. Never send it to clients. |
-| `RAIL_RISK_RECORD_KEY_RING` | Required independent AES-256-GCM/HMAC key ring for detailed risk records. Reusing material from any configured payment-evidence version is rejected. Never send it to clients. |
-| `RAIL_ALLOWED_ORIGINS` | Comma-separated frontend origins allowed by CORS. Localhost development origins are used by default when unset. |
-| `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
-| `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
-| `RAIL_BEHAVIOUR_MODEL_PATH` | Optional expanded `behaviour-v1` artifact. Uses trusted historical features after financial locks; takes precedence over the legacy model, remains shadow-only. |
-| `RAIL_ANOMALY_MODEL_PATH` | Optional `behaviour-anomaly-v1` reference-distance artifact. Runs alongside logistic inference with sufficient trusted history; detailed scores remain encrypted and shadow-only. |
-| `RAIL_AUDIT_BATCH_SIZE` | Maintenance-command batch size, 1-256 (default 128). Does not schedule work or enable chain publication. |
-| `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
-| `RAIL_REQUEST_BODY_TIMEOUT_MS` | Absolute body-read deadline for JSON routes. Default 10000 ms; slow/stalled uploads receive 408. |
-| `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
-| `RAIL_RATE_LIMIT_LOGIN_MAX` | Login attempts allowed in the configured login window. |
-| `RAIL_RATE_LIMIT_LOGIN_WINDOW_MS` | Login rate-limit window in milliseconds. |
-| `RAIL_RATE_LIMIT_AUTHORIZE_MAX` | Authorization requests allowed in the configured authorize window. |
-| `RAIL_RATE_LIMIT_AUTHORIZE_WINDOW_MS` | Authorization rate-limit window in milliseconds. |
-| `RAIL_RATE_LIMIT_EXECUTE_MAX` | Execute requests allowed in the configured execute window. |
-| `RAIL_RATE_LIMIT_EXECUTE_WINDOW_MS` | Execute rate-limit window in milliseconds. |
-| `RAIL_RATE_LIMIT_SYNC_MAX` | Sync requests allowed in the configured sync window. |
-| `RAIL_RATE_LIMIT_SYNC_WINDOW_MS` | Sync rate-limit window in milliseconds. |
-| `RAIL_RATE_LIMIT_TOKEN_ISSUE_MAX` | Offline-token issue requests allowed in the configured token window. |
-| `RAIL_RATE_LIMIT_TOKEN_ISSUE_WINDOW_MS` | Offline-token issue rate-limit window in milliseconds. |
-| `RAIL_AUTH_SWEEP_INTERVAL_MS` | Interval for expired authorization cleanup. |
-| `RAIL_PKCS11_MODULE_PATH` | Unsupported: setting it fails startup. |
-| `RAIL_KMS_KEY_ID` | Unsupported: setting it fails startup. |
-
----
-
-## API Overview
-
-### Owner-Controlled Agent Payments (V2.1)
-
-These endpoints configure agent identities, spending policy and exact-request approvals, then execute approved online wallet transfers through the existing protected engine. Owner management requires a user JWT, not a wallet/service API key or agent credential. All owner control reads/writes share a PostgreSQL-backed limit of 20 requests per minute per owner, independent of source IP or agent ID. This is internal wallet accounting, not a live UPI or bank settlement connector.
-
-| Endpoint | Purpose |
+| Method and endpoint | Purpose / authority |
 | --- | --- |
-| `POST /v2/agents` | Create an owned agent using `{ "name": "Invoice assistant" }`. |
-| `GET /v2/agents` | List the owner's agents. |
-| `POST /v2/agents/:agentId/revoke` | Permanently revoke the agent through the API and revoke its credentials/mandates. Send `{}`. |
-| `POST /v2/agents/:agentId/credentials` | Issue a random credential with optional `ttlSeconds` and explicit `scope`; its token is returned once. |
-| `GET /v2/agents/:agentId/credentials` | List credential metadata without tokens or hashes. |
-| `POST /v2/agents/:agentId/credentials/:credentialId/revoke` | Revoke one credential. Send `{}`. |
-| `POST /v2/agents/:agentId/mandates` | Create a bounded, recipient-specific policy. |
-| `GET /v2/agents/:agentId/mandates` | List policies and their active/expired/revoked status. |
-| `POST /v2/agents/:agentId/mandates/:mandateId/revoke` | Revoke one policy. Send `{}`. |
-| `GET /v2/agent/identity` | Validate an agent token in `Authorization: Bearer <token>`; limited to 30 requests/minute per request source. |
-| `POST /v2/agent/intents` | Propose a fingerprint-bound request using an agent credential; reserve mandate budget, not wallet funds. |
-| `GET /v2/agent/intents` | List that agent's retained intents and release elapsed holds. |
-| `POST /v2/agent/intents/:intentId/execute` | Execute an approved intent with an execution-scoped credential and its exact fingerprint. |
-| `GET /v2/agents/:agentId/intents` | Owner-only approval queue and retained history. |
-| `POST /v2/agents/:agentId/intents/:intentId/decision` | Owner-only `approve` or `reject` decision bound to `requestFingerprint`. |
-
-Credential scope defaults to `payments:propose`, which cannot execute payments. The owner must explicitly request `payments:execute` to grant execution authority; existing credentials are not upgraded by migration. Execution credentials can also propose and inspect intents. Issuance and execution fail closed unless the engine supports durable transactional replay and required evidence, and `RAIL_SIGNING_SECRET` contains at least 32 non-padding characters after trimming. Use securely generated material, not a human password. Default expiry is 24 hours; supplied lifetimes must be 60 seconds to 30 days. Only a SHA-256 hash of the 256-bit random token is persisted. Capture the one-time token response securely, never in browser storage or application logs. If the response is lost, inspect credential metadata, revoke that credential and issue a replacement; issuance itself is not an idempotent payment operation.
-
-Example mandate body:
-
-```json
-{
-  "mode": "budgeted",
-  "currency": "INR",
-  "perPaymentLimitMinor": 2500,
-  "totalBudgetMinor": 10000,
-  "allowedReceiverWalletIds": ["receiver_wallet"],
-  "ttlSeconds": 86400
-}
-```
-
-`approval_required` is the other supported mode. Amounts use minor units, the per-payment limit cannot exceed the total budget, and 1-20 distinct receivers must already exist in the owner's currency. Self-payment policies are rejected. Intents start `pending` in approval-required mode and `approved` under a budgeted mandate. Approval cannot override the policy. Neither creating a policy nor approving an intent reserves wallet funds. There is no unrestricted mode. `executionEnabled` describes runtime/state capability, not proof of credentials, funds or permission; execution rechecks them transactionally.
-
-Example proposal to `POST /v2/agent/intents`:
-
-```json
-{
-  "mandateId": "<mandate UUID>",
-  "clientRequestId": "invoice_request_001",
-  "receiverWalletId": "receiver_wallet",
-  "amountMinor": 2500,
-  "currency": "INR",
-  "ttlSeconds": 300
-}
-```
-
-The response contains `{ "intent": { ... } }`, including the immutable `requestFingerprint`, `status`, deadline and capability flag. The owner posts `{ "decision": "approve", "requestFingerprint": "<returned fingerprint>" }` to the decision endpoint. Use `reject` to release an unexecuted hold, including a previously approved hold. Rejected/expired intents cannot be revived. Executed intents retain their receipt and consumed budget; a later rejection cannot refund money or restore budget. Inspect the returned status rather than assuming a repeated decision succeeded.
-
-`clientRequestId` is 8-128 characters and unique within an agent. Identical retries return the existing intent without another hold or a renewed deadline; a changed mandate, receiver, amount, currency or TTL returns `409`. TTL defaults to 300 seconds, accepts 60-900 seconds and is clipped to the mandate deadline. The approval fingerprint binds the exact owner, agent, mandate, recipient, amount, currency and timestamps.
-
-Pending and approved intents hold `reservedBudgetMinor`; executed intents consume `spentBudgetMinor`. PostgreSQL commit constraints require each counter to equal its corresponding intent sum, with held plus spent not exceeding `totalBudgetMinor`. This is policy headroom, not proof of available wallet money. Intent/mandate reads and intent mutations lazily release expired holds in a successful audited transaction; there is no intent expiry worker. A failed operation rolls that cleanup back. Revoking an agent or mandate releases unexecuted holds, not spent budget; revoking one credential prevents subsequent token use but does not cancel every intent belonging to the agent.
-
-Send only `{ "requestFingerprint": "<returned fingerprint>" }` to the agent execution endpoint with an execution-scoped bearer token. Extra money or recipient fields are rejected. The server constructs the transaction from the immutable intent, creates a bound authorization and signs it with the server-only HMAC secret. It uses `executeInTransaction`, `createAuthorizationInTransaction` and PostgreSQL `dedupeInTransaction` on one client. Authorization, wallet/ledger changes, evidence, replay, budget consumption, executed-intent linkage and audit events commit together. Failed work rolls back; the HTTP receipt is returned only after final `COMMIT`, including deferred checks.
-
-Successful responses contain `{ "intent": { ... }, "result": { ... } }`; the executed intent includes `paymentTxId` and `executedAt`. Concurrent retries return the original committed result without another transfer or evidence record. Live execution credentials, agent and mandate authority are required even for replay; after revocation, owners can still inspect retained history. `rail_agent:` transaction IDs and `rail_agent_intent:` replay keys are reserved for this server-generated path. Agent execution is online-only; existing device-bound offline/reconnect processing is unchanged.
-
-```mermaid
-flowchart TD
-  Owner[Owner JWT] --> Mandate[Recipient and budget policy]
-  Mandate --> Proposal[Agent proposes immutable intent]
-  Proposal --> Mode{Mandate mode}
-  Mode -->|Approval required| Decision[Owner approves exact fingerprint]
-  Mode -->|Budgeted| Approved[Approved intent with policy hold]
-  Decision --> Approved
-  Approved --> Guard[Execution credential and live authority checks]
-  Guard --> Atomic[One database transaction: payment, evidence, replay, budget and audit]
-  Atomic --> Commit{Final commit}
-  Commit -->|Success| Receipt[Committed receipt or identical replay]
-  Commit -->|Failure| Rollback[Rollback all changes; no success receipt]
-```
-
-The coordinator locks both wallets in sorted order and does not sweep unrelated expired wallet authorizations inside that lock scope. Existing authorization reads/sweeps release those reservations separately; policy headroom does not guarantee immediately available wallet funds. This implementation has local regression coverage, not hosted or real-money acceptance.
-
-Agent intent reads/writes share a PostgreSQL-backed 20/minute agent bucket across credentials and IP addresses, plus a 30/minute source bucket. Limits are 50 retained agents per owner, 100 credentials/mandates and 1,000 intents per agent, including revoked, rejected or expired rows. No automatic deletion resets these bounds. Intent bindings/history cannot be edited or deleted through normal SQL updates. Mutations and audit events commit together; failed audit writes roll changes back. Apply migrations before updating hosted API instances. Pending intent fields are relational data, not encrypted payment evidence; the AES/HMAC evidence path below applies to committed payments.
-
-### `GET /v1/payments/:txId/risk`
-
-Authenticated sender/receiver access to the payment's retained shadow assessment. The response contains observation time, policy version, explanation codes, model availability/version and synthetic-data status, not raw history, feature values or inference probabilities. Unknown and inaccessible payments both return 404. Reads use a 30/minute wallet/source bucket and `Cache-Control: no-store`. Older payments without snapshots return `legacy_unobserved`, not an invented score.
-
-New payments using the standard pipeline retain one immutable, fingerprint-bound observation in the financial transaction. Collection occurs after authority/token checks and sorted wallet locks, before posting the current payment. It uses database time and up to 1,000 prior visible payments from the last 30 days in the same wallet/currency. Truncated history is explicit; sampled five-minute velocity is a lower bound and recipient familiarity is sample-local. Cold start and missing device-verification history are not treated as proof of safety. Agent budget exposure comes from persisted held plus spent budget, not agent claims.
-
-The versioned deterministic policy reports amount deviation, velocity and budget pressure for explanation only. `review` is a shadow observation, not a suspended payment; `normal` does not mean fraud-free. Optional `RAIL_BEHAVIOUR_MODEL_PATH` enables expanded logistic inference from trusted features, with named log-odds contributions and explicit missing-history/budget indicators. The legacy amount/channel artifact remains supported. A future training cutoff returns `not_yet_valid` without silently falling back to another model. Observation writes and required-observation commit checks must succeed with payment accounting; retry returns the same snapshot rather than rescoring history.
-
-New HTTP-runtime payments encrypt detailed features, model hashes and predictions in a separate AES-256-GCM/HMAC risk envelope, bound to the payment fingerprint. Their plaintext copies are not retained in the observation table, and the old probability-bearing shadow event is suppressed. Observation time, explanation codes and model availability/version/synthetic status remain queryable; the API verifies them against the envelope before returning `protection: verified`. Missing keys or failed verification return `verification_unavailable` without the assessment. Historical plaintext observations remain explicitly `legacy_plaintext`; they are not silently encrypted or removed. Real-label validation, retention/privacy approval, monitored key recovery and production fraud enforcement remain open.
-
-`npm run risk:monitor -- /private/path/cohorts.json` compares chronological reference/current cohorts with the expanded model. It reports aggregate feature/prediction shifts and missingness, not individual transactions or fraud accuracy. Exit codes are 0 for no detected shift, 2 for detected shift, 3 for insufficient samples and 1 for invalid input. This offline diagnostic does not auto-retrain or change payments; threshold validation, independently reviewed inputs, protected risk-record retention and live operational acceptance remain required.
-
-Optional `RAIL_ANOMALY_MODEL_PATH` adds a robust reference-distance baseline alongside logistic inference. Train it with `risk:train` using a `behaviour-anomaly-v1` dataset containing chronological training, calibration and test cohorts. It learns feature medians/scales from training only and calibrates an experimental threshold on the later calibration cohort. Unusualness is not fraud probability or a payment decision. Cold start, truncated history, future artifacts and currency mismatch return explicit unavailable statuses. The API's `anomaly` summary exposes availability/version/synthetic status, not distances or contributions; those remain in the protected observation. See `V2_TECHNICAL_GUIDE.md` for the algorithm, dataset requirements and limits.
-
-### `GET /v1/payments/:txId/evidence`
-
-Authenticated sender/receiver access to committed payment evidence status. Returns `verified` with a ciphertext commitment, `legacy_unprotected` for historical payments without evidence, or `verification_unavailable` with a safe reason. Unknown and inaccessible payments both return `404`. Reads are limited to 30 per minute per wallet and request-source bucket; responses use `Cache-Control: no-store`.
-
-New HTTP-runtime payments commit AES-256-GCM evidence and independently keyed HMAC-SHA256 in the same transaction as wallet, token, ledger, event and replay state. Retries do not regenerate the evidence. This protects the canonical audit copy, not every relational field or event payload. HMAC is server-side authentication, not a public digital signature. Historical payments are not automatically backfilled, and no blockchain is deployed by this feature.
-
-### `GET /v1/payments/:txId/audit`
-
-Authenticated sender/receiver access to a payment's audit status and its own inclusion proof. Returns `pending_batch`, `batched`, `legacy_unprotected` or `verification_unavailable`. Batched responses contain the batch ID/root, this payment's leaf and ciphertext commitments, and sibling hashes/index/count; they contain no other transaction identities, raw features or encryption keys. Missing and unauthorized payments both return 404. Reads are non-cacheable with independent 30/minute wallet-wide and source quotas. Source throttling runs before authentication; changing IPs does not reset the authenticated wallet allowance.
-
-Protected evidence queues audit work inside the financial transaction. `npm run audit:batch` verifies retained payment/risk evidence and atomically persists immutable Merkle membership while consuming a bounded pending queue. Failed batching does not undo already committed payments; partial batch writes roll back and retry does not duplicate membership. Migration queues existing protected evidence without modifying ciphertext or silently protecting legacy payments.
-
-Proofs currently report `publication: unanchored` and `verification: local_only`. There is no chain contract, publisher or independent trusted checkpoint yet. Inclusion proves neither settlement nor that every payment is covered. No blockchain call runs on the payment path. Keep the maintenance command and proof data private; hosting, scheduling, key recovery and chain acceptance remain separate work.
-
-### `POST /auth/register`
-
-Creates a user and a matching wallet identity.
-
-Notes:
-
-- passwords are hashed with `bcryptjs`
-- registration is transactional
-- duplicate users return a conflict-style error instead of a generic server failure
-
-### `POST /auth/login`
-
-Authenticates a user and returns a JWT.
-
-Notes:
-
-- login failures return a generic invalid-credentials response
-- login is rate limited per IP and per account across IPs (default five attempts per 15 minutes); account identifiers are hashed in quota keys
-- successful attempts count toward the same bounded quota; this temporary throttle is not an adaptive fraud engine or permanent account lockout
-- JWTs carry the stored credential version and expire after 15 minutes; tokens issued before this versioned-token change require a fresh login
-
-### `POST /auth/logout-all`
-
-Send `Authorization: Bearer <token>`. Rail atomically increments the user's credential version, returning `{ "ok": true, "sessionsRevoked": "all" }`. Previously issued bearer tokens fail subsequent authentication across instances, including stream rechecks. The caller must log in again. This does not revoke API keys or cancel a payment already authenticated and executing; uncertain payment responses must be retried with the original idempotency key.
-
-Password recovery and operator credential resets must also increment this version. No public password-reset flow is implemented in V1; do not expose a manual database reset operation to client applications.
-
-### `POST /v1/payments/authorize`
-
-Creates a payment authorization and reserves sender funds.
-
-Expected fields:
-
-- `txId`
-- `senderWalletId`
-- `receiverWalletId`
-- `amountMinor`
-- `currency`
-
-Important behavior:
-
-- caller identity must match `senderWalletId`
-- authorization is persisted server-side
-- the authorization returned to the client corresponds to stored state
-
-### `POST /v1/offline/tokens/issue`
-
-Issues device-bound offline spend headroom while the client is online.
-
-Expected fields:
-
-- `walletId`
-- `deviceId`
-- `amountCapMinor`
-- optional `currency`
-- optional `ttlSeconds`
-
-### `POST /v1/payments/execute`
-
-Executes a single payment through the hardened pipeline.
-
-Required transaction fields include:
-
-- `txId`
-- `idempotencyKey`
-- `authorizationId`
-- `senderWalletId`
-- `receiverWalletId`
-- `amountMinor`
-- `currency`
-- `channel`
-- `createdAt`
-
-Offline transactions must also include:
-
-- `offlineTokenId`
-- `deviceId`
-
-Important behavior:
-
-- `authorizationId` must reference a stored server-issued authorization
-- transaction data must match the stored authorization
-- same-key completed retries are allowed safely
-- reused authorizations with a different request identity are blocked
-
-### `POST /v1/sync/transactions`
-
-Replays queued offline transactions in FIFO order.
-
-Rules:
-
-- sync accepts offline transactions only
-- every item must include `authorizationId`
-- every transaction `deviceId` must match the outer request `deviceId`
-- the route is API-key protected
-
-### `GET /v1/events`
-
-Returns committed wallet-visible events for the authenticated caller. Use `?limit=20` (1-100) and `?before=<nextBefore>` for older pages. The response contains `events` and `nextBefore`; each event has a stable string `id`. Wallet filtering happens in PostgreSQL before the limit, so other wallets cannot crowd out your history.
-
-Pages are ordered by database event ID, not client timestamps. Refresh the first page when reconnecting and deduplicate by ID: IDs are allocated before commit, so a page cursor is not a guaranteed live-delivery watermark. The feed is not a settlement confirmation.
-
-### `GET /v1/events/stream`
-
-Streams committed wallet-visible snapshots over SSE on persistent servers. The server polls shared PostgreSQL rows every two seconds, rechecks credentials, and closes connections after 60 seconds or on write backpressure. Admission is limited to two connections per wallet and 64 per process. Event requests are rate-limited (60 REST reads or six stream starts per minute per wallet/IP).
-
-SSE is an advisory UI feed, not a durable subscription. It samples the latest 100 wallet events and can miss bursts above that window; clients must refresh and page REST history to recover, deduplicating by event ID. `Last-Event-ID` does not provide guaranteed replay. Multi-instance deployment needs provider-level connection/resource limits as well as these local caps. Serverless runtimes use REST polling only.
-
-Frontend note:
-
-- regular clients can use `Authorization: Bearer <token>`
-- use authenticated `fetch` streaming when custom headers are required, or poll `GET /v1/events`
-- query-string credentials are not accepted; hosted serverless runtimes disable SSE
-
----
-
-## Request and Diagnostic Bounds
-
-JSON bodies are size-limited and have an absolute read deadline. Oversized requests receive 413; stalled bodies receive 408. Both responses close the connection after flushing the JSON error, rather than destroying the socket before the client can read it. Reverse proxies still need independent header, connection and upload limits.
-
-Development memory stores are bounded: idempotency retains at most 10,000 records and refuses new keys when full, never evicting successful replay results to admit another payment. The memory rate limiter caps identities and denies new ones until expired entries can be reclaimed. The memory diagnostic DLQ keeps the latest 1,000 entries and is not an audit log or delivery queue; durable delivery failures live in the PostgreSQL outbox. Database replay/token retention must be designed separately before pruning financial records.
-
-## Event Model
-
-The backend emits operational and business events that can be used for dashboards, observability, or future integrations.
-
-Examples include:
-
-- pipeline stage progression
-- pipeline failures
-- ledger-posted events
-- other wallet-relevant execution activity
-
-Current event visibility rules:
-
-- event routes require authentication
-- users only see events relevant to their wallet
-- API-key callers only see events relevant to the wallet bound to that key
-- raw `system.error` events are not exposed through the client-visible event feed
-- browser access is restricted by explicit allowed origins instead of wildcard CORS
-
----
-
-## Selected Source Layout
-
-```text
-src/
-  auth/
-    jwt.ts
-  crypto/
-    authorizationSigning.ts
-    transactionSigning.ts
-  domain/
-    authorization.ts
-    types.ts
-  persistence/
-    migrate.ts
-    postgresIdempotency.ts
-    postgresOfflineTokenStore.ts
-    postgresPool.ts
-  pipeline/
-    engine.ts
-    idempotency.ts
-    outbox.ts
-    tracing.ts
-  rail/
-    offlineTokenStore.ts
-    syncBatch.ts
-  server/
-    server.ts
-    authentication.ts
-    config.ts
-    events.ts
-    http.ts
-    types.ts
-    validation.ts
-    routes/
-      authRoutes.ts
-      eventRoutes.ts
-      paymentRoutes.ts
-  stages/
-    authorizationStage.ts
-    paymentPipeline.ts
-```
-
----
-
-## Scripts
-
-| Script | Command |
-|---|---|
-| Build | `npm run build` |
-| Tests | `npm test` |
-| Deliver outbox batch | `npm run outbox:dispatch` |
-| Release expired authorizations | `npm run authorizations:sweep` |
-| Check accounting consistency | `npm run accounting:reconcile` |
-| Train risk baseline | `npm run risk:train -- dataset.json model.json` |
-| Build a durable audit batch | `npm run audit:batch` |
-| Run server | `npm run server` |
-| Isolated demo script | `RAIL_DEMO_MODE=true npm run demo` |
-
-`RAIL_DEMO_MODE=true npm run demo` follows the authorization-first flow. It requires a non-production environment, `DATABASE_URL`, `RAIL_SIGNING_SECRET`, and database permissions to create/drop a schema. Use a development database and maintenance credentials, not production runtime credentials.
-
-Each invocation creates a random isolated schema, seeds synthetic opening funds there, creates an authorization, executes an online payment, replays the exact request and checks reconciliation. It prints acceptance results and balances, then removes only its own temporary schema and closes its pools. Repeated runs do not claim existing wallets or reuse stale payment fingerprints. This proves the internal demo flow, not external bank settlement or production readiness.
-
-Schedule `npm run authorizations:sweep` outside the API process for unattended expiry cleanup. Each run releases at most 1,000 expired reservations; repeat runs drain larger backlogs. Reads and new authorizations also reclaim expired reservations transactionally. Serverless instances do not start background timers. Keep database credentials in the scheduler's secret storage and monitor failed runs.
-
-`npm run accounting:reconcile` is read-only and exits nonzero if it finds problems. It compares available plus reserved funds with the recorded opening balance plus ledger movements, and reserved funds with issued authorizations. It also checks currency, usage, execution and replay consistency in one database snapshot. Reports are bounded; a truncated report is explicitly incomplete, not a clean result.
-
-New wallets record their initial balance; registration starts at zero. This is an accounting baseline, not proof of external funding or settlement. Historical wallets are not automatically backfilled, and money mutations without a baseline fail with `503 accounting_review_required`. An operator must review source records first. With separate maintenance credentials and `RAIL_ACCOUNTING_OPERATOR=true`, the command `npm run accounting:reconcile -- --record-opening WALLET_ID AMOUNT_MINOR EVIDENCE_REFERENCE` records an independently reviewed value once. Unresolved wallet-related findings or an incorrect balance prevent the record from committing. The reference is stored for review; Rail cannot verify the external evidence itself. Do not change wallet balances directly to add funds; a formal funding/reversal lifecycle is still unfinished.
-
----
-
-## Current Limitations
-
-This project is much stronger than a toy payment demo, but it is still honest to call out what is not finished yet.
-
-Current limitations include:
-
-- durable webhook delivery needs a scheduled worker and a receiver that deduplicates event IDs; SSE is advisory and requires REST recovery
-- API keys are still an area that can be hardened further
-- memory components are test utilities, not a supported HTTP runtime
-- no enforced fraud policy is implemented; optional ML remains in shadow mode and needs validated labeled data
-- documentation and demo flows need to be kept aligned as the project evolves
-
-These gaps are tracked more fully in [PROJECT_STATUS_REPORT.md](./PROJECT_STATUS_REPORT.md).
-
----
+| `GET /health` | Public process-liveness/configuration response. |
+| `POST /auth/register` | Create a user and a new zero-funded wallet. |
+| `POST /auth/login` | Obtain a bounded-lifetime user JWT. |
+| `POST /auth/logout-all` | Advance credential version; invalidate prior JWTs on subsequent authentication. |
+| `POST /v1/payments/authorize` | Authenticated sender requests an exact authorization and fund reservation. |
+| `POST /v1/payments/execute` | Authenticated sender executes/replays a bound transaction. |
+| `POST /v1/offline/tokens/issue` | Service key with `offline_tokens:issue` issues bounded device headroom. |
+| `POST /v1/sync/transactions` | Service key with `sync:write` processes queued offline requests. |
+| `GET /v1/payments/:txId/evidence` | Sender/receiver reads verified evidence status, not decrypted payment data. |
+| `GET /v1/payments/:txId/risk` | Sender/receiver reads authenticated explanation/model-availability summaries. |
+| `GET /v1/payments/:txId/audit` | Sender/receiver reads local inclusion proof/status. |
+| `GET /v1/events` | Wallet-filtered committed history with `limit` and `before` pagination. |
+| `GET /v1/events/stream` | Authenticated advisory SSE on persistent servers; disabled in serverless mode. |
+| `POST /v2/agents`, `GET /v2/agents` | Owner JWT creates/lists owned agents. |
+| `POST /v2/agents/:agentId/revoke` | Owner JWT revokes an agent and its credentials/mandates. |
+| `POST`, `GET /v2/agents/:agentId/credentials` | Owner JWT issues a one-time credential or lists safe metadata. |
+| `POST /v2/agents/:agentId/credentials/:credentialId/revoke` | Owner JWT revokes one credential. |
+| `POST`, `GET /v2/agents/:agentId/mandates` | Owner JWT creates/lists spending policy. |
+| `POST /v2/agents/:agentId/mandates/:mandateId/revoke` | Owner JWT revokes a mandate. |
+| `GET /v2/agent/identity` | Validate a distinct agent credential. |
+| `POST`, `GET /v2/agent/intents` | Agent proposes/lists its intents. |
+| `GET /v2/agents/:agentId/intents` | Owner JWT reads the approval queue/history. |
+| `POST /v2/agents/:agentId/intents/:intentId/decision` | Owner JWT approves/rejects the exact fingerprint. |
+| `POST /v2/agent/intents/:intentId/execute` | Execution-scoped agent submits the approved fingerprint. |
+
+An authorization request contains `txId`, `senderWalletId`, `receiverWalletId`, `amountMinor` and `currency`. Execute adds `idempotencyKey`, the returned `authorizationId`, `channel` and `createdAt`; offline execution also requires `offlineTokenId` and `deviceId`. `paymentSignature` is required when incoming HMAC enforcement is enabled. Preserve the original canonical request when retrying.
+
+For mandate/intent bodies, dataset contracts, capacities, approval modes and key behavior, see [V2_TECHNICAL_GUIDE.md](V2_TECHNICAL_GUIDE.md). Unknown routes return 404. An accepted receipt means the internal financial commit succeeded, not that a bank transfer settled.
+
+## Security and Operations
+
+PostgreSQL quotas apply independently to the request source and trusted identity. Malformed requests count; changing IP does not reset a wallet/owner/agent allowance. Token issuance and sync use a stable single configured-service allowance, not caller-selected body identifiers. Existing defaults are deliberately strict: authorize 12/minute, execute 20/minute, issue/sync 6/10 minutes per route, login 5/15 minutes. Review service-wide capacity before multi-user deployment. Allowed frontend origins can read quota and `Retry-After` headers; CORS is not authentication.
+
+Forwarded headers are trusted only through explicit configuration with a sanitizing proxy. Shared NAT clients and targeted accounts can still experience throttling. Database bucket retention and edge connection/DDoS controls are separate operational requirements. Production configuration rejects missing/weak required secrets and unsuitable frontend origins. JSON size/deadline bounds and bounded local diagnostic stores limit resource use.
+
+Outbox delivery is at least once: receivers must durably deduplicate stable delivery IDs before acknowledging. Leases/retries recover worker failure; exhausted attempts remain dead-lettered for review. SSE samples committed events with credential rechecks and bounded connections/lifetime, but can miss bursts. Recover through REST history and deduplicate IDs; SSE is not a settlement receipt or durable subscription.
+
+| Command | Responsibility |
+| --- | --- |
+| `npm run build` | Clean output and compile TypeScript. |
+| `npm test` | Compile and run unit/integration tests. |
+| `npm run migrate` | Apply database/runtime and outbox migrations. |
+| `npm run server` | Start the persistent local HTTP runtime. |
+| `npm run outbox:dispatch` | Deliver a finite batch to a configured trusted HTTPS webhook. |
+| `npm run authorizations:sweep` | Release a bounded set of expired reservations. |
+| `npm run accounting:reconcile` | Read-only accounting review; findings exit nonzero. |
+| `npm run audit:batch` | Verify and persist a finite local audit batch. |
+| `npm run risk:train -- dataset.json model.json` | Train/evaluate a supported private risk/anomaly artifact. |
+| `npm run risk:monitor -- cohorts.json` | Run bounded offline drift diagnostics. |
+
+Schedule and monitor finite maintenance commands explicitly; their existence does not install workers or alerts. The Vercel adapter reuses the same handler without starting a listener, running cold-start DDL or starting sweeps. Serverless pool sizes are configurable and SSE is disabled. A real hosted/provider acceptance run is still required; source support is not deployment verification. Follow [DEPLOYMENT.md](DEPLOYMENT.md) for cutover, independent keys, webhook configuration and recovery requirements.
+
+## Source Map
+
+| Directory | Responsibility |
+| --- | --- |
+| `src/server/` | Runtime composition, HTTP routing, authentication, validation, events and quota boundaries. |
+| `src/stages/` | Authorization lifecycle and the financial pipeline. |
+| `src/pipeline/` | Execution context, durable replay integration, tracing and bounded concurrency utilities. |
+| `src/persistence/` | Schema/invariants, durable stores, agent authority, protected records, audit batches and maintenance workers. |
+| `src/crypto/` | Canonical signing, AES-GCM/HMAC record protection and Merkle commitment helpers. |
+| `src/risk/` | Trusted features, model training/inference, anomaly assessment and offline drift checks. |
+| `src/rail/` | Token interfaces/test implementation and reconnect batch processing. |
+| `src/auth/`, `src/domain/` | JWT contracts and typed payment/authorization models. |
+| `src/demo/`, `test/` | Isolated synthetic demonstration and regression coverage. |
+| `api/`, `.github/workflows/` | Hosted adapter and CI. |
+
+Rail is a modular monolith. Keeping financial state in one transactional database avoids introducing distributed compensation before external provider side effects exist. Microservices, on-chain money and larger neural networks are not prerequisites for correctness.
+
+## Documentation
+
+- [Project status and implementation history](PROJECT_STATUS_REPORT.md): delivered changes, architecture and source details.
+- [V2 technical guide](V2_TECHNICAL_GUIDE.md): agent, intelligence and protected-record contracts.
+- [Deployment guide](DEPLOYMENT.md): configuration, migration, workers, key retention and operational boundaries.
+- [Security review](SECURITY_REVIEW.md): findings, regressions and unpassed release gates.
+- [V1 acceptance record](V1_SIGN_OFF.md): baseline verification and explicit demonstration/production boundaries.
+
+## Remaining Work
+
+The next audit milestone is a minimal contract and an isolated durable publisher with duplicate, ambiguous-response, crash, confirmation and reorganization handling. It is not deployed today. Operator visibility/alerts, legitimate labelled datasets, reviewed risk-policy enforcement, secure mobile offline transport, external funding/refund/reversal lifecycles, provider settlement and hosted recovery acceptance remain unfinished.
+
+Historical accounting issues require reviewed evidence, not inferred opening balances. Database owners can bypass triggers, so least-privilege runtime roles matter. Production key custody/restore, retention, capacity testing and compliance review are not supplied by passing fixtures. There is no claim of zero vulnerabilities, proven fraud accuracy or production readiness.
 
 ## License
 
-Licensed under AGPL-3.0-only. See [LICENSE](../LICENSE).
+Licensed under **AGPL-3.0-only**. See [LICENSE](../LICENSE) for the terms. Contributions are welcome; retain the license and applicable attribution when building on this work.
 
----
-
-## Disclaimer
-
-Rail is infrastructure software for learning, architectural exploration, and controlled backend experimentation. It does not by itself satisfy regulatory, settlement, reconciliation, or compliance requirements for real-money production deployment.
+Rail is intended for learning, controlled demonstrations and architectural development. Do not treat its internal receipts or audit proofs as evidence of licensed real-money settlement.

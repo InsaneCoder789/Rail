@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### README and Repository Banner Refresh: 12 October 2026
+
+Rebuilt `docs/README.md` around the current payment control/execution backend rather than the earlier transfer-only overview. It preserves offline-aware scope while explaining available/reserved accounting, exact authorization, atomic execution/replay, owner-controlled agents, encrypted evidence/risk, optional shadow intelligence, durable local Merkle batches and event delivery. Three Mermaid flows cover execution, agent authority and audit batching, with future chain publication visually separated. Removed the stale statement that durable audit storage is not implemented; the contract/publisher/finality and production gates remain explicitly unfinished.
+
+Setup now uses the actual `.env_example` name, locked installation, PostgreSQL 16 development container and CI-covered Node 22/24 versions. Required independent key rings, placeholder replacement, zero-funded registration, safe isolated demo boundaries, integration-test database requirements, privileged-service quotas and maintenance scheduling are documented. API/source/script maps and AGPL license links are current. The earlier [architecture banner](https://github.com/user-attachments/assets/343a760c-a171-4fa7-b06c-35b03984ee89) remains a historical reference, not current runtime documentation.
+
+Added the repository-local `docs/assets/rail-banner-v2.png`, a 1983 x 793 brand banner generated with the built-in image tool. Its full design prompt is retained in `docs/assets/rail-banner-v2.prompt.txt`. The visual says "Payments with permission" and depicts controlled coordination, not a deployed blockchain or settlement connector. No runtime code, existing secrets, environment example, private-roadmap publication or unrelated manuals changed. Private reports were updated locally and remain ignored.
+
+Verification: 244 backend tests pass, zero failures/skips, including PostgreSQL. All 18 detected link/image references were checked for applicable relative targets; npm script references and balanced code fences pass. All three Mermaid diagrams parse successfully with Mermaid 11.12.0, and final diff checks pass. Preview-only Mermaid tooling is isolated outside the repository, with no project dependency/lockfile change. The banner was visually inspected. This documentation change is not a production acceptance result or a remotely verified GitHub render.
+
 ### Independent Source and Identity Quotas: 12 October 2026
 
 Closed SEC-35's route-level quota bypass. Authorization, execution, protected risk/evidence reads, event reads/streams and agent routes now apply independent source and server-resolved identity allowances. Source limits run before authentication and body parsing; identity limits run before payload validation or expensive work. Malformed and invalid-credential attempts count rather than evading the limiter. Registration has only source authority before enrollment; login retains its independent hashed-account allowance. Logout-all now has source and signed-user allowances. Agent management adds missing pre-authentication source protection.
