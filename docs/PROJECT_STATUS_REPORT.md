@@ -38,6 +38,30 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Independent Source and Identity Quotas: 12 October 2026
+
+Closed SEC-35's route-level quota bypass. Authorization, execution, protected risk/evidence reads, event reads/streams and agent routes now apply independent source and server-resolved identity allowances. Source limits run before authentication and body parsing; identity limits run before payload validation or expensive work. Malformed and invalid-credential attempts count rather than evading the limiter. Registration has only source authority before enrollment; login retains its independent hashed-account allowance. Logout-all now has source and signed-user allowances. Agent management adds missing pre-authentication source protection.
+
+Token issuance and synchronization use a stable `configured_service` allowance after their existing privileged key/scope check. This runtime has one configured issuer: changing body wallet/device IDs, IPs or that key does not create another issuer allowance. This is not multi-tenant scoped-key ownership. Original financial limits/windows, device binding, exact approvals, atomic money and replay semantics are retained; stricter ordering may return authentication/429 errors before malformed-body errors. The generic source helper no longer accepts composite identity discriminators.
+
+PostgreSQL uses database time read after locking the quota row, so an application replica's clock jump cannot reset a shared allowance. Bounded input validation, SQL lock/statement deadlines and failed-client disposal were added. Existing shared source limits can throttle unrelated clients behind a NAT, while account limits can be targeted; these controls do not replace proxy sanitation, edge DDoS protection or future quota-retention maintenance. Changed bucket namespaces start fresh at rollout; drain old writers and deploy consistently to avoid mixed-version enforcement. Successful and unsuccessful attempts count. Retry headers describe the last checked bucket, not all available allowances.
+
+Verification: `npm test` passes 244 tests, zero failures/skips, including live PostgreSQL; `git diff --check` passes. Twenty-two new tests exercise IP/body rotation, pre-authentication throttling, malformed/content-type requests, agent/event limits, real PostgreSQL concurrency across limiter instances, clock-skew recovery, failed-client disposal and allowed-frontend header visibility. Configured origins can read quota/retry headers through CORS without opening access to other origins. GitHub Actions has a dedicated quota step. Existing ownership tests now rotate sources to isolate identity limits; resource fixtures supply a limiter because parsing is no longer the first operation. Blockchain contract/publisher/finality, operator visibility, reviewed risk enforcement, legitimate datasets and hosted key/recovery acceptance remain unfinished. No remote CI, deployment or push is claimed.
+
+Default allowances below are independently applied to each source and the listed identity, not multiplied together. Existing environment settings can override the configured financial/auth limits. Token/sync defaults intentionally cap the entire configured service; they need reviewed capacity settings before multi-user deployment.
+
+| Route group | Default allowance | Additional identity |
+| --- | --- | --- |
+| Registration | 5 per 15 minutes | None before enrollment |
+| Login / logout-all | 5 per 15 minutes per route | Hashed account / signed user |
+| Authorization | 12 per minute | Authenticated wallet |
+| Execution | 20 per minute | Authenticated wallet |
+| Token issue / sync | 6 per 10 minutes per route | Single configured service |
+| Risk / evidence / audit reads | 30 per minute per route | Authenticated wallet |
+| Events / stream | 60 / 6 per minute | Authenticated wallet |
+| Agent management / intent operations | Source 30 per minute, identity 20 | Owner wallet / agent |
+| Agent identity lookup | 30 per minute | Agent |
+
 ### V2.3 Durable Verified Audit Batches and Proof API: 12 October 2026
 
 Added `src/persistence/auditBatches.ts`, a finite `audit:batch` command and immutable `rail_audit_batches`/`rail_audit_memberships`. Leaves bind existing randomized authenticated payment commitments and required protected-risk commitments, not raw financial data. Helpers now reject sparse/oversized leaves and malformed proof shapes. Generic construction caps at 1,024 leaves; the worker accepts 1-256 pending records (default 128). No new dependency or chain provider was added.

@@ -16,7 +16,8 @@ function request(body) {
 test("authentication routes reject non-object JSON without accessing the database", async () => {
   for (const path of ["/auth/register", "/auth/login"]) {
     for (const body of [null, [], "invalid", 123]) {
-      await assert.rejects(handleAuthRoutes(request(body), {}, new URL(`http://localhost${path}`), { config: loadServerConfig() }),
+      await assert.rejects(handleAuthRoutes(request(body), { setHeader() {} }, new URL(`http://localhost${path}`),
+        { config: loadServerConfig(), rateLimiter: new SlidingWindowRateLimiter() }),
         { status: 422, code: "invalid_body" });
     }
   }

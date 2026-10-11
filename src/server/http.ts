@@ -57,6 +57,7 @@ export function applyCors(
   const allowedOrigin = resolveAllowedOrigin(req, allowedOrigins);
   if (allowedOrigin) {
     res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    res.setHeader("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After");
     res.setHeader("Vary", "Origin");
   }
 
@@ -231,10 +232,9 @@ export async function applyRateLimit(args: {
   scope: string;
   limit: number;
   windowMs: number;
-  discriminator?: string;
   trustProxyHeaders?: boolean;
 }): Promise<void> {
-  const key = `${args.scope}:${getClientIp(args.req, args.trustProxyHeaders)}:${args.discriminator ?? "anon"}`;
+  const key = `${args.scope}:${getClientIp(args.req, args.trustProxyHeaders)}:anon`;
   const decision = await args.rateLimiter.consume(key, args.limit, args.windowMs);
 
   args.res.setHeader("X-RateLimit-Limit", String(decision.limit));

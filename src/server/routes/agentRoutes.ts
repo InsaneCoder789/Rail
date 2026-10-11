@@ -1,5 +1,5 @@
 import type http from "node:http";
-import { RequestError, RateLimitError, applyRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
+import { RequestError, applyRateLimit, applyIdentityRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
 import type { ServerContext } from "../types.js";
 
 export async function handleAgentRoutes(req: http.IncomingMessage, res: http.ServerResponse, url: URL, context: ServerContext): Promise<boolean> {
@@ -10,10 +10,8 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     const header = req.headers.authorization;
     const token = typeof header === "string" ? /^Bearer (rail_agent_[A-Za-z0-9_-]{43})$/.exec(header)?.[1] : undefined;
     const identity = await context.agentStore.resolveCredential(token);
-    const quota = await context.rateLimiter.consume(`agent-intents:agent:${identity.agentId}`, 20, 60_000);
-    res.setHeader("X-RateLimit-Limit", String(quota.limit));
-    res.setHeader("X-RateLimit-Remaining", String(quota.remaining));
-    if (quota.retryAfterSeconds > 0) throw new RateLimitError("agent intent rate limit exceeded", quota.retryAfterSeconds, quota.limit, quota.remaining);
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_intents",
+      identity: identity.agentId, limit: 20, windowMs: 60_000 });
     if (req.method === "GET") json(res, 200, { intents: await context.agentStore.listAgentIntents(token) });
     else {
       if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
@@ -28,7 +26,10 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
       trustProxyHeaders: context.config.trustProxyHeaders });
     const header = req.headers.authorization;
     const token = typeof header === "string" ? /^Bearer (rail_agent_[A-Za-z0-9_-]{43})$/.exec(header)?.[1] : undefined;
-    json(res, 200, { identity: await context.agentStore.resolveCredential(token) });
+    const identity = await context.agentStore.resolveCredential(token);
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_identity",
+      identity: identity.agentId, limit: 30, windowMs: 60_000 });
+    json(res, 200, { identity });
     return true;
   }
 
@@ -39,12 +40,11 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
   if (route && ((route[2] === "intents" && (route[4] === "revoke" || (req.method === "POST" && !route[3]))) ||
     (route[2] !== "intents" && route[4] === "decision"))) return false;
 
+  await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_control_source", limit: 30,
+    windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
   const owner = await context.authResolver.resolveOwnerWallet(req);
-  // Owner-global bucket deliberately has no caller-supplied agent ID or IP component.
-  const quota = await context.rateLimiter.consume(`agent-control:owner:${owner}`, 20, 60_000);
-  res.setHeader("X-RateLimit-Limit", String(quota.limit));
-  res.setHeader("X-RateLimit-Remaining", String(quota.remaining));
-  if (quota.retryAfterSeconds > 0) throw new RateLimitError("agent control rate limit exceeded", quota.retryAfterSeconds, quota.limit, quota.remaining);
+  await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_control",
+    identity: owner, limit: 20, windowMs: 60_000 });
   if (req.method === "GET") {
     if (root) json(res, 200, { agents: await context.agentStore.listAgents(owner) });
     else if (route![2] === "credentials") json(res, 200, { credentials: await context.agentStore.listCredentials(owner, route![1]) });

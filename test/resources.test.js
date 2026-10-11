@@ -29,7 +29,7 @@ test("interrupted request bodies reject rather than waiting for the deadline", a
 
 async function requestAgainstServer(write, limits) {
   const config = { ...loadServerConfig(), ...limits };
-  const context = { config, eventStore: { emitSystemError() {} } };
+  const context = { config, rateLimiter: new SlidingWindowRateLimiter(), eventStore: { emitSystemError() {} } };
   const server = http.createServer((req, res) => { void handleRequest(req, res, context); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");

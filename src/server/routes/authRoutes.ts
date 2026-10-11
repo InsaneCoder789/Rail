@@ -2,7 +2,7 @@ import http from "node:http";
 import * as bcrypt from "bcryptjs";
 import { createHash } from "node:crypto";
 import { generateToken, verifyToken, InvalidTokenError } from "../../auth/jwt.js";
-import { RateLimitError, RequestError, applyRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
+import { RequestError, applyRateLimit, applyIdentityRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
 import type { ServerContext } from "../types.js";
 import { isSafeText, isRecord } from "../validation.js";
 
@@ -12,20 +12,16 @@ export async function handleAuthRoutes(
   url: URL,
   context: ServerContext,
 ): Promise<boolean> {
+  const scope = req.method === "POST" ? ({ "/auth/register": "register", "/auth/login": "login",
+    "/auth/logout-all": "logout_all" } as Record<string, string>)[url.pathname] : undefined;
+  if (scope) await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope,
+    limit: context.config.rateLimits.loginMax, windowMs: context.config.rateLimits.loginWindowMs,
+    trustProxyHeaders: context.config.trustProxyHeaders });
   if (req.method === "POST" && url.pathname === "/auth/register") {
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
     if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
     const body = parsed;
-    await applyRateLimit({
-      req,
-      res,
-      rateLimiter: context.rateLimiter,
-      scope: "register",
-      limit: context.config.rateLimits.loginMax,
-      windowMs: context.config.rateLimits.loginWindowMs,
-      trustProxyHeaders: context.config.trustProxyHeaders,
-    });
 
     if (!context.pool) {
       throw new Error("DB_NOT_INITIALIZED");
@@ -85,15 +81,6 @@ export async function handleAuthRoutes(
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
     if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
     const body = parsed;
-    await applyRateLimit({
-      req,
-      res,
-      rateLimiter: context.rateLimiter,
-      scope: "login",
-      limit: context.config.rateLimits.loginMax,
-      windowMs: context.config.rateLimits.loginWindowMs,
-      trustProxyHeaders: context.config.trustProxyHeaders,
-    });
 
     if (!context.pool) {
       throw new Error("DB_NOT_INITIALIZED");
@@ -107,8 +94,8 @@ export async function handleAuthRoutes(
     // No IP component: rotating source addresses cannot bypass this account quota.
     // Hash the identifier to avoid placing usernames in rate-limit bucket keys.
     const account = createHash("sha256").update(body.userId).digest("hex");
-    const quota = await context.rateLimiter.consume(`login_account:${account}`, context.config.rateLimits.loginMax, context.config.rateLimits.loginWindowMs);
-    if (quota.retryAfterSeconds > 0) throw new RateLimitError("account login quota exceeded", quota.retryAfterSeconds, quota.limit, quota.remaining);
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "login_account", identity: account,
+      limit: context.config.rateLimits.loginMax, windowMs: context.config.rateLimits.loginWindowMs });
     const resDb = await context.pool.query(
       `SELECT password_hash, auth_version FROM users WHERE user_id = $1`,
       [body.userId],
@@ -138,6 +125,9 @@ export async function handleAuthRoutes(
       if (error instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
       throw error;
     }
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "logout_all",
+      identity: createHash("sha256").update(credentials.userId).digest("hex"),
+      limit: context.config.rateLimits.loginMax, windowMs: context.config.rateLimits.loginWindowMs });
     const result = await context.pool.query(`UPDATE users SET auth_version = auth_version + 1
       WHERE user_id = $1 AND auth_version = $2 AND auth_version < 2147483647 RETURNING user_id`,
       [credentials.userId, credentials.authVersion]);

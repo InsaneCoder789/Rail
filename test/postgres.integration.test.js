@@ -564,7 +564,8 @@ test("online evidence status endpoint filters ownership, hides protected fields 
     const context = { pool, config: loadServerConfig(), evidenceStore: evidence, rateLimiter: new SlidingWindowRateLimiter(),
       authResolver: { resolveAuthenticatedWallet: async () => viewer } };
     const url = new URL(`http://localhost/v1/payments/${encodeURIComponent(txn.txId)}/evidence`);
-    const request = () => ({ method: "GET", headers: {}, socket: { remoteAddress: "127.0.0.1" } });
+    let source = 0;
+    const request = () => ({ method: "GET", headers: {}, socket: { remoteAddress: `192.0.2.${++source}` } });
     const response = () => ({ headers: {}, setHeader(name, value) { this.headers[name] = value; }, writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } });
     const res = response();
     assert.equal(await handlePaymentRoutes(request(), res, url, context), true);
@@ -675,14 +676,15 @@ test("logout-all revokes tokens across instances and prevents repeated revocatio
       const first = createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] });
       const second = createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] });
       const token = generateToken("user_session_test", 0);
-      const req = { method: "POST", headers: { authorization: `Bearer ${token}` } };
+      const req = { method: "POST", headers: { authorization: `Bearer ${token}` }, socket: { remoteAddress: "127.0.0.1" } };
       assert.equal(await first.resolveAuthenticatedWallet(req), txn.senderWalletId);
       let result;
-      const res = { writeHead() {}, end(body) { result = JSON.parse(body); } };
-      await handleAuthRoutes(req, res, new URL("http://local/auth/logout-all"), { pool });
+      const res = { setHeader() {}, writeHead() {}, end(body) { result = JSON.parse(body); } };
+      const context = { pool, config: loadServerConfig(), rateLimiter: new PostgresRateLimiter(pool) };
+      await handleAuthRoutes(req, res, new URL("http://local/auth/logout-all"), context);
       assert.equal(result.sessionsRevoked, "all");
       await assert.rejects(second.resolveAuthenticatedWallet(req), { status: 401 });
-      await assert.rejects(handleAuthRoutes(req, res, new URL("http://local/auth/logout-all"), { pool }), { status: 401 });
+      await assert.rejects(handleAuthRoutes(req, res, new URL("http://local/auth/logout-all"), context), { status: 401 });
       assert.equal((await pool.query("SELECT auth_version FROM users WHERE user_id = 'user_session_test'")).rows[0].auth_version, 1);
       assert.equal(await second.resolveAuthenticatedWallet({ headers: { authorization: `Bearer ${generateToken("user_session_test", 1)}` } }), txn.senderWalletId);
       const login = Readable.from([JSON.stringify({ userId: "user_session_test", password: "session_test_password" })]);

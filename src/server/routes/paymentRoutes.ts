@@ -97,6 +97,30 @@ export async function handlePaymentRoutes(
   url: URL,
   context: ServerContext,
 ): Promise<boolean> {
+  const readScope = req.method === "GET" && /^\/v1\/payments\/[^/]+\/(risk|evidence)$/.exec(url.pathname)?.[1];
+  const writeLimits: Readonly<Record<string, readonly [string, number, number]>> = {
+    "/v1/payments/authorize": ["authorize", context.config.rateLimits.authorizeMax, context.config.rateLimits.authorizeWindowMs],
+    "/v1/payments/execute": ["execute", context.config.rateLimits.executeMax, context.config.rateLimits.executeWindowMs],
+    "/v1/offline/tokens/issue": ["offline_token_issue", context.config.rateLimits.tokenIssueMax, context.config.rateLimits.tokenIssueWindowMs],
+    "/v1/sync/transactions": ["sync", context.config.rateLimits.syncMax, context.config.rateLimits.syncWindowMs],
+  };
+  const quota = readScope ? [`${readScope}_read`, 30, 60_000] as const
+    : req.method === "POST" ? writeLimits[url.pathname] : undefined;
+  let authenticatedWallet: string | undefined;
+  if (quota) {
+    const [scope, limit, windowMs] = quota;
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: `${scope}_source`,
+      limit, windowMs, trustProxyHeaders: context.config.trustProxyHeaders });
+    const privilegedScope = scope === "offline_token_issue" ? "offline_tokens:issue" : scope === "sync" ? "sync:write" : undefined;
+    if (privilegedScope) {
+      if (!context.authResolver.requireApiKey(req, res, privilegedScope)) return true;
+    } else {
+      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
+    }
+    // This runtime has one configured privileged issuer, not a principal chosen by the request body.
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope,
+      identity: authenticatedWallet ?? "configured_service", limit, windowMs });
+  }
   const auditRoute = /^\/v1\/payments\/([^/]+)\/audit$/.exec(url.pathname);
   if (req.method === "GET" && auditRoute) {
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "audit_read_source",
@@ -115,12 +139,10 @@ export async function handlePaymentRoutes(
   }
   const riskRoute = /^\/v1\/payments\/([^/]+)\/risk$/.exec(url.pathname);
   if (req.method === "GET" && riskRoute) {
-    const walletId = await context.authResolver.resolveAuthenticatedWallet(req);
+    const walletId = authenticatedWallet!;
     let txId: string;
     try { txId = decodeURIComponent(riskRoute[1]); } catch { throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID"); }
     if (!isSafeText(txId, 8, 128)) throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID");
-    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "risk_read", discriminator: walletId,
-      limit: 30, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
     const risk = await readBehaviourObservation(context.pool, txId, walletId, context.riskProtection);
     if (!risk) throw new RequestError(404, "payment_not_found", "payment not found");
     res.setHeader("Cache-Control", "no-store");
@@ -129,12 +151,10 @@ export async function handlePaymentRoutes(
   }
   const evidenceRoute = /^\/v1\/payments\/([^/]+)\/evidence$/.exec(url.pathname);
   if (req.method === "GET" && evidenceRoute) {
-    const walletId = await context.authResolver.resolveAuthenticatedWallet(req);
+    const walletId = authenticatedWallet!;
     let txId: string;
     try { txId = decodeURIComponent(evidenceRoute[1]); } catch { throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID"); }
     if (!isSafeText(txId, 8, 128)) throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID");
-    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "evidence_read", discriminator: walletId,
-      limit: 30, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
     const evidence = await context.evidenceStore.status(context.pool, txId, walletId);
     if (!evidence) throw new RequestError(404, "payment_not_found", "payment not found");
     res.setHeader("Cache-Control", "no-store");
@@ -146,19 +166,11 @@ export async function handlePaymentRoutes(
 
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
 
-    let authenticatedWallet: string;
-    try {
-      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
-    } catch (err) {
-      context.eventStore.emitSystemError(err, "auth.verify");
-      throw err;
-    }
-
-    if (!parsed || typeof parsed !== "object") {
+    if (!isRecord(parsed)) {
       throw new RequestError(422, "invalid_body", "expected object body");
     }
 
-    const body = parsed as Record<string, unknown>;
+    const body = parsed;
 
     if (
       !isSafeText(body.txId, 8, 128) ||
@@ -178,16 +190,6 @@ export async function handlePaymentRoutes(
     if (body.senderWalletId !== authenticatedWallet) {
       throw new RequestError(403, "identity_mismatch", "sender does not match auth");
     }
-    await applyRateLimit({
-      req,
-      res,
-      rateLimiter: context.rateLimiter,
-      scope: "authorize",
-      limit: context.config.rateLimits.authorizeMax,
-      windowMs: context.config.rateLimits.authorizeWindowMs,
-      discriminator: authenticatedWallet,
-      trustProxyHeaders: context.config.trustProxyHeaders,
-    });
 
     if (!context.pool) throw new RequestError(503, "database_required", "payment persistence unavailable");
     const authorization = await createAuthorization({
@@ -203,7 +205,6 @@ export async function handlePaymentRoutes(
   }
 
   if (req.method === "POST" && url.pathname === "/v1/offline/tokens/issue") {
-    if (!context.authResolver.requireApiKey(req, res, "offline_tokens:issue")) return true;
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
@@ -214,18 +215,6 @@ export async function handlePaymentRoutes(
       });
       return true;
     }
-
-    await applyRateLimit({
-      req,
-      res,
-      rateLimiter: context.rateLimiter,
-      scope: "offline_token_issue",
-      limit: context.config.rateLimits.tokenIssueMax,
-      windowMs: context.config.rateLimits.tokenIssueWindowMs,
-      discriminator: `${parsed.walletId}:${parsed.deviceId}`,
-      trustProxyHeaders: context.config.trustProxyHeaders,
-    });
-
     const row = await context.offlineTokenStore.issue({
       walletId: parsed.walletId,
       deviceId: parsed.deviceId,
@@ -254,14 +243,6 @@ export async function handlePaymentRoutes(
 
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
 
-    let authenticatedWallet: string;
-    try {
-      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
-    } catch (err) {
-      context.eventStore.emitSystemError(err, "auth.verify");
-      throw err;
-    }
-
     if (!isRecord(parsed)) throw new RequestError(422, "invalid_body", "expected object body");
     const body = parsed;
     const { authorizationId, providedAuthorization } = resolveAuthorizationReference(body);
@@ -280,16 +261,6 @@ export async function handlePaymentRoutes(
     if (txn.senderWalletId !== authenticatedWallet) {
       throw new RequestError(403, "identity_mismatch", "sender does not match auth");
     }
-    await applyRateLimit({
-      req,
-      res,
-      rateLimiter: context.rateLimiter,
-      scope: "execute",
-      limit: context.config.rateLimits.executeMax,
-      windowMs: context.config.rateLimits.executeWindowMs,
-      discriminator: authenticatedWallet,
-      trustProxyHeaders: context.config.trustProxyHeaders,
-    });
 
     await prepareAuthorizedTransaction(txn, context);
     if (providedAuthorization) {
@@ -314,7 +285,6 @@ export async function handlePaymentRoutes(
   }
 
   if (req.method === "POST" && url.pathname === "/v1/sync/transactions") {
-    if (!context.authResolver.requireApiKey(req, res, "sync:write")) return true;
     if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
 
     const parsed = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
@@ -325,18 +295,6 @@ export async function handlePaymentRoutes(
       });
       return true;
     }
-
-    await applyRateLimit({
-      req,
-      res,
-      rateLimiter: context.rateLimiter,
-      scope: "sync",
-      limit: context.config.rateLimits.syncMax,
-      windowMs: context.config.rateLimits.syncWindowMs,
-      discriminator: parsed.deviceId,
-      trustProxyHeaders: context.config.trustProxyHeaders,
-    });
-
     const txns: PaymentTransaction[] = [];
     for (const item of parsed.transactions) {
       if (!isPaymentTransaction(item)) {
@@ -368,7 +326,7 @@ export async function handlePaymentRoutes(
       }
 
       try {
-            await prepareAuthorizedTransaction(txn, context);
+        await prepareAuthorizedTransaction(txn, context);
       } catch (err) {
         const mapped = toErrorResponse(err, context.config.exposeInternalErrors);
         json(res, mapped.status, {

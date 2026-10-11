@@ -429,11 +429,12 @@ test("behaviour status is participant-only, non-cacheable and throttled without 
     await engine(model, undefined, undefined, protection, true).execute(txn);
     assert.equal(await readBehaviourObservation(pool, txn.txId, "risk_other"), undefined);
     assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_receiver", protection)).status, "observed");
+    let source = 0;
     const call = async (walletId, txId = txn.txId) => {
       const req = Readable.from([]);
       req.method = "GET";
       req.headers = {};
-      req.socket = { remoteAddress: "192.0.2.50" };
+      req.socket = { remoteAddress: `192.0.2.${++source}` };
       const headers = {};
       const res = { setHeader(key, value) { headers[key] = value; }, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
       await handlePaymentRoutes(req, res, new URL(`http://localhost/v1/payments/${txId}/risk`), {

@@ -1,5 +1,5 @@
 import http from "node:http";
-import { RequestError, applyRateLimit, json, resolveAllowedOrigin } from "../http.js";
+import { RequestError, applyRateLimit, applyIdentityRateLimit, json, resolveAllowedOrigin } from "../http.js";
 import type { ServerContext, ServerEvent } from "../types.js";
 
 export async function handleEventRoutes(
@@ -10,14 +10,17 @@ export async function handleEventRoutes(
 ): Promise<boolean> {
   const stream = url.pathname === "/v1/events/stream";
   if (req.method !== "GET" || (!stream && url.pathname !== "/v1/events")) return false;
+  const scope = stream ? "events_stream" : "events_read";
+  const limit = stream ? 6 : 60;
+  await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: `${scope}_source`,
+    limit, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
   if (stream && context.config.disableSse) {
     json(res, 501, { error: "event_stream_unavailable", hint: "use GET /v1/events for hosted serverless runtimes" });
     return true;
   }
   const viewer = { walletId: await context.authResolver.resolveAuthenticatedWallet(req) };
-  await applyRateLimit({ req, res, rateLimiter: context.rateLimiter,
-    scope: stream ? "events_stream" : "events_read", discriminator: viewer.walletId,
-    limit: stream ? 6 : 60, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
+  await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope, identity: viewer.walletId,
+    limit, windowMs: 60_000 });
 
   if (!stream) {
     const rawLimit = url.searchParams.get("limit");
