@@ -145,14 +145,15 @@ The CLI changes no files, model weights, payment policy or financial records. Ex
 
 ## Audit commitment foundation
 
-`src/crypto/auditCommitment.ts` implements salted SHA-256 transaction commitments, Merkle batch roots and inclusion proof verification. Version prefixes separate leaf, internal-node and root hashing. Leaf encoding uses a JSON array, avoiding ambiguous delimiter concatenation. The root binds the batch count; odd levels duplicate the final node deterministically.
+`src/crypto/auditCommitment.ts` implements SHA-256 leaf commitments, Merkle batch roots and inclusion proof verification. Version prefixes separate leaf, internal-node and root hashing. Leaf encoding uses a JSON array, avoiding ambiguous delimiter concatenation. The root binds the batch count; odd levels duplicate the final node deterministically. Helpers reject malformed/sparse leaves and proofs and cap construction at 1,024 leaves; the durable worker uses a smaller 256-record bound.
 
-Generate a distinct salt for each payment using `randomBytes(32).toString("hex")`. Keep salts, transaction details and proofs in protected storage. Publishing the root alone avoids putting wallet identifiers, amounts or credentials on-chain. Salt format validation cannot prove callers generated random, non-reused salts.
+The older raw-transaction helper remains a standalone primitive requiring a distinct 32-byte random salt; format validation cannot prove salts are random. The durable runtime instead uses `commitProtectedEvidence`: SHA-256 of `["rail:audit:evidence-leaf:v1", paymentCiphertextCommitment, requiredRiskCiphertextCommitmentOrNull]`. Those commitments bind already randomized authenticated envelopes. Raw identities, amounts, predictions, plaintext transaction salts and encrypted payloads do not enter public-root metadata. A null risk commitment explicitly means that the execution did not require protected risk evidence; it does not invent historical coverage.
 
 ```mermaid
 flowchart LR
   Payment[Committed payment] --> Store[Durable transaction and audit record]
-  Store --> Batch[Worker builds salted Merkle batch]
+  Store --> Queue[Atomic indexed pending queue]
+  Queue --> Batch[Worker verifies evidence and persists Merkle batch]
   Batch --> Anchor[Publish root to selected chain]
   Anchor --> Finality[Confirm finality and store receipt]
   Store --> Proof[Authorized inclusion proof]
@@ -160,7 +161,13 @@ flowchart LR
   Proof --> Verify
 ```
 
-This diagram is the integration design. Only commitment/proof computation is implemented. There is no chain client, contract, scheduled batcher, durable salt/proof table, wallet funding, external checkpoint or finality tracker yet. Roots are not currently inserted automatically during payment execution.
+The queue, verified bounded batch command, immutable membership/proof persistence and participant proof API are implemented. Chain publication/finality remain design only: no chain client, contract, scheduler, wallet funding or external checkpoint exists yet. Payment commit enqueues evidence; root construction happens afterward in a separate transaction, never through a network call on the payment path.
+
+`rail_audit_pending` is indexed by queue time/transaction ID. An evidence-insert trigger queues new protected executions atomically; migration queues existing protected ciphertext without altering it. The financial commit requires pending work or durable membership. `AuditBatchStore.createBatch` uses one client and a transaction-scoped lock, selects 1-256 pending records, authenticates payment and required risk envelopes and builds a deterministic ordered tree. Root/count, all memberships/proofs and queue consumption commit together. Each transaction belongs to at most one batch. Deferred SQL checks require exact contiguous membership/count, correct evidence foreign keys, required risk inclusion and consumed pending rows; normal writes cannot mutate history. Hash/proof verification remains application-side, not a SQL cryptographic guarantee.
+
+`npm run audit:batch` loads the retained independent key rings, runs one bounded batch and exits. Missing keys or poisoned records halt selection rather than silently omitting them. Partial writes, deferred failures and a terminated PostgreSQL backend roll back the batch and restore its queue; money remains committed. Retrying after response loss cannot duplicate membership, though it may create the next batch rather than return the lost command response. Scheduling, backlog alerts and real hosted load acceptance are not configured by the command.
+
+`GET /v1/payments/:txId/audit` filters participants in SQL, masks inaccessible/missing records with 404 and uses independent wallet-wide/source quotas plus `no-store`. It verifies envelope commitments and the stored leaf/proof/count/index before returning this payment's proof. Failure or missing keys returns unavailable status without a proof. No other identities or raw payloads are returned. Present roots remain `unanchored` and verification is `local_only`; an authenticated local response is not an independent chain checkpoint.
 
 Anchoring must run after financial commit. A chain outage must delay an audit anchor rather than reverse a completed payment. Reorganizations need confirmation policy and re-anchoring. An independent verifier must have a trusted root/checkpoint; a database administrator can rewrite a locally stored tree and its root together.
 

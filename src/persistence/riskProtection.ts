@@ -15,7 +15,7 @@ export interface RiskRecord {
   readonly anomaly?: { readonly summary: unknown; readonly modelHash: string | null; readonly prediction: unknown };
 }
 interface Binding { readonly txId: string; readonly requestFingerprint: string; }
-interface RiskEnvelope extends Binding {
+export interface RiskEnvelope extends Binding {
   readonly version: 1;
   readonly purpose: "risk-v1";
   readonly keyId: string;

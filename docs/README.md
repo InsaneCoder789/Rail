@@ -323,6 +323,7 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 | `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
 | `RAIL_BEHAVIOUR_MODEL_PATH` | Optional expanded `behaviour-v1` artifact. Uses trusted historical features after financial locks; takes precedence over the legacy model, remains shadow-only. |
 | `RAIL_ANOMALY_MODEL_PATH` | Optional `behaviour-anomaly-v1` reference-distance artifact. Runs alongside logistic inference with sufficient trusted history; detailed scores remain encrypted and shadow-only. |
+| `RAIL_AUDIT_BATCH_SIZE` | Maintenance-command batch size, 1-256 (default 128). Does not schedule work or enable chain publication. |
 | `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
 | `RAIL_REQUEST_BODY_TIMEOUT_MS` | Absolute body-read deadline for JSON routes. Default 10000 ms; slow/stalled uploads receive 408. |
 | `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
@@ -444,6 +445,14 @@ Optional `RAIL_ANOMALY_MODEL_PATH` adds a robust reference-distance baseline alo
 Authenticated sender/receiver access to committed payment evidence status. Returns `verified` with a ciphertext commitment, `legacy_unprotected` for historical payments without evidence, or `verification_unavailable` with a safe reason. Unknown and inaccessible payments both return `404`. Reads are limited to 30 per minute per wallet and request-source bucket; responses use `Cache-Control: no-store`.
 
 New HTTP-runtime payments commit AES-256-GCM evidence and independently keyed HMAC-SHA256 in the same transaction as wallet, token, ledger, event and replay state. Retries do not regenerate the evidence. This protects the canonical audit copy, not every relational field or event payload. HMAC is server-side authentication, not a public digital signature. Historical payments are not automatically backfilled, and no blockchain is deployed by this feature.
+
+### `GET /v1/payments/:txId/audit`
+
+Authenticated sender/receiver access to a payment's audit status and its own inclusion proof. Returns `pending_batch`, `batched`, `legacy_unprotected` or `verification_unavailable`. Batched responses contain the batch ID/root, this payment's leaf and ciphertext commitments, and sibling hashes/index/count; they contain no other transaction identities, raw features or encryption keys. Missing and unauthorized payments both return 404. Reads are non-cacheable with independent 30/minute wallet-wide and source quotas. Source throttling runs before authentication; changing IPs does not reset the authenticated wallet allowance.
+
+Protected evidence queues audit work inside the financial transaction. `npm run audit:batch` verifies retained payment/risk evidence and atomically persists immutable Merkle membership while consuming a bounded pending queue. Failed batching does not undo already committed payments; partial batch writes roll back and retry does not duplicate membership. Migration queues existing protected evidence without modifying ciphertext or silently protecting legacy payments.
+
+Proofs currently report `publication: unanchored` and `verification: local_only`. There is no chain contract, publisher or independent trusted checkpoint yet. Inclusion proves neither settlement nor that every payment is covered. No blockchain call runs on the payment path. Keep the maintenance command and proof data private; hosting, scheduling, key recovery and chain acceptance remain separate work.
 
 ### `POST /auth/register`
 
@@ -642,6 +651,7 @@ src/
 | Release expired authorizations | `npm run authorizations:sweep` |
 | Check accounting consistency | `npm run accounting:reconcile` |
 | Train risk baseline | `npm run risk:train -- dataset.json model.json` |
+| Build a durable audit batch | `npm run audit:batch` |
 | Run server | `npm run server` |
 | Isolated demo script | `RAIL_DEMO_MODE=true npm run demo` |
 

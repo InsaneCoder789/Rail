@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.3 Durable Verified Audit Batches and Proof API: 12 October 2026
+
+Added `src/persistence/auditBatches.ts`, a finite `audit:batch` command and immutable `rail_audit_batches`/`rail_audit_memberships`. Leaves bind existing randomized authenticated payment commitments and required protected-risk commitments, not raw financial data. Helpers now reject sparse/oversized leaves and malformed proof shapes. Generic construction caps at 1,024 leaves; the worker accepts 1-256 pending records (default 128). No new dependency or chain provider was added.
+
+Protected evidence inserts an indexed pending job inside the financial commit; queue failure rolls back money/token/evidence/risk/replay. Migration queues existing protected ciphertext without rewriting it, while legacy unprotected executions stay excluded. Batch construction uses a separate one-client transaction and shared advisory lock. It verifies retained envelopes, inserts root/count and all unique immutable memberships/proofs, consumes queued work and waits for final commit before reporting success. Deferred constraints enforce count/index/bindings, required risk evidence and queue consumption. Partial writes, final-commit failure and real backend termination restore pending work without undoing completed payments. Missing keys or corrupt records halt batching rather than silently skipping history.
+
+`GET /v1/payments/:txId/audit` filters sender/receiver access, returns identical missing/inaccessible 404s and non-cacheable responses, and verifies the record/proof before disclosure. The participant receives only its own leaf, ciphertext commitments, sibling hashes, index/count and batch root/ID. Failure suppresses proof data. It reports `unanchored`/`local_only`, never chain confirmation or settlement. A new IP-rotation regression exposed the composite quota helper's identity-reset behavior; audit reads now use independent source and wallet-wide limits. Older risk/evidence and financial-route composite quotas need their own hardening follow-up; this finding is not hidden by passing audit tests.
+
+Verification: 222 local tests pass, zero failures/skips. Seventeen added cases cover protected leaf bindings, sparse/malformed/bounded helpers, odd online/offline batches, concurrent bounded workers, legacy exclusion, partial/deferred/crash rollback, key retention, tampered envelopes/roots/proofs, incomplete/unbound membership and queue consumption, participant privacy/IP-rotation quotas, pre-authentication invalid-credential throttling, financial enqueue rollback, retained-history migration and safe finite CLI behavior. GitHub Actions has explicit audit coverage but is not remotely run for this revision. No testnet contract, signer, publisher, fee approval, finality/reorg tracker or independent checkpoint exists yet. Quota follow-up, full chain integration, operator visibility and real-data/deployment/key-recovery gates remain open; the full V2 goal remains active.
+
 ### V2.2 Explainable Anomaly Reference Baseline: 12 October 2026
 
 Added `src/risk/anomalyRisk.ts`, a fitted median/MAD reference-distance baseline over the nine non-intercept behavioural dimensions. It complements logistic inference rather than replacing it. Training fits medians/scales, a later calibration cohort sets an experimental nearest-rank p95 threshold with floor three, and later test observations affect neither. Scale flooring and capped named contributions keep constant/binary dimensions and extreme valid inputs finite. This is unusualness relative to a supplied reference cohort, not a fraud probability, neural network, false-positive guarantee or automatic payment decision. Correlated dimensions, narrow/contaminated references and declared source/history provenance require independent evaluation.
@@ -558,7 +568,14 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
 - `src/server/routes/eventRoutes.ts`
   Contains the event listing and SSE stream endpoints.
 
-### Risk Modules
+### Audit and Risk Modules
+
+- `src/persistence/auditBatches.ts`
+  Verifies retained protected records, atomically builds bounded immutable batches and returns participant-filtered locally verified proofs.
+- `src/persistence/runAuditBatch.ts`
+  Runs one authorized bounded maintenance batch with retained keys, no chain network calls and sanitized failure output.
+- `test/auditBatches.integration.test.js`
+  Exercises queue/membership integrity, concurrency, migrations, financial rollback, worker termination, key loss, tampering, proof privacy/quotas and CLI behavior.
 
 - `src/risk/anomalyRisk.ts`
   Fits a bounded median/MAD reference baseline, calibrates an experimental threshold, validates artifacts and reports explainable shadow distances and local inference timing.

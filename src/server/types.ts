@@ -8,6 +8,7 @@ import type { RateLimiter } from "./http.js";
 import type { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 import type { AgentAuthorityStore } from "../persistence/agentAuthority.js";
 import type { RiskProtectionStore } from "../persistence/riskProtection.js";
+import type { AuditBatchStore } from "../persistence/auditBatches.js";
 
 export interface AuthenticatedViewer {
   readonly walletId: string;
@@ -51,6 +52,7 @@ export interface ServerContext {
   readonly engine: PaymentPipelineEngine;
   readonly evidenceStore: TransactionEvidenceStore;
   readonly riskProtection: RiskProtectionStore;
+  readonly auditStore: AuditBatchStore;
   readonly agentStore: AgentAuthorityStore;
   readonly rateLimiter: RateLimiter;
   readonly authResolver: AuthResolver;

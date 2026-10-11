@@ -19,7 +19,7 @@ export class TransactionEvidenceStore {
     if (!execution.rows[0]?.evidence_required) throw new Error("transaction_evidence_execution_not_required");
     const existing = await client.query("SELECT envelope, commitment FROM rail_transaction_evidence WHERE tx_id = $1", [txn.txId]);
     if (existing.rows[0]) {
-      this.verify(existing.rows[0], { txId: txn.txId, requestFingerprint: execution.rows[0].request_fingerprint });
+      this.verifyRecord(existing.rows[0], { txId: txn.txId, requestFingerprint: execution.rows[0].request_fingerprint });
       return;
     }
     const key = this.keyRing.get(this.keyRing.activeKeyId);
@@ -35,7 +35,8 @@ export class TransactionEvidenceStore {
       JSON.stringify(envelope), protectedTransactionCommitment(envelope)]);
   }
 
-  private verify(row: { envelope: ProtectedTransaction; commitment: string }, expected: { txId: string; requestFingerprint: string }): void {
+  /** Internal trusted-storage verification; the caller must independently enforce access control. */
+  verifyRecord(row: { envelope: ProtectedTransaction; commitment: string }, expected: { txId: string; requestFingerprint: string }): void {
     verifyAndDecryptTransaction(row.envelope, expected, this.keyRing.get(row.envelope.keyId));
     if (protectedTransactionCommitment(row.envelope) !== row.commitment) throw new Error("transaction_evidence_commitment_mismatch");
   }
@@ -50,7 +51,7 @@ export class TransactionEvidenceStore {
     if (!row) return undefined;
     if (!row.envelope && !row.evidence_required) return { txId, status: "legacy_unprotected" };
     try {
-      this.verify(row, { txId, requestFingerprint: row.request_fingerprint });
+      this.verifyRecord(row, { txId, requestFingerprint: row.request_fingerprint });
       return { txId, status: "verified", commitment: row.commitment };
     } catch (error) {
       return { txId, status: "verification_unavailable", reason: error instanceof Error && error.message === "transaction_evidence_key_unavailable"

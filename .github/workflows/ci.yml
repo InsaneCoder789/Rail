@@ -80,3 +80,5 @@ jobs:
         run: node --test test/riskProtection.test.js test/behaviourRisk.integration.test.js
       - name: Verify anomaly baseline, reference calibration, protected observations and startup validation
         run: node --test test/anomalyRisk.test.js test/behaviourRisk.integration.test.js test/securityConfig.test.js
+      - name: Verify durable audit batches, proof privacy, queue rollback and worker crash recovery
+        run: node --test test/auditCommitment.test.js test/auditBatches.integration.test.js

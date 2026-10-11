@@ -9,6 +9,7 @@ import { validateAnomalyModel } from "../risk/anomalyRisk.js";
 import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 import { RiskProtectionStore, loadRiskKeyRing } from "../persistence/riskProtection.js";
+import { AuditBatchStore } from "../persistence/auditBatches.js";
 import { AgentAuthorityStore } from "../persistence/agentAuthority.js";
 dotenv.config();
 
@@ -106,6 +107,7 @@ export async function createServerContext(options: {
     engine,
     evidenceStore,
     riskProtection,
+    auditStore: new AuditBatchStore(pool, evidenceStore, riskProtection),
     agentStore: new AgentAuthorityStore(pool, engine),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({

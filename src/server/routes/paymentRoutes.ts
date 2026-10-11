@@ -3,7 +3,7 @@ import type { PaymentAuthorization } from "../../domain/authorization.js";
 import type { PaymentTransaction } from "../../domain/types.js";
 import { processSyncBatch } from "../../rail/syncBatch.js";
 import { createAuthorization, getAuthorizationById } from "../../stages/authorizationStage.js";
-import { RequestError, applyRateLimit, json, readAndParseJson, requireJsonContentType, toErrorResponse } from "../http.js";
+import { RequestError, applyRateLimit, applyIdentityRateLimit, json, readAndParseJson, requireJsonContentType, toErrorResponse } from "../http.js";
 import type { ServerContext } from "../types.js";
 import { readBehaviourObservation } from "../../risk/behaviourRisk.js";
 import {
@@ -97,6 +97,22 @@ export async function handlePaymentRoutes(
   url: URL,
   context: ServerContext,
 ): Promise<boolean> {
+  const auditRoute = /^\/v1\/payments\/([^/]+)\/audit$/.exec(url.pathname);
+  if (req.method === "GET" && auditRoute) {
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "audit_read_source",
+      limit: 30, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
+    const walletId = await context.authResolver.resolveAuthenticatedWallet(req);
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "audit_read", identity: walletId,
+      limit: 30, windowMs: 60_000 });
+    let txId: string;
+    try { txId = decodeURIComponent(auditRoute[1]); } catch { throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID"); }
+    if (!isSafeText(txId, 8, 128)) throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID");
+    const audit = await context.auditStore.status(txId, walletId);
+    if (!audit) throw new RequestError(404, "payment_not_found", "payment not found");
+    res.setHeader("Cache-Control", "no-store");
+    json(res, 200, { audit });
+    return true;
+  }
   const riskRoute = /^\/v1\/payments\/([^/]+)\/risk$/.exec(url.pathname);
   if (req.method === "GET" && riskRoute) {
     const walletId = await context.authResolver.resolveAuthenticatedWallet(req);

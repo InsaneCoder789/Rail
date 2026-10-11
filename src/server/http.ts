@@ -250,6 +250,20 @@ export async function applyRateLimit(args: {
   }
 }
 
+/** The trusted identity bucket is independent of request-source rotation. */
+export async function applyIdentityRateLimit(args: {
+  res: http.ServerResponse; rateLimiter: RateLimiter; scope: string;
+  identity: string; limit: number; windowMs: number;
+}): Promise<void> {
+  const quota = await args.rateLimiter.consume(`${args.scope}:identity:${args.identity}`, args.limit, args.windowMs);
+  args.res.setHeader("X-RateLimit-Limit", String(quota.limit));
+  args.res.setHeader("X-RateLimit-Remaining", String(quota.remaining));
+  if (quota.retryAfterSeconds > 0) {
+    args.res.setHeader("Retry-After", String(quota.retryAfterSeconds));
+    throw new RateLimitError(`${args.scope} rate limit exceeded`, quota.retryAfterSeconds, quota.limit, quota.remaining);
+  }
+}
+
 export function toErrorResponse(
   err: unknown,
   exposeInternalErrors: boolean,

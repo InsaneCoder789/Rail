@@ -8,11 +8,19 @@ export interface AuditProof {
 }
 
 const HASH = /^[a-f0-9]{64}$/;
+const MAX_LEAVES = 1024;
 function hash(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 function parent(left: string, right: string): string {
   return hash(`rail:audit:node:v1:${left}:${right}`);
+}
+
+/** Ciphertext commitments already bind randomized authenticated envelopes; no raw payment data enters this leaf. */
+export function commitProtectedEvidence(paymentCommitment: string, riskCommitment: string | null): string {
+  if (typeof paymentCommitment !== "string" || !HASH.test(paymentCommitment) ||
+      (riskCommitment !== null && (typeof riskCommitment !== "string" || !HASH.test(riskCommitment)))) throw new Error("INVALID_PROTECTED_AUDIT_INPUT");
+  return hash(JSON.stringify(["rail:audit:evidence-leaf:v1", paymentCommitment, riskCommitment]));
 }
 
 /** Keep the random salt and transaction private; publish only the batch root. */
@@ -25,7 +33,8 @@ export function commitTransaction(txn: PaymentTransaction, salt: string): string
 
 /** Pure Merkle construction. Persistence, chain anchoring and finality are separate responsibilities. */
 export function buildAuditCommitment(leaves: readonly string[]): { root: string; proofs: AuditProof[] } {
-  if (!leaves.length || !leaves.every((leaf) => HASH.test(leaf))) throw new Error("INVALID_AUDIT_LEAVES");
+  if (!Array.isArray(leaves) || !leaves.length || leaves.length > MAX_LEAVES ||
+      Array.from(leaves).some(leaf => typeof leaf !== "string" || !HASH.test(leaf))) throw new Error("INVALID_AUDIT_LEAVES");
   const levels: string[][] = [[...leaves]];
   while (levels[levels.length - 1].length > 1) {
     const level = levels[levels.length - 1];
@@ -47,9 +56,11 @@ export function buildAuditCommitment(leaves: readonly string[]): { root: string;
 }
 
 export function verifyAuditProof(leaf: string, proof: AuditProof, root: string): boolean {
-  if (!HASH.test(leaf) || !HASH.test(root) || !Number.isSafeInteger(proof.leafCount) || proof.leafCount < 1 ||
+  if (typeof leaf !== "string" || typeof root !== "string" || !HASH.test(leaf) || !HASH.test(root) || !proof || typeof proof !== "object" ||
+      !Array.isArray(proof.siblings) || !Number.isSafeInteger(proof.leafCount) || proof.leafCount < 1 || proof.leafCount > MAX_LEAVES ||
       !Number.isSafeInteger(proof.leafIndex) || proof.leafIndex < 0 || proof.leafIndex >= proof.leafCount ||
-      proof.siblings.length !== Math.ceil(Math.log2(proof.leafCount))) return false;
+      proof.siblings.length !== Math.ceil(Math.log2(proof.leafCount)) ||
+      Array.from(proof.siblings).some(sibling => typeof sibling !== "string" || !HASH.test(sibling))) return false;
   let current = leaf;
   let index = proof.leafIndex;
   let width = proof.leafCount;

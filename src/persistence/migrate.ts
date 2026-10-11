@@ -236,6 +236,34 @@ CREATE TABLE IF NOT EXISTS rail_transaction_evidence (
     envelope->>'txId' = tx_id AND envelope->>'requestFingerprint' = request_fingerprint AND envelope->>'nonce' = nonce) IS TRUE)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_commitment_binding ON rail_transaction_evidence(tx_id, commitment);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_commitment_binding ON rail_protected_risk(tx_id, commitment);
+CREATE TABLE IF NOT EXISTS rail_audit_batches (
+  batch_id UUID PRIMARY KEY, schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+  root TEXT NOT NULL CHECK (root ~ '^[a-f0-9]{64}$'), leaf_count INTEGER NOT NULL CHECK (leaf_count BETWEEN 1 AND 256),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TABLE IF NOT EXISTS rail_audit_memberships (
+  tx_id TEXT PRIMARY KEY REFERENCES rail_payment_executions(tx_id), batch_id UUID NOT NULL REFERENCES rail_audit_batches(batch_id),
+  leaf_index INTEGER NOT NULL CHECK (leaf_index BETWEEN 0 AND 255), leaf_hash TEXT NOT NULL CHECK (leaf_hash ~ '^[a-f0-9]{64}$'),
+  payment_commitment TEXT NOT NULL, risk_commitment TEXT, proof JSONB NOT NULL,
+  FOREIGN KEY (tx_id, payment_commitment) REFERENCES rail_transaction_evidence(tx_id, commitment),
+  FOREIGN KEY (tx_id, risk_commitment) REFERENCES rail_protected_risk(tx_id, commitment),
+  UNIQUE (batch_id, leaf_index),
+  CHECK ((jsonb_typeof(proof) = 'object' AND proof - 'leafCount' - 'leafIndex' - 'siblings' = '{}'::jsonb
+    AND jsonb_typeof(proof->'leafIndex') = 'number' AND (proof->>'leafIndex')::integer = leaf_index
+    AND jsonb_typeof(proof->'leafCount') = 'number' AND (proof->>'leafCount')::integer BETWEEN 1 AND 256
+    AND jsonb_typeof(proof->'siblings') = 'array' AND jsonb_array_length(proof->'siblings') <= 8) IS TRUE)
+);
+CREATE TABLE IF NOT EXISTS rail_audit_pending (
+  tx_id TEXT PRIMARY KEY REFERENCES rail_payment_executions(tx_id), queued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_pending_order ON rail_audit_pending(queued_at, tx_id);
+INSERT INTO rail_audit_pending(tx_id)
+  SELECT evidence.tx_id FROM rail_transaction_evidence evidence JOIN rail_payment_executions execution ON execution.tx_id = evidence.tx_id
+  WHERE execution.evidence_required AND NOT EXISTS (SELECT 1 FROM rail_audit_memberships membership WHERE membership.tx_id = evidence.tx_id)
+  ON CONFLICT (tx_id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS authorization_usage (
   auth_id TEXT PRIMARY KEY,
   tx_id TEXT NOT NULL,
@@ -625,6 +653,11 @@ BEGIN
         AND protected.request_fingerprint = observation.request_fingerprint)) THEN
     RAISE EXCEPTION 'payment_risk_protection_missing' USING ERRCODE = '23514';
   END IF;
+  IF EXISTS (SELECT 1 FROM rail_payment_executions execution WHERE execution.tx_id = payment_tx_id AND execution.evidence_required
+      AND NOT EXISTS (SELECT 1 FROM rail_audit_pending pending WHERE pending.tx_id = execution.tx_id)
+      AND NOT EXISTS (SELECT 1 FROM rail_audit_memberships membership WHERE membership.tx_id = execution.tx_id)) THEN
+    RAISE EXCEPTION 'payment_audit_queue_missing' USING ERRCODE = '23514';
+  END IF;
 END $$;
 
 CREATE OR REPLACE FUNCTION rail_check_payment_commit() RETURNS TRIGGER
@@ -670,6 +703,60 @@ CREATE TRIGGER rail_risk_immutable BEFORE UPDATE OR DELETE ON rail_risk_observat
 DROP TRIGGER IF EXISTS rail_protected_risk_immutable ON rail_protected_risk;
 CREATE TRIGGER rail_protected_risk_immutable BEFORE UPDATE OR DELETE ON rail_protected_risk
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_audit_batch_immutable ON rail_audit_batches;
+CREATE TRIGGER rail_audit_batch_immutable BEFORE UPDATE OR DELETE ON rail_audit_batches
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_audit_membership_immutable ON rail_audit_memberships;
+CREATE TRIGGER rail_audit_membership_immutable BEFORE UPDATE OR DELETE ON rail_audit_memberships
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+CREATE OR REPLACE FUNCTION rail_queue_audit_evidence() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  INSERT INTO rail_audit_pending(tx_id) SELECT NEW.tx_id FROM rail_payment_executions execution
+    WHERE execution.tx_id = NEW.tx_id AND execution.evidence_required ON CONFLICT (tx_id) DO NOTHING;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_queue_audit_evidence ON rail_transaction_evidence;
+CREATE TRIGGER rail_queue_audit_evidence AFTER INSERT ON rail_transaction_evidence FOR EACH ROW EXECUTE FUNCTION rail_queue_audit_evidence();
+CREATE OR REPLACE FUNCTION rail_guard_audit_pending() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' OR (TG_OP = 'DELETE' AND NOT EXISTS (SELECT 1 FROM rail_audit_memberships WHERE tx_id = OLD.tx_id)) THEN
+    RAISE EXCEPTION 'audit_queue_requires_membership' USING ERRCODE = '23514';
+  END IF;
+  RETURN OLD;
+END $$;
+DROP TRIGGER IF EXISTS rail_guard_audit_pending ON rail_audit_pending;
+CREATE TRIGGER rail_guard_audit_pending BEFORE UPDATE OR DELETE ON rail_audit_pending FOR EACH ROW EXECUTE FUNCTION rail_guard_audit_pending();
+CREATE OR REPLACE FUNCTION rail_check_audit_pending() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM rail_audit_pending pending WHERE pending.tx_id = NEW.tx_id AND
+      (EXISTS (SELECT 1 FROM rail_audit_memberships membership WHERE membership.tx_id = pending.tx_id) OR
+       NOT EXISTS (SELECT 1 FROM rail_payment_executions execution WHERE execution.tx_id = pending.tx_id AND execution.evidence_required))) THEN
+    RAISE EXCEPTION 'audit_pending_state_invalid' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_check_audit_pending ON rail_audit_pending;
+CREATE CONSTRAINT TRIGGER rail_check_audit_pending AFTER INSERT ON rail_audit_pending
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_audit_pending();
+CREATE OR REPLACE FUNCTION rail_check_audit_batch() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE expected INTEGER;
+BEGIN
+  SELECT leaf_count INTO expected FROM rail_audit_batches WHERE batch_id = NEW.batch_id;
+  IF expected IS NULL OR (SELECT COUNT(*) FROM rail_audit_memberships WHERE batch_id = NEW.batch_id) <> expected
+    OR EXISTS (SELECT 1 FROM rail_audit_memberships membership JOIN rail_payment_executions execution ON execution.tx_id = membership.tx_id
+      WHERE membership.batch_id = NEW.batch_id AND (membership.leaf_index >= expected OR (membership.proof->>'leafCount')::integer <> expected
+        OR NOT execution.evidence_required OR execution.risk_protection_required <> (membership.risk_commitment IS NOT NULL)
+        OR EXISTS (SELECT 1 FROM rail_audit_pending pending WHERE pending.tx_id = membership.tx_id))) THEN
+    RAISE EXCEPTION 'audit_batch_incomplete_or_unbound' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_check_audit_batch ON rail_audit_batches;
+CREATE CONSTRAINT TRIGGER rail_check_audit_batch AFTER INSERT ON rail_audit_batches
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_audit_batch();
+DROP TRIGGER IF EXISTS rail_check_audit_member ON rail_audit_memberships;
+CREATE CONSTRAINT TRIGGER rail_check_audit_member AFTER INSERT ON rail_audit_memberships
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_audit_batch();
 DROP TRIGGER IF EXISTS rail_risk_commit_check ON rail_risk_observations;
 CREATE CONSTRAINT TRIGGER rail_risk_commit_check AFTER INSERT ON rail_risk_observations
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_payment_commit();
