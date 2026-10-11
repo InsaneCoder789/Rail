@@ -14,6 +14,7 @@ type RecordState =
 
 export interface IdempotencyStore {
   dedupe(key: string, fingerprint: string, run: IdempotencyWork, options?: DedupeOptions): Promise<PipelineResult>;
+  dedupeInTransaction?(client: PoolClient, key: string, fingerprint: string, run: IdempotencyWork, options?: DedupeOptions): Promise<PipelineResult>;
   getCompleted(key: string): Promise<PipelineResult | undefined> | PipelineResult | undefined;
 }
 

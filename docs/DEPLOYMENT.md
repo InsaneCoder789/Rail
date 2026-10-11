@@ -93,6 +93,10 @@ Agent execution is disabled. Proposals and exact-request human approvals reserve
 
 No extra deployment secret is introduced. Monitor owner-global and agent-global 20/minute quotas, source quotas and retained-record capacities (50 agents/owner, 100 credentials and mandates/agent, 1,000 intents/agent). Lifecycle/retention decisions must not delete audit history automatically. Pending intent fields are not AES-encrypted evidence. Database triggers protect normal data writes, not a database owner capable of disabling them; least-privilege runtime roles remain a production gate. Run the complete PostgreSQL-backed suite and the explicit agent test step before rollout.
 
+### Internal transaction composition
+
+Authorization issuance, PostgreSQL replay protection and the engine support supplied-client composition. This adds no hosted endpoint or permission grant. A trusted coordinator must `BEGIN`, configure SQL deadlines, check live authority, call the helpers, perform related budget/state writes and await outer `COMMIT` before returning success. Deferred constraints can fail that final commit. On any failure, roll back the whole operation and discard unusable clients; an inner savepoint only undoes its own scope. Never run overlapping operations on the same checked-out client. The caller must preserve consistent lock ordering and check authority before cached replay. Existing HTTP execute/sync paths still use the normal self-contained engine boundary, and agent execution remains disabled.
+
 ### Durable external event delivery
 
 Configure `RAIL_OUTBOX_WEBHOOK_URL` as a trusted HTTPS receiver and `RAIL_OUTBOX_WEBHOOK_SECRET` as a separate random secret of at least 32 characters. The worker refuses redirects and URL credentials. Run `npm run outbox:dispatch` from a scheduled worker/cron environment after applying migrations; each invocation claims a bounded batch and exits. The command is not run during API requests or serverless cold starts.

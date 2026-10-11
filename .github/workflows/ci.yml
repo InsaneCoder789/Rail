@@ -62,6 +62,8 @@ jobs:
         run: node --test --test-name-pattern='evidence|legacy replay remains unprotected' test/postgres.integration.test.js
       - name: Verify agent credentials, intent approvals, budget holds and revocation races
         run: node --test test/agentAuthority.test.js
+      - name: Verify single-transaction authorization, evidence, rollback and replay composition
+        run: node --test --test-name-pattern='transaction composition:' test/postgres.integration.test.js
       - name: Verify event delivery and stream lifecycle
         run: node --test test/events.test.js
       - name: Verify request deadlines and bounded diagnostic stores

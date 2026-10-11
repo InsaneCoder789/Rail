@@ -41,6 +41,12 @@ At a high level, Rail supports the following flow:
 
 That makes Rail more than a simple transfer API. It behaves like a controlled payment runtime with explicit lifecycle state, replay protection, offline-aware constraints, and ledger-visible execution.
 
+### What Offline Means Here
+
+Rail supports preissued authority, device-bound spend headroom and reconnect-time processing of queued requests. Server-side verification and final ledger posting require connectivity to Rail. The `nfc`, `ble` and `qr` channel values model payment inputs; this repository does not implement the mobile transport, secure device storage or a protocol proving final settlement while both devices are disconnected. A queued offline attempt must not be displayed as confirmed settlement.
+
+No-internet UPI through USSD or voice is a different mechanism: it still reaches a payment service over a telecom network. Rail has no bank, NPCI, USSD or IVR connector today. Its useful upgrade path is enforceable delegated authority and recovery, not claiming to replace those networks.
+
 ---
 
 ## Why This Project Exists
@@ -390,6 +396,8 @@ The response contains `{ "intent": { ... } }`, including the immutable `requestF
 `clientRequestId` is 8-128 characters and unique within an agent. Identical retries return the existing intent without another hold or a renewed deadline; a changed mandate, receiver, amount, currency or TTL returns `409`. TTL defaults to 300 seconds, accepts 60-900 seconds and is clipped to the mandate deadline. The approval fingerprint binds the exact owner, agent, mandate, recipient, amount, currency and timestamps.
 
 Pending and approved intents hold `reservedBudgetMinor`; PostgreSQL commit constraints require it to equal the sum of live intent amounts and stay within `totalBudgetMinor`. This is policy headroom, not proof of available wallet money. Intent/mandate reads, proposals and decisions lazily release expired holds in a successful audited transaction; there is no expiry worker. A failed operation rolls that cleanup back. Revoking an agent or mandate releases its holds; revoking one credential prevents subsequent token use but does not cancel every intent belonging to the agent.
+
+The engine now supports trusted server-side composition through `executeInTransaction`, alongside `createAuthorizationInTransaction` and PostgreSQL `dedupeInTransaction`. These methods use an existing client and refuse autocommit execution before writes. They let a future agent executor commit authority, budget and payment state together without nested pool checkouts. They are not authentication APIs and do not enable agent execution. Results are provisional until the caller's outer `COMMIT`, including deferred database checks. The caller must own deadlines, rollback, connection disposal and authority checks before both new execution and cached replay; do not expose a provisional result to the frontend.
 
 Agent intent reads/writes share a PostgreSQL-backed 20/minute agent bucket across credentials and IP addresses, plus a 30/minute source bucket. Limits are 50 retained agents per owner, 100 credentials/mandates and 1,000 intents per agent, including revoked, rejected or expired rows. No automatic deletion resets these bounds. Intent bindings/history cannot be edited or deleted through normal SQL updates. Mutations and audit events commit together; failed audit writes roll changes back. Apply migrations before updating hosted API instances. Pending intent fields are relational data, not encrypted payment evidence; the AES/HMAC evidence path below applies to committed payments.
 

@@ -9,7 +9,8 @@ import { Readable } from "node:stream";
 import { handleAuthRoutes } from "../dist/server/routes/authRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { SlidingWindowRateLimiter } from "../dist/server/http.js";
-import { createAuthorization, claimAuthorizationForExecution, getAuthorizationById, releaseExpiredAuthorizations, reserveFunds, consumeReservation, creditWallet, releaseReservation } from "../dist/stages/authorizationStage.js";
+import { createAuthorization, createAuthorizationInTransaction, claimAuthorizationForExecution, getAuthorizationById, releaseExpiredAuthorizations, reserveFunds, consumeReservation, creditWallet, releaseReservation } from "../dist/stages/authorizationStage.js";
+import { MemoryIdempotencyStore } from "../dist/pipeline/idempotency.js";
 import { buildHardenedPaymentPipeline } from "../dist/stages/paymentPipeline.js";
 import { PaymentPipelineEngine } from "../dist/pipeline/engine.js";
 import { MemoryDeadLetterQueue } from "../dist/pipeline/dlq.js";
@@ -309,6 +310,178 @@ async function paymentFixture(work) {
     else process.env.RAIL_SIGNING_SECRET = previousSecret;
   }
 }
+
+function authorizationInput(txn, suffix = "composed") {
+  return { txId: `${txn.txId}_${suffix}`, senderWalletId: txn.senderWalletId, receiverWalletId: txn.receiverWalletId,
+    amountMinor: txn.amountMinor, currency: txn.currency };
+}
+
+test("transaction composition: autocommit clients cannot issue authority or execute work", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, store, makeEngine }) => {
+    const before = (await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows;
+    const client = await pool.connect();
+    let ran = false;
+    try {
+      await assert.rejects(createAuthorizationInTransaction(authorizationInput(txn), client), { code: "25P01" });
+      await assert.rejects(store.dedupeInTransaction(client, "autocommit_key", "a".repeat(64), async () => {
+        ran = true;
+        return { status: "accepted" };
+      }), { code: "25P01" });
+      await assert.rejects(makeEngine().executeInTransaction(txn, client), { code: "25P01" });
+      assert.equal(ran, false);
+    } finally { client.release(); }
+    assert.deepEqual((await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows, before);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+  });
+});
+
+test("transaction composition: outer rollback removes authorization, money, tokens, evidence and replay", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const before = (await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows;
+    const { evidence } = evidenceFixture();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL lock_timeout = '5s'");
+      await client.query("SET LOCAL statement_timeout = '15s'");
+      const auth = await createAuthorizationInTransaction(authorizationInput(txn), client);
+      const composed = { ...txn, txId: auth.txId, idempotencyKey: `${txn.idempotencyKey}_composed`, authorizationId: auth.authId };
+      assert.equal((await makeEngine(undefined, undefined, evidence).executeInTransaction(composed, client)).status, "accepted");
+      assert.equal((await client.query("SELECT * FROM rail_transaction_evidence")).rowCount, 1);
+      await client.query("ROLLBACK");
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    assert.deepEqual((await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows, before);
+    for (const table of ["ledger_entries", "authorization_usage", "rail_payment_executions", "rail_idempotency", "rail_transaction_evidence", "outbox"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 1);
+    assert.equal((await pool.query("SELECT remaining_minor FROM rail_offline_tokens WHERE token_id = $1", [txn.offlineTokenId])).rows[0].remaining_minor, "5000");
+  });
+});
+
+test("transaction composition: one connection commits a new offline authorization and replays once", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const { evidence } = evidenceFixture();
+    const engine = makeEngine(undefined, undefined, evidence);
+    const client = await pool.connect();
+    let composed, result;
+    try {
+      await client.query("BEGIN");
+      const auth = await createAuthorizationInTransaction(authorizationInput(txn), client);
+      composed = { ...txn, txId: auth.txId, idempotencyKey: `${txn.idempotencyKey}_composed`, authorizationId: auth.authId };
+      result = await engine.executeInTransaction(composed, client);
+      assert.deepEqual(await engine.executeInTransaction(composed, client), result);
+      await client.query("COMMIT");
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    assert.deepEqual(await engine.execute(composed), result);
+    for (const table of ["rail_payment_executions", "rail_idempotency", "rail_transaction_evidence", "authorization_usage"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 1, table);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+    assert.equal((await pool.query("SELECT remaining_minor FROM rail_offline_tokens WHERE token_id = $1", [txn.offlineTokenId])).rows[0].remaining_minor, "2500");
+    assert.deepEqual(await findReconciliationIssues(pool), []);
+  });
+});
+
+test("transaction composition: evidence failures roll back payment scope before outer rollback", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const { evidence } = evidenceFixture();
+    const failing = { async persist(client, payment) { await evidence.persist(client, payment); throw new Error("injected_composed_evidence_failure"); } };
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const auth = await createAuthorizationInTransaction(authorizationInput(txn), client);
+      const composed = { ...txn, txId: auth.txId, idempotencyKey: `${txn.idempotencyKey}_composed`, authorizationId: auth.authId };
+      await assert.rejects(makeEngine(undefined, undefined, failing).executeInTransaction(composed, client), /injected_composed_evidence_failure/);
+      assert.equal((await client.query("SELECT status FROM authorizations WHERE auth_id = $1", [auth.authId])).rows[0].status, "issued");
+      for (const table of ["ledger_entries", "rail_transaction_evidence", "rail_idempotency"])
+        assert.equal((await client.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+      await client.query("ROLLBACK");
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 1);
+    assert.equal((await pool.query("SELECT remaining_minor FROM rail_offline_tokens WHERE token_id = $1", [txn.offlineTokenId])).rows[0].remaining_minor, "5000");
+  });
+});
+
+test("transaction composition: SQL event failure leaves no partial posted payment", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    await pool.query(`CREATE FUNCTION reject_composed_event() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.type = 'payments.ledger_posted' THEN RAISE EXCEPTION 'injected_composed_event_failure'; END IF; RETURN NEW; END $$`);
+    await pool.query("CREATE TRIGGER reject_composed_event BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION reject_composed_event()");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const auth = await createAuthorizationInTransaction(authorizationInput(txn), client);
+      const composed = { ...txn, txId: auth.txId, idempotencyKey: `${txn.idempotencyKey}_composed`, authorizationId: auth.authId };
+      await assert.rejects(makeEngine().executeInTransaction(composed, client), /injected_composed_event_failure/);
+      assert.equal((await client.query("SELECT * FROM ledger_entries")).rowCount, 0);
+      assert.equal((await client.query("SELECT * FROM outbox")).rowCount, 0);
+      await client.query("ROLLBACK");
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 1);
+  });
+});
+
+test("transaction composition: snapshots protect authorization and execution from caller mutation", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const input = authorizationInput(txn);
+    const issuing = createAuthorization(input, pool);
+    input.amountMinor = 1;
+    const auth = await issuing;
+    assert.equal(auth.amountMinor, txn.amountMinor);
+    const composed = { ...txn, txId: auth.txId, idempotencyKey: `${txn.idempotencyKey}_composed`, authorizationId: auth.authId };
+    const executing = makeEngine().execute(composed);
+    composed.amountMinor = 1;
+    assert.equal((await executing).status, "accepted");
+    assert.deepEqual((await pool.query("SELECT amount_minor FROM ledger_entries WHERE tx_id = $1", [auth.txId])).rows.map(row => row.amount_minor), ["2500", "2500"]);
+  });
+});
+
+test("transaction composition: failed inner work preserves caller writes and permits safe retry", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, store }) => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("INSERT INTO outbox (type, payload) VALUES ('caller.before', '{}')");
+      await assert.rejects(store.dedupeInTransaction(client, "composed_retry_key", "a".repeat(64), async () => {
+        await client.query("INSERT INTO outbox (type, payload) VALUES ('inner.failed', '{}')");
+        throw new Error("injected_composed_work_failure");
+      }), /injected_composed_work_failure/);
+      assert.deepEqual((await client.query("SELECT type FROM outbox")).rows, [{ type: "caller.before" }]);
+      assert.equal((await store.dedupeInTransaction(client, "composed_retry_key", "a".repeat(64), async () => ({ status: "rejected", reason: "demonstration_only" }))).status, "rejected");
+      await assert.rejects(store.dedupeInTransaction(client, "composed_retry_key", "b".repeat(64), async () => ({ status: "accepted" })), { code: "IDEMPOTENCY_KEY_REUSED" });
+      await client.query("COMMIT");
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    assert.equal((await store.getCompleted("composed_retry_key")).status, "rejected");
+  });
+});
+
+test("transaction composition: volatile idempotency cannot join a financial transaction", async () => {
+  const engine = new PaymentPipelineEngine({ idempotency: new MemoryIdempotencyStore(), tracer: noopTracer,
+    dlq: new MemoryDeadLetterQueue(), pipeline: async () => { throw new Error("must_not_run"); } });
+  await assert.rejects(engine.executeInTransaction({}, {}), { code: "TRANSACTIONAL_IDEMPOTENCY_REQUIRED" });
+});
+
+test("transaction composition: accepted work remains provisional when deferred commit checks fail", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, makeEngine }) => {
+    const before = (await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows;
+    await pool.query(`CREATE FUNCTION reject_composed_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'injected_deferred_commit_failure' USING ERRCODE = '23514'; END $$`);
+    await pool.query(`CREATE CONSTRAINT TRIGGER reject_composed_commit AFTER UPDATE ON wallets
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_composed_commit()`);
+    const { evidence } = evidenceFixture();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const auth = await createAuthorizationInTransaction(authorizationInput(txn), client);
+      const composed = { ...txn, txId: auth.txId, idempotencyKey: `${txn.idempotencyKey}_composed`, authorizationId: auth.authId };
+      assert.equal((await makeEngine(undefined, undefined, evidence).executeInTransaction(composed, client)).status, "accepted");
+      await assert.rejects(client.query("COMMIT"), /injected_deferred_commit_failure/);
+    } finally { await client.query("ROLLBACK"); client.release(); }
+    assert.deepEqual((await pool.query("SELECT wallet_id, balance, reserved FROM wallets ORDER BY wallet_id")).rows, before);
+    for (const table of ["ledger_entries", "authorization_usage", "rail_idempotency", "rail_payment_executions", "rail_transaction_evidence", "outbox"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 1);
+  });
+});
 
 function evidenceFixture(maxRecordsPerKey = 1000000) {
   const key = { keyId: "integration_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };

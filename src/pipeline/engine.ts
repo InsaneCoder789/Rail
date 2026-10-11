@@ -10,6 +10,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { canonicalTransactionPayload, legacyTransactionPayload } from "../crypto/transactionSigning.js";
 import { verifyCommittedAuthorization } from "../stages/authorizationStage.js";
 import type { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
+import type { PoolClient } from "pg";
+import { PipelineError } from "./errors.js";
 
 function randomId(): string {
   return randomUUID();
@@ -31,6 +33,18 @@ export class PaymentPipelineEngine {
   constructor(private readonly opts: PaymentPipelineEngineOptions) {}
 
   async execute(txn: PaymentTransaction): Promise<PipelineResult> {
+    return this.executeBoundary(Object.freeze({ ...txn }));
+  }
+
+  /** Internal composition: never return this provisional result to HTTP before outer COMMIT. */
+  async executeInTransaction(txn: PaymentTransaction, client: PoolClient): Promise<PipelineResult> {
+    if (!this.opts.idempotency.dedupeInTransaction) {
+      throw new PipelineError("transactional_idempotency_required", "TRANSACTIONAL_IDEMPOTENCY_REQUIRED");
+    }
+    return this.executeBoundary(Object.freeze({ ...txn }), client);
+  }
+
+  private async executeBoundary(txn: PaymentTransaction, transaction?: PoolClient): Promise<PipelineResult> {
     const span = this.opts.tracer.startSpan("payment.execute", {
       txId: txn.txId,
       idempotencyKey: txn.idempotencyKey,
@@ -40,7 +54,10 @@ export class PaymentPipelineEngine {
         .update(canonicalTransactionPayload(txn), "utf8")
         .digest("hex");
       const legacy = legacyTransactionPayload(txn);
-      const result = await this.opts.idempotency.dedupe(txn.idempotencyKey, fingerprint, async (client) => {
+      const dedupe = transaction
+        ? this.opts.idempotency.dedupeInTransaction!.bind(this.opts.idempotency, transaction)
+        : this.opts.idempotency.dedupe.bind(this.opts.idempotency);
+      const result = await dedupe(txn.idempotencyKey, fingerprint, async (client) => {
         const outbox = new MemoryOutbox();
         const ctx = createPaymentContext(randomId(), randomId(), txn, outbox, client);
         ctx.state.requireEvidence = Boolean(this.opts.evidence);

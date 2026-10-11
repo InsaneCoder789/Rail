@@ -4,6 +4,7 @@ import type { PaymentAuthorization, StoredPaymentAuthorization } from "../domain
 import type { PaymentTransaction } from "../domain/types.js";
 import { PipelineError } from "../pipeline/errors.js";
 import { signAuthorization } from "../crypto/authorizationSigning.js";
+import { withTransactionSavepoint } from "../persistence/transaction.js";
 
 const DEFAULT_AUTH_TTL_MS = 5 * 60 * 1000;
 function validateMoney(amount: number, currency: string): void {
@@ -187,14 +188,23 @@ export async function releaseExpiredAuthorizations(db: Pool, limit = 100): Promi
   return authorizationTransaction(db, client => expireReservations(client, limit));
 }
 
-export async function createAuthorization(input: {
-  txId: string;
-  senderWalletId: string;
-  receiverWalletId: string;
-  amountMinor: number;
-  currency: string;
-  ttlMs?: number;
-}, db: Pool): Promise<PaymentAuthorization> {
+export interface AuthorizationInput {
+  readonly txId: string;
+  readonly senderWalletId: string;
+  readonly receiverWalletId: string;
+  readonly amountMinor: number;
+  readonly currency: string;
+  readonly ttlMs?: number;
+}
+
+export async function createAuthorization(input: AuthorizationInput, db: Pool): Promise<PaymentAuthorization> {
+  const snapshot = { ...input };
+  return authorizationTransaction(db, client => createAuthorizationInTransaction(snapshot, client));
+}
+
+/** Trusted server composition only; no BEGIN, COMMIT or separate pool checkout. */
+export async function createAuthorizationInTransaction(value: AuthorizationInput, client: PoolClient): Promise<PaymentAuthorization> {
+  const input = { ...value };
   validateMoney(input.amountMinor, input.currency);
   for (const [id, minimum] of [[input.txId, 8], [input.senderWalletId, 3], [input.receiverWalletId, 3]] as const) {
     if (typeof id !== "string" || id.length < minimum || id.length > 128 || /[\x00-\x1f\x7f]/.test(id)) {
@@ -210,7 +220,7 @@ export async function createAuthorization(input: {
     throw new Error("missing signing secret");
   }
 
-  return authorizationTransaction(db, async client => {
+  return withTransactionSavepoint(client, async () => {
     // Serialize issuance even when the authorization row does not exist yet.
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`authorize:${input.txId}`]);
     let existing = await client.query(
@@ -238,6 +248,7 @@ export async function createAuthorization(input: {
 
     await reserveFunds(client, input.senderWalletId, input.amountMinor, input.currency);
 
+    const time = await client.query("WITH timestamp AS (SELECT clock_timestamp() AS now) SELECT now AS created_at, now + $1 * interval '1 millisecond' AS expires_at FROM timestamp", [ttlMs]);
     const unsignedAuth = {
       authId: `auth_${randomUUID()}`,
       txId: input.txId,
@@ -245,8 +256,8 @@ export async function createAuthorization(input: {
       receiverWalletId: input.receiverWalletId,
       amountMinor: input.amountMinor,
       currency: input.currency,
-      createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + ttlMs).toISOString(),
+      createdAt: new Date(time.rows[0].created_at).toISOString(),
+      expiresAt: new Date(time.rows[0].expires_at).toISOString(),
     } as const;
 
     const signature = signAuthorization(unsignedAuth, secret);

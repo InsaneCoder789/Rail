@@ -38,6 +38,18 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Transaction Composition and Offline Scope Review: 11 October 2026
+
+Reviewed FlowPay's public description and two focused Kotlin components, not its complete application or a live bank transaction. Its repository describes a no-internet Android interface over existing USSD and voice rails. The [dial builder](https://raw.githubusercontent.com/Flowpayup/Payments-Without-Internet/main/app/src/main/java/com/flowpay/app/payment/Upi123CallStringBuilder.kt) constructs an IVR DTMF call, and the [session manager](https://raw.githubusercontent.com/Flowpayup/Payments-Without-Internet/main/app/src/main/java/com/flowpay/app/payment/PaymentSessionManager.kt) waits for SMS evidence rather than treating call duration as success. [NPCI's 123Pay booklet](https://www.npci.org.in/PDF/npci/upi-123pay/Product-Booklet.pdf) documents the underlying no-internet service. Carrier/bank coverage and FlowPay's live reliability were not verified. No third-party code was copied or integration implied.
+
+Rail's offline scope is different: preissued authority, bounded device token headroom and server-side reconnect processing. Channel labels do not implement NFC/BLE hardware transport or prove final settlement without connectivity. README now distinguishes offline initiation from committed ledger state. Rail still has no live bank/UPI connector. The selected V2 direction is controlled agent authority, explainable risk and verifiable audit evidence, not replacing existing payment networks or claiming encryption/blockchain prevent every fraud.
+
+Added trusted transaction-composition entry points: `createAuthorizationInTransaction`, PostgreSQL `dedupeInTransaction` and engine `executeInTransaction`. They reuse one caller-owned client, avoiding an independently committed authorization or nested checkout when assembling future agent execution. A small shared savepoint helper rejects autocommit before work begins, rolls back failed inner work and preserves earlier caller-owned writes. Existing standalone authorization/engine behavior retains its own commit boundary. Authorization timestamps now use one database clock sample; authorization and engine inputs are snapshotted before asynchronous work to prevent caller mutation from changing fingerprinted financial fields.
+
+These methods are not permission checks. Their accepted result remains provisional until the outer transaction commits, including deferred financial constraints. The caller owns live agent/mandate/approval checks, lock ordering, SQL deadlines, rollback and client disposal; cached replay cannot bypass those authority checks. A failed payment scope rolls back that scope, not an earlier authorization outside its savepoint; the outer coordinator must roll back the whole operation on failure. No HTTP route exposes the composition methods, and agent `executionEnabled: false` remains unchanged. Mandate budget consumption and executed-intent bindings are still the next category.
+
+Verification: all 136 local tests pass with zero failures/skips. Nine added tests cover autocommit rejection, outer rollback of authority/money/token/evidence/replay, one-connection committed execution, duplicate replay, evidence and SQL-event failure, input mutation, savepoint retry isolation, rejection of volatile composition and rollback when deferred checks reject a provisional accepted result at final commit. Initial focused assertions used the wrong offline-token table/column name; they were corrected before the full passing run. An explicit GitHub Actions composition step was added; this revision has not run remotely. Public and private reports were updated without exposing private scope files. Production key recovery, historical accounting and provider acceptance remain open.
+
 ### V2.1 Bound Intents, Approvals and Budget Holds: 11 October 2026
 
 Added `rail_agent_intents` and a mandate `reserved_budget_minor` counter. Agents can propose requests through `POST /v2/agent/intents` and inspect them through `GET` on the same path. Owners use `GET /v2/agents/:agentId/intents` and `POST /v2/agents/:agentId/intents/:intentId/decision` with a current-version JWT. Agent credentials cannot approve requests or authenticate as owners. A separate 20/minute shared agent bucket spans credentials and source IPs, alongside the 30/minute source guard and existing owner-global quota.
@@ -379,7 +391,10 @@ This section describes the current TypeScript source layout and the responsibili
   Contains PostgreSQL schema creation and migration logic. This includes the wallet, ledger, authorization, idempotency, and related persistence setup that the live server depends on.
 
 - `src/persistence/postgresIdempotency.ts`
-  Implements PostgreSQL-backed idempotency using database state and advisory locking. This is the durable replay-safety implementation for multi-request execution.
+  Implements PostgreSQL-backed idempotency using database state and advisory locking. Supports its normal owned transaction and savepoint-isolated composition in a supplied transaction; composed results are not committed until the caller commits.
+
+- `src/persistence/transaction.ts`
+  Requires an existing PostgreSQL transaction and isolates composed work using a uniquely named savepoint. Does not own final commit, deadlines, authorization or pool-client disposal.
 
 - `src/persistence/postgresOfflineTokenStore.ts`
   Implements PostgreSQL-backed storage for offline spend tokens and token headroom tracking.
@@ -410,7 +425,7 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Defines the dead-letter queue support used for failed pipeline runs.
 
 - `src/pipeline/engine.ts`
-  The core payment pipeline engine. It coordinates idempotency, tracing, pipeline execution, DLQ behavior, and result handling.
+  Coordinates idempotency, tracing, pipeline execution, evidence, events, DLQ behavior and result handling. Snapshots transaction fields and supports trusted execution inside a caller-owned transaction without enabling a new HTTP payment authority path.
 
 - `src/pipeline/errors.ts`
   Contains pipeline-level error definitions and shared error structures for engine and stage failures.
@@ -486,7 +501,7 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
 ### Business Stages
 
 - `src/stages/authorizationStage.ts`
-  Implements authorization creation, authorization lookup, reservation release, and wallet-authorization setup logic.
+  Implements authorization creation/lookup, reservation release and wallet mutation helpers. Supports standalone issuance or savepoint-isolated issuance in a supplied transaction, snapshots input and signs database-clock timestamps.
 
 - `src/stages/paymentPipeline.ts`
   Implements validation, prechecks and money/ledger changes within the idempotency-owned database transaction. No saga compensation runtime remains.
