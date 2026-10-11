@@ -38,6 +38,14 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.2 Bounded Behavioural Drift Diagnostics: 12 October 2026
+
+Added a finite `risk:monitor` command and `behaviourMonitoring.ts`. The operator supplies one expanded model and ordered, distinct reference/current cohorts; validation rejects repeated events, mismatched currencies, invalid features, observations at/before training cutoff and overlapping periods. Input uses the existing 20-MiB reader cap and at most 10,000 rows per cohort. Fewer than twenty samples returns `insufficient_data` without fabricating a stability conclusion. Supplied source declarations remain unverified; this tool is not an authenticated PostgreSQL exporter.
+
+The diagnostic compares nine non-intercept feature distributions and model probabilities through fixed ten-bucket PSI with half-count smoothing, and reports history/budget missingness. Its fixed 0.2 shift threshold is experimental, not a validated fraud or significance threshold. Output contains aggregate counts/distributions and model version/hash, omitting event IDs and individual timestamps. Calibration/accuracy drift is explicitly unavailable without independent outcome labels. No detected shift does not certify safety, and a shift does not prove fraud. Operators must protect cohorts and aggregate reports; the twenty-row floor does not establish privacy or adequate statistical power.
+
+Exit codes support finite operational checks: 0 no detected shift, 2 shift, 3 insufficient samples, 1 invalid input. The command never rewrites inputs, updates models or changes money/policy; no scheduler, alert delivery or retraining was silently configured. Review also sanitized shared JSON parser errors so malformed private dataset/artifact content cannot appear in error messages. Verification: 180 local tests pass, zero failures/skips, including existing PostgreSQL integration. Six added cases cover unchanged/shifted cohorts, sample insufficiency, time/identity/currency/provenance/bounds, missingness/finite smoothing and CLI codes/input preservation; existing artifact-read coverage additionally checks generic private-input errors. GitHub Actions includes explicit drift coverage but this revision is not remotely run or deployed. Protected risk records, legitimate labels, live monitoring acceptance, blockchain integration and operator UI remain unfinished; the full V2 goal stays active.
+
 ### V2.2 Expanded Behavioural ML and Temporal Evaluation: 12 October 2026
 
 Added `src/risk/behaviourModel.ts`, a ten-feature logistic model covering trusted history/velocity, amount deviation, recipient familiarity, agent exposure and explicit missing-history/budget indicators. It shares a bounded deterministic gradient trainer with the legacy amount/channel model rather than adding a network inference dependency. Named contributions explain log odds, not causation. Expanded artifact validation binds feature schema, model/dataset versions, serialized-dataset hash, currency, synthetic status, training count, label-availability cutoff and finite copied weights. Review additionally fixed sparse-array validation that could otherwise allow missing weights/vector elements through JavaScript array predicates.
@@ -540,6 +548,12 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Validates expanded feature/model schemas, guards chronological label availability, trains from trusted-feature datasets and reports named contributions, held-out calibration/ranking metrics and bounded local inference timings.
 - `src/risk/trainRisk.ts`
   Loads bounded private legacy or behavioural datasets, writes new mode-0600 artifacts without overwriting and prints evaluation/benchmark diagnostics.
+- `src/risk/behaviourMonitoring.ts`
+  Validates distinct temporal cohorts and produces bounded aggregate feature/probability PSI and missingness diagnostics without changing model or financial state.
+- `src/risk/monitorRisk.ts`
+  Reads a restricted-size supplied cohort file, prints an operator drift report and returns distinct shift/insufficient/invalid exit codes.
+- `test/behaviourMonitoring.test.js`
+  Tests drift/missingness, input bounds/provenance chronology, explicit insufficiency and CLI privacy/exit/input-preservation behavior.
 - `test/behaviourModel.test.js`
   Tests expanded training, features, provenance/time leakage, calibration/ranking, sparse/invalid artifacts, deterministic weights and CLI/IO/benchmark bounds.
 - `test/behaviourRisk.integration.test.js`

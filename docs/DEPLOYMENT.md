@@ -109,6 +109,10 @@ Optional `RAIL_RISK_MODEL_PATH` loads the legacy amount/channel model; `RAIL_BEH
 
 Migrate the expanded model-status constraint before updating hosted writers. Train expanded artifacts with the existing `risk:train` command using strict chronological training/validation/test arrays and label-availability timestamps. Keep datasets and model artifacts outside the repository; inspect held-out and calibration reports before a reviewed configuration rollout. Restart/cut over to a retained approved artifact for rollback; already committed snapshots remain unchanged. Do not enable fraud enforcement based on synthetic reports or experimental threshold 0.5. Feature snapshots are sensitive relational records, not encrypted transaction evidence; production retention, least-privilege access, label provenance, drift and independent evaluation remain required.
 
+### Offline Drift Checks
+
+Run `npm run risk:monitor -- /private/path/cohorts.json` in an authorized offline/operator job, not inside a payment request. The bounded input supplies one expanded model and distinct chronological reference/current cohorts; the command does not export database data or verify its authenticity. Protect input and aggregate output from customer/public access. Codes 2 and 3 mean detected shift and insufficient data, not transfer failure. Inspect invalid-input code 1 rather than suppressing it; code 0 is not fraud/performance acceptance. No alert receiver, schedule or automatic model update is configured by this implementation. Reference selection and the experimental PSI threshold require use-case validation before relying on operational alerts.
+
 ### Durable External Event Delivery
 
 Configure `RAIL_OUTBOX_WEBHOOK_URL` as a trusted HTTPS receiver and `RAIL_OUTBOX_WEBHOOK_SECRET` as a separate random secret of at least 32 characters. The worker refuses redirects and URL credentials. Run `npm run outbox:dispatch` from a scheduled worker/cron environment after applying migrations; each invocation claims a bounded batch and exits. The command is not run during API requests or serverless cold starts.

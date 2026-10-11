@@ -171,5 +171,7 @@ test("risk artifact reads have a hard size bound and reject directories", async 
     await assert.rejects(readRiskJson(path, 10), /RISK_JSON_SIZE_LIMIT/);
     await assert.rejects(readRiskJson(directory), /RISK_JSON_SIZE_LIMIT/);
     assert.equal((await readRiskJson(path)).value.length, 100);
+    await writeFile(path, "private_sensitive_input_must_not_appear_in_parser_errors");
+    await assert.rejects(readRiskJson(path), { message: "INVALID_RISK_JSON" });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

@@ -74,3 +74,5 @@ jobs:
         run: node --test test/behaviourRisk.integration.test.js
       - name: Verify expanded behavioural ML, temporal leakage guards and calibration reporting
         run: node --test test/behaviourModel.test.js
+      - name: Verify bounded drift diagnostics, insufficient data and operational exit codes
+        run: node --test test/behaviourMonitoring.test.js

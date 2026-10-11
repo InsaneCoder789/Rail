@@ -15,7 +15,8 @@ export async function readRiskJson(path: string, maxBytes = 1024 * 1024): Promis
       offset += bytesRead;
     }
     if (offset > maxBytes) throw new Error("RISK_JSON_SIZE_LIMIT");
-    return JSON.parse(buffer.subarray(0, offset).toString("utf8"));
+    try { return JSON.parse(buffer.subarray(0, offset).toString("utf8")); }
+    catch { throw new Error("INVALID_RISK_JSON"); }
   } finally { await file.close(); }
 }
 
