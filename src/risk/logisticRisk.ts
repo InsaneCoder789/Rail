@@ -1,4 +1,23 @@
 import type { PaymentTransaction } from "../domain/types.js";
+import { open } from "node:fs/promises";
+
+export async function readRiskJson(path: string, maxBytes = 1024 * 1024): Promise<unknown> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 20 * 1024 * 1024) throw new Error("RISK_JSON_SIZE_LIMIT");
+  const file = await open(path, "r");
+  try {
+    const stats = await file.stat();
+    if (!stats.isFile() || stats.size > maxBytes) throw new Error("RISK_JSON_SIZE_LIMIT");
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) throw new Error("RISK_JSON_SIZE_LIMIT");
+    return JSON.parse(buffer.subarray(0, offset).toString("utf8"));
+  } finally { await file.close(); }
+}
 
 export interface RiskExample {
   readonly amountMinor: number;
@@ -24,8 +43,28 @@ function features(amountMinor: number, channel: PaymentTransaction["channel"]): 
   return [1, Math.log1p(amountMinor) / Math.log1p(1_000_000), channel === "online" ? 0 : 1];
 }
 
-function sigmoid(value: number): number {
+export function sigmoid(value: number): number {
   return value >= 0 ? 1 / (1 + Math.exp(-value)) : Math.exp(value) / (1 + Math.exp(value));
+}
+
+/** Shared bounded batch-gradient trainer for versioned logistic feature schemas. */
+export function fitLogisticWeights(rows: readonly { input: readonly number[]; label: 0 | 1 }[], dimensions: number): number[] {
+  if (rows.length < 10 || rows.length > 10000 || !Number.isSafeInteger(dimensions) || dimensions < 1 || dimensions > 32 ||
+      !rows.some(row => row.label === 0) || !rows.some(row => row.label === 1) ||
+      rows.some(row => !row || (row.label !== 0 && row.label !== 1) || !Array.isArray(row.input) || row.input.length !== dimensions ||
+        Array.from(row.input).some(value => typeof value !== "number" || !Number.isFinite(value)))) throw new Error("INVALID_LOGISTIC_TRAINING_ROWS");
+  const weights = Array<number>(dimensions).fill(0);
+  for (let epoch = 0; epoch < 1500; epoch++) {
+    const gradient = Array<number>(dimensions).fill(0);
+    for (const row of rows) {
+      const error = sigmoid(row.input.reduce((sum, feature, index) => sum + feature * weights[index], 0)) - row.label;
+      row.input.forEach((feature, index) => { gradient[index] += error * feature; });
+    }
+    weights.forEach((weight, index) => {
+      weights[index] -= 0.1 * (gradient[index] / rows.length + (index === 0 ? 0 : 0.01 * weight));
+    });
+  }
+  return weights;
 }
 
 export function validateRiskModel(value: unknown): LogisticRiskModel {
@@ -36,7 +75,7 @@ export function validateRiskModel(value: unknown): LogisticRiskModel {
       typeof model.currency !== "string" || !/^[A-Z]{3}$/.test(model.currency) ||
       !Number.isSafeInteger(model.trainingRows) || model.trainingRows < 10 ||
       !Array.isArray(model.weights) || model.weights.length !== 3 ||
-      !model.weights.every((weight) => typeof weight === "number" && Number.isFinite(weight) && Math.abs(weight) <= 1_000_000)) {
+      !Array.from(model.weights).every((weight) => typeof weight === "number" && Number.isFinite(weight) && Math.abs(weight) <= 1_000_000)) {
     throw new Error("INVALID_RISK_MODEL");
   }
   return { schemaVersion: 1, modelVersion: model.modelVersion, datasetId: model.datasetId, currency: model.currency,
@@ -63,17 +102,7 @@ export function trainRiskModel(examples: readonly RiskExample[], metadata: {
     if (row.label !== 0 && row.label !== 1) throw new Error("INVALID_RISK_LABEL");
     return { input: features(row.amountMinor, row.channel), label: row.label };
   });
-  const weights: [number, number, number] = [0, 0, 0];
-  for (let epoch = 0; epoch < 1500; epoch++) {
-    const gradient = [0, 0, 0];
-    for (const row of rows) {
-      const error = sigmoid(row.input.reduce((sum, feature, index) => sum + feature * weights[index], 0)) - row.label;
-      row.input.forEach((feature, index) => { gradient[index] += error * feature; });
-    }
-    weights.forEach((weight, index) => {
-      weights[index] -= 0.1 * (gradient[index] / rows.length + (index === 0 ? 0 : 0.01 * weight));
-    });
-  }
+  const weights = fitLogisticWeights(rows, 3);
   return validateRiskModel({ schemaVersion: 1, ...metadata, trainingRows: rows.length, weights });
 }
 

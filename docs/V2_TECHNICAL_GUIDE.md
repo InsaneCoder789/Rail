@@ -73,7 +73,7 @@ Features include sampled five-minute payment count, sample-local recipient famil
 
 History describes rows visible at the collection statement, including earlier work in a caller-owned transaction. `committed_at` is a stored database transaction timestamp, not proof of the exact instant an outer commit completed. Concurrent normal transfers from the same wallet serialize under wallet locks, so subsequently collected snapshots include their visible predecessors. Offline histories measure reconnect/server processing, not claimed disconnected-device event times. Client timestamps, confidence, history and device-change claims do not enter the trusted feature calculation. Device changes explicitly remain `not_assessed` until enrollment/revocation history is implemented.
 
-`rail_risk_observations` binds one immutable observation to the execution fingerprint. It retains schema/policy versions, database observation time, feature snapshot, explanation and model status; matching models also retain their artifact hash, synthetic flag and prediction/contributions. The pipeline validates/copies its model at construction so caller mutation cannot change the captured version or weights. These features do not yet feed an expanded trained model; the existing model still uses amount/channel. No model configured or a currency mismatch stores an explicit status and no fabricated probability.
+`rail_risk_observations` binds one immutable observation to the execution fingerprint. It retains schema/policy versions, database observation time, feature snapshot, explanation and model status; matching models also retain their artifact hash, synthetic flag and prediction/contributions. The pipeline validates/copies its models at construction so caller mutation cannot change the captured version or weights. Expanded inference is available through the optional behavioural artifact below; the legacy model retains its amount/channel features. Missing configuration, currency mismatch or an expanded model not yet valid for the observation time stores an explicit status and no fabricated probability.
 
 New standard-pipeline execution rows set `risk_required`; deferred commit checks reject missing observations. Observation failure rolls back the financial attempt, and retry is allowed. Successful replay does not overwrite observations or re-run a new model. Legacy records are not silently backfilled. These safeguards do not prevent a privileged database owner from disabling triggers. Feature snapshots are relational/private data; AES/HMAC transaction evidence currently protects the canonical payment, not these feature records. Retention, label provenance, encryption of risk records and access auditing require further work before production.
 
@@ -90,7 +90,38 @@ flowchart LR
   Features -. next milestone .-> Model[Expanded evaluated model]
 ```
 
-Next: trusted outcome labels, temporal independent evaluation, expanded logistic features, drift/calibration checks and explicit unavailable-model behavior. Automated fraud enforcement is not enabled by collecting these observations.
+Automated fraud enforcement is not enabled by collecting these observations. Real outcome/feature provenance review, drift monitoring and production evaluation remain necessary.
+
+## Expanded Behavioural ML
+
+`src/risk/behaviourModel.ts` implements an optional logistic model with ten fixed, versioned features: intercept, log amount, offline-channel indicator, sampled velocity, amount ratio, positive statistical deviation, receiver unseen in the sample, agent budget exposure, incomplete history and unavailable budget. Values are bounded/normalized; missing history and budget are explicit indicators rather than fabricated observations. Device claims and payment IDs are not model inputs. Feature contributions explain additive log odds, not causation or payment authority.
+
+Both logistic schemas share one bounded batch-gradient implementation in `logisticRisk.ts`, with the same L2 regularization and deterministic training. Expanded artifacts declare `featureSchema: "behaviour-v1"`, currency, model/dataset versions, a SHA-256 hash of the serialized supplied dataset, synthetic status, training-row count, last training-label availability time and exactly ten finite weights. Validators reject malformed provenance, sparse/non-finite vectors and unsupported schemas. The hash records supplied data; it does not prove authentic labels, independence or permission to use customer data.
+
+### Expanded Dataset Contract
+
+Use `npm run risk:train -- /private/path/behaviour-dataset.json /private/path/behaviour-model.json`. The command selects expanded training when the input declares `featureSchema: "behaviour-v1"`; old amount/channel datasets still work without that field. Input is capped at 20 MiB, each expanded split at 10,000 rows and runtime artifacts at 1 MiB. Outputs are created with mode 0600 and cannot overwrite existing artifacts. No default expanded model or real fraud dataset is shipped.
+
+Dataset metadata: `featureSchema`, `modelVersion`, `datasetId`, `currency`, `synthetic`. Arrays: `training` (at least ten rows), `validation` and `test` (at least two each); every split must contain both labels. Each row contains:
+
+| Field | Meaning |
+| --- | --- |
+| `eventId` | Unique event reference across all splits; no payment identifier is used as a feature. |
+| `amountMinor`, `channel` | The observed payment values, in the dataset's declared currency. |
+| `features` | A complete version-1 persisted feature snapshot, including database observation time and source. |
+| `label` | 0 or 1 from an independently reviewed outcome, not an automatic risk score. |
+| `labelObservedAt` | UTC timestamp when that outcome became available; must not precede observation. |
+| `labelSource` | `synthetic` for synthetic datasets, otherwise `confirmed_outcome`; declaration still needs independent verification. |
+
+All timestamps use canonical UTC ISO strings with milliseconds. Rows are observation-time ordered within each split. The latest training label must become available strictly before the first validation observation; the latest validation label must become available strictly before the first test observation. This prevents fitting with future labels and overlapping periods. Only training rows fit weights. Validation/test labels produce reports and affect provenance hash, not fitted weights. The caller must still exclude future-derived features, review entity leakage and establish honest labels: timestamps/source declarations alone cannot prove those facts.
+
+### Evaluation and Runtime
+
+The report returns validation and untouched-test log loss, Brier score, precision/recall and false-positive rate at experimental threshold 0.5, confusion counts, tied-score-safe average precision, ten calibration bins and expected calibration error. A separate warmed local-inference benchmark reports median/p95/max time over 1,000 calls; it excludes SQL, networking, evidence and financial commit and is not an end-to-end latency promise. Timings are machine-dependent and do not enter deterministic model weights or evaluation. These are diagnostics, not a fitted calibration transform or a release approval. Synthetic reports explicitly warn that they do not validate real fraud detection. Production thresholds require real class imbalance/cost analysis, meaningful sample sizes and temporal/entity leakage review; no accuracy percentage is claimed.
+
+Configure the resulting artifact as `RAIL_BEHAVIOUR_MODEL_PATH`. The pipeline copies/validates it once and runs inference only after collecting trusted features under financial locks. A configured expanded model takes precedence over the legacy model; currency mismatch or a training cutoff at/after observation time does not silently switch to legacy inference. It records `currency_mismatch` or `not_yet_valid` with no probability, while deterministic shadow explanations and financial checks remain active. `risk.behaviour` lifecycle events are committed with the payment. Existing successful replay retains its original prediction/version/hash even after a model rollback or replacement.
+
+Expanded inference remains shadow-only. It neither approves an intent nor denies funds, changes offline allowances or bypasses authentication/authorizations. Switch artifacts only through a reviewed configuration restart/cutover; no automatic retraining or model-driven enforcement is implemented. Drift monitoring, risk-record encryption/retention, independently sourced labels and hosted load/recovery acceptance remain separate work.
 
 ## Audit commitment foundation
 

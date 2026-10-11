@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.2 Expanded Behavioural ML and Temporal Evaluation: 12 October 2026
+
+Added `src/risk/behaviourModel.ts`, a ten-feature logistic model covering trusted history/velocity, amount deviation, recipient familiarity, agent exposure and explicit missing-history/budget indicators. It shares a bounded deterministic gradient trainer with the legacy amount/channel model rather than adding a network inference dependency. Named contributions explain log odds, not causation. Expanded artifact validation binds feature schema, model/dataset versions, serialized-dataset hash, currency, synthetic status, training count, label-availability cutoff and finite copied weights. Review additionally fixed sparse-array validation that could otherwise allow missing weights/vector elements through JavaScript array predicates.
+
+The existing `risk:train` command now accepts `behaviour-v1` datasets with chronological training, validation and test arrays, globally unique event references, source declarations and canonical observation/label timestamps. Training labels must be available before validation observations, and validation labels before test observations. Only training rows fit weights. Reports include held-out log loss, Brier score, confusion counts, precision/recall, false-positive rate, tied-score-safe average precision and calibration bins/error. A bounded warmed benchmark reports local inference median/p95/max separately from deterministic evaluation; it is not SQL/network/end-to-end latency. Synthetic reports explicitly disclaim real fraud validation. Source/timestamp declarations and hashes do not establish honest labels or independent feature provenance.
+
+Optional `RAIL_BEHAVIOUR_MODEL_PATH` selects expanded inference after trusted feature collection and financial locks. The legacy path remains supported. Expanded configuration takes precedence without silent fallback; currency mismatch or a future/not-earlier training cutoff records an explicit unavailable status and no probability. Invalid configured artifacts fail startup before runtime creation. Runtime reads are capped at 1 MiB, dataset reads at 20 MiB and each split at 10,000 rows. Output artifacts are created with mode 0600 and refuse overwrite. Committed predictions/version/hash remain unchanged across retry, rollback or replacement of the configured model. The `risk.behaviour` stage emits lifecycle events in the payment commit.
+
+Verification: 174 local tests pass, zero failures/skips, including PostgreSQL. Fifteen new cases cover learning from history with identical amount/channel, deterministic fitting without held-out label leakage, chronology/provenance, cold start/truncation, corrupt/sparse artifacts, temporal inference, tied-score/calibration reporting, bounded benchmark/IO, CLI permissions/overwrite, database-derived runtime predictions, replay/preference/unavailable-model behavior and startup rejection. No real fraud dataset or default production model was fabricated; tests use clearly labelled synthetic fixtures. GitHub Actions includes an explicit expanded-model step but this revision has not run remotely or deployed. Reports and dataset/runtime guidance are updated. Drift monitoring, protected risk-record retention, independently reviewed labels, blockchain batches/worker/contract, operator UI and production recovery/provider gates remain open; the overall V2 scope is not complete.
+
 ### V2.2 Trusted Behavioural Observation Foundation: 11 October 2026
 
 Added `src/risk/behaviourRisk.ts` and immutable, fingerprint-bound `rail_risk_observations`. The standard online/offline/agent pipeline now captures database-derived history after authority/token verification and sorted wallet locks, before the current ledger posting. A database-clock 30-day window and indexed 1,001-row query produce a maximum 1,000-sample snapshot with explicit truncation. Client event timestamps, confidence/history claims and unverified device identity cannot create trusted history. Earlier rows visible in the same supplied-client transaction are included; stored execution timestamps are not exact outer-commit times.
@@ -525,9 +535,13 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
 - `src/risk/behaviourRisk.ts`
   Collects bounded database history, derives statistical/velocity/budget observations and persists immutable shadow assessments inside financial execution. Provides participant-filtered summary reads without raw features.
 - `src/risk/logisticRisk.ts`
-  Validates and copies the amount/channel logistic artifact; implements training, prediction and evaluation. Synthetic demonstration results do not prove real-world fraud performance.
+  Validates/copies the amount/channel artifact, provides bounded JSON reads and the shared deterministic logistic trainer, and implements legacy prediction/evaluation. Synthetic results do not prove real-world fraud performance.
+- `src/risk/behaviourModel.ts`
+  Validates expanded feature/model schemas, guards chronological label availability, trains from trusted-feature datasets and reports named contributions, held-out calibration/ranking metrics and bounded local inference timings.
 - `src/risk/trainRisk.ts`
-  Loads private supplied training/validation arrays, writes a new artifact without overwriting existing files and prints evaluation metrics.
+  Loads bounded private legacy or behavioural datasets, writes new mode-0600 artifacts without overwriting and prints evaluation/benchmark diagnostics.
+- `test/behaviourModel.test.js`
+  Tests expanded training, features, provenance/time leakage, calibration/ranking, sparse/invalid artifacts, deterministic weights and CLI/IO/benchmark bounds.
 - `test/behaviourRisk.integration.test.js`
   Tests collection bounds, clock/provenance, history/concurrency, immutable replay, rollback, commit enforcement and participant-safe HTTP summaries.
 

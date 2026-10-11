@@ -3,8 +3,8 @@ import http from "node:http";
 import process from "node:process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile } from "node:fs/promises";
-import { validateRiskModel } from "../risk/logisticRisk.js";
+import { readRiskJson, validateRiskModel } from "../risk/logisticRisk.js";
+import { validateBehaviourModel } from "../risk/behaviourModel.js";
 import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 import { AgentAuthorityStore } from "../persistence/agentAuthority.js";
@@ -41,8 +41,10 @@ export async function createServerContext(options: {
   if (!databaseUrl?.trim()) throw new Error("DATABASE_URL_REQUIRED_FOR_SERVER");
   const evidenceStore = new TransactionEvidenceStore(loadTransactionKeyRing(process.env.RAIL_EVIDENCE_KEY_RING));
   const riskModel = process.env.RAIL_RISK_MODEL_PATH
-    ? validateRiskModel(JSON.parse(await readFile(process.env.RAIL_RISK_MODEL_PATH, "utf8")))
+    ? validateRiskModel(await readRiskJson(process.env.RAIL_RISK_MODEL_PATH))
     : undefined;
+  const behaviourModel = process.env.RAIL_BEHAVIOUR_MODEL_PATH
+    ? validateBehaviourModel(await readRiskJson(process.env.RAIL_BEHAVIOUR_MODEL_PATH)) : undefined;
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
   const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
@@ -83,7 +85,7 @@ export async function createServerContext(options: {
     idempotency,
     tracer,
     dlq: new MemoryDeadLetterQueue(),
-    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel),
+    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel, behaviourModel),
     evidence: evidenceStore,
     relay: (event) => eventStore.insertOutboxEvent(event),
   });

@@ -12,6 +12,7 @@ import { claimAuthorizationForExecution, consumeReservation, creditWallet, verif
 import { predictRisk, validateRiskModel, type LogisticRiskModel } from "../risk/logisticRisk.js";
 import { isPaymentTransaction } from "../server/validation.js";
 import { persistBehaviourObservation } from "../risk/behaviourRisk.js";
+import { validateBehaviourModel, type BehaviourRiskModel } from "../risk/behaviourModel.js";
 
 function emitStage(ctx: PaymentContext, stage: string, status: "start" | "ok" | "error"): void {
   const sequence = Number(ctx.state.eventSequence ?? 0) + 1;
@@ -47,7 +48,7 @@ function riskScoreStage(model?: LogisticRiskModel): Stage {
 }
 
 /** Mutations use only the transaction supplied by the durable idempotency boundary. */
-function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel): Stage {
+function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel, behaviourModel?: BehaviourRiskModel): Stage {
   return async (ctx) => {
     const client = ctx.dbClient;
     if (!client) throw new Error("db_not_initialized");
@@ -77,7 +78,9 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
       const gate = await tokenStore.beginOfflineSpend(txn, client);
       if (!gate.ok) throw new PipelineError(gate.reason, gate.reason);
     }
-    await persistBehaviourObservation(client, txn, riskModel);
+    emitStage(ctx, "risk.behaviour", "start");
+    await persistBehaviourObservation(client, txn, riskModel, behaviourModel);
+    emitStage(ctx, "risk.behaviour", "ok");
     await consumeReservation(client, txn.senderWalletId, txn.amountMinor, txn.currency);
     await creditWallet(client, txn.receiverWalletId, txn.amountMinor, txn.currency);
     emitStage(ctx, "wallet.transfer", "ok");
@@ -101,16 +104,18 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
   };
 }
 
-export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel): Stage {
+export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel,
+  behaviourRiskModel?: BehaviourRiskModel): Stage {
   const model = riskModel ? validateRiskModel(riskModel) : undefined;
+  const behaviourModel = behaviourRiskModel ? validateBehaviourModel(behaviourRiskModel) : undefined;
   const limiter = new Semaphore(4);
   const parallelChecks: Stage = (ctx) => runParallelBounded([
     withSpan(tracer, "verify.signatures", async (context) => verifyTransactionSignatureIfRequired(context.txn)),
-    withSpan(tracer, "risk.score", riskScoreStage(model)),
+    withSpan(tracer, "risk.score", riskScoreStage(behaviourModel ? undefined : model)),
   ], ctx, limiter);
   return (ctx) => runSequential([
     withSpan(tracer, "validate.core", validateBasics),
     withSpan(tracer, "prechecks.parallel", parallelChecks),
-    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model)),
+    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model, behaviourModel)),
   ], ctx);
 }

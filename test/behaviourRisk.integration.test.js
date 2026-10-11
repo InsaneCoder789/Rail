@@ -34,8 +34,8 @@ async function fixture(work) {
     await runMigrations(pool);
     await ensureOutboxSchema(pool);
     await pool.query("INSERT INTO wallets(wallet_id, balance) VALUES ('risk_sender', 1000000), ('risk_receiver', 0), ('risk_other', 0)");
-    const engine = (riskModel, after) => {
-      const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, riskModel);
+    const engine = (riskModel, after, behaviourModel) => {
+      const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, riskModel, behaviourModel);
       return new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
         dlq: new MemoryDeadLetterQueue(), pipeline: async ctx => { await pipeline(ctx); await after?.(ctx); } });
     };
@@ -148,6 +148,47 @@ test("behaviour reports a currency mismatch rather than fabricating a model prob
     assert.equal(row.model_status, "currency_mismatch");
     assert.equal(row.prediction, null);
     assert.equal(row.model_version, null);
+  });
+});
+
+const behaviourModel = { schemaVersion: 1, featureSchema: "behaviour-v1", modelVersion: "synthetic-behaviour-integration",
+  datasetId: "synthetic-integration", datasetHash: "a".repeat(64), currency: "INR", synthetic: true, trainingRows: 20,
+  trainingCutoff: "2025-01-01T00:00:00.000Z", weights: [-2, 0, 0, 5, 0, 0, 2, 0, 0, 0] };
+
+test("behaviour ML consumes locked database history, takes precedence and preserves its original prediction on replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const mutable = { ...behaviourModel, weights: [...behaviourModel.weights] };
+    const runtime = engine(model, undefined, mutable);
+    mutable.weights[0] = 100;
+    const first = await transaction();
+    await runtime.execute({ ...first, features: { recentCount: 999, receiverSeen: true } });
+    const original = (await pool.query("SELECT * FROM rail_risk_observations WHERE tx_id = $1", [first.txId])).rows[0];
+    assert.equal(original.model_version, behaviourModel.modelVersion);
+    assert.equal(original.prediction.modelKind, "behaviour-v1");
+    assert.equal(original.prediction.contributions.find(item => item.feature === "recent_velocity").value, 0);
+    assert.equal(original.prediction.contributions.find(item => item.feature === "intercept").value, -2);
+    for (let i = 0; i < 5; i++) await runtime.execute(await transaction());
+    const next = await transaction(100, "risk_other");
+    assert.equal((await runtime.execute(next)).status, "accepted");
+    const observed = (await pool.query("SELECT * FROM rail_risk_observations WHERE tx_id = $1", [next.txId])).rows[0];
+    assert.equal(observed.feature_snapshot.recentCount, 6);
+    assert.ok(observed.prediction.probability > original.prediction.probability);
+    await engine(undefined, undefined, { ...behaviourModel, modelVersion: "rolled_back", weights: Array(10).fill(0) }).execute(first);
+    assert.deepEqual((await pool.query("SELECT * FROM rail_risk_observations WHERE tx_id = $1", [first.txId])).rows[0], original);
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE type = 'risk.shadow_assessed'")).rowCount, 0);
+  });
+});
+
+test("behaviour ML reports future cutoff or currency mismatch without falling back or blocking valid payments", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    for (const [change, expected] of [[{ trainingCutoff: "2099-01-01T00:00:00.000Z" }, "not_yet_valid"], [{ currency: "USD" }, "currency_mismatch"]]) {
+      const txn = await transaction();
+      assert.equal((await engine(model, undefined, { ...behaviourModel, ...change }).execute(txn)).status, "accepted");
+      const observation = (await pool.query("SELECT * FROM rail_risk_observations WHERE tx_id = $1", [txn.txId])).rows[0];
+      assert.equal(observation.model_status, expected);
+      assert.equal(observation.prediction, null);
+      assert.equal(observation.model_version, null);
+    }
   });
 });
 

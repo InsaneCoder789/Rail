@@ -164,6 +164,9 @@ CREATE TABLE IF NOT EXISTS rail_risk_observations (
   CHECK ((model_status = 'available' AND model_version IS NOT NULL AND model_hash IS NOT NULL AND synthetic IS NOT NULL AND prediction IS NOT NULL)
     OR (model_status <> 'available' AND model_version IS NULL AND model_hash IS NULL AND synthetic IS NULL AND prediction IS NULL))
 );
+ALTER TABLE rail_risk_observations DROP CONSTRAINT IF EXISTS rail_risk_observations_model_status_check;
+ALTER TABLE rail_risk_observations ADD CONSTRAINT rail_risk_observations_model_status_check
+  CHECK (model_status IN ('available','currency_mismatch','not_configured','not_yet_valid'));
 CREATE TABLE IF NOT EXISTS rail_evidence_key_usage (
   encryption_key_fingerprint TEXT PRIMARY KEY CHECK (encryption_key_fingerprint ~ '^[a-f0-9]{64}$'),
   record_count BIGINT NOT NULL CHECK (record_count BETWEEN 1 AND 1000000)

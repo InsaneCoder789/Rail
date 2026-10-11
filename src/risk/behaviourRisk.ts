@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import type { PaymentTransaction } from "../domain/types.js";
 import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
 import { predictRisk, type LogisticRiskModel } from "./logisticRisk.js";
+import { predictBehaviourRisk, type BehaviourRiskModel } from "./behaviourModel.js";
 
 export interface BehaviourFeatures {
   readonly schemaVersion: 1;
@@ -34,7 +35,8 @@ export function explainBehaviour(features: BehaviourFeatures): { level: "insuffi
 }
 
 /** Called after financial authority checks and sorted wallet locks, before posting this payment. */
-export async function persistBehaviourObservation(client: PoolClient, txn: PaymentTransaction, model?: LogisticRiskModel): Promise<void> {
+export async function persistBehaviourObservation(client: PoolClient, txn: PaymentTransaction, model?: LogisticRiskModel,
+  behaviourModel?: BehaviourRiskModel): Promise<void> {
   const history = await client.query(`WITH timestamp AS (SELECT clock_timestamp() AS now)
     SELECT timestamp.now, history.amount_minor, history.receiver_wallet_id, history.committed_at
     FROM timestamp LEFT JOIN LATERAL (
@@ -76,9 +78,12 @@ export async function persistBehaviourObservation(client: PoolClient, txn: Payme
     deviceChange: "not_assessed",
   };
   const assessment = explainBehaviour(features);
-  const matching = model?.currency === txn.currency ? model : undefined;
-  const prediction = matching ? predictRisk(matching, txn) : null;
-  const modelStatus = matching ? "available" : model ? "currency_mismatch" : "not_configured";
+  const selected = behaviourModel ?? model;
+  const outOfTime = behaviourModel !== undefined && Date.parse(behaviourModel.trainingCutoff) >= Date.parse(observedAt);
+  const matching = selected?.currency === txn.currency && !outOfTime ? selected : undefined;
+  const prediction = matching ? behaviourModel ? { modelKind: "behaviour-v1", ...predictBehaviourRisk(behaviourModel,
+    { amountMinor: txn.amountMinor, channel: txn.channel, features }) } : { modelKind: "amount-channel-v1", ...predictRisk(model!, txn) } : null;
+  const modelStatus = matching ? "available" : !selected ? "not_configured" : selected.currency !== txn.currency ? "currency_mismatch" : "not_yet_valid";
   const fingerprint = createHash("sha256").update(canonicalTransactionPayload(txn)).digest("hex");
   await client.query(`INSERT INTO rail_risk_observations(tx_id, request_fingerprint, observed_at, feature_snapshot, assessment,
     model_status, model_version, model_hash, synthetic, prediction)

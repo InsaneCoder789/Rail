@@ -5,6 +5,10 @@ import { loadServerConfig } from "../dist/server/config.js";
 import { generateToken, verifyToken } from "../dist/auth/jwt.js";
 import { createAuthResolver } from "../dist/server/authentication.js";
 import { createServerContext } from "../dist/server/server.js";
+import { randomBytes } from "node:crypto";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function withEnvironment(values, work) {
   const original = {};
@@ -51,6 +55,22 @@ test("JWTs require a credential version and bounded lifetime", () => withEnviron
   assert.throws(() => verifyToken(long), /invalid_token/);
   assert.equal(verifyToken(generateToken("user_test", 2)).authVersion, 2);
 }));
+
+test("HTTP startup rejects corrupt or oversized behavioural artifacts before opening its runtime", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "rail-model-startup-"));
+  const path = join(directory, "model.json");
+  try {
+    await withEnvironment({ NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_RISK_MODEL_PATH: undefined,
+      RAIL_BEHAVIOUR_MODEL_PATH: path, RAIL_EVIDENCE_KEY_RING: JSON.stringify({ activeKeyId: "startup_test", keys: [{ keyId: "startup_test",
+        encryptionKey: randomBytes(32).toString("base64"), authenticationKey: randomBytes(32).toString("base64") }] }) }, async () => {
+      await writeFile(path, JSON.stringify({ featureSchema: "behaviour-v1", privateMetadata: "never_echo_me" }));
+      await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }),
+        { message: "INVALID_BEHAVIOUR_MODEL_OR_DATA" });
+      await writeFile(path, Buffer.alloc(1024 * 1024 + 1));
+      await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }), { message: "RISK_JSON_SIZE_LIMIT" });
+    });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
 
 test("serverless runtime does not implicitly trust client proxy headers", () => withEnvironment({
   NODE_ENV: "test", VERCEL: "1", RAIL_TRUST_PROXY_HEADERS: undefined,

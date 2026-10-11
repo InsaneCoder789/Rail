@@ -72,3 +72,5 @@ jobs:
         run: node --test test/authRoutes.test.js test/risk.test.js test/auditCommitment.test.js
       - name: Verify trusted behavioural observations, privacy, rollback and replay
         run: node --test test/behaviourRisk.integration.test.js
+      - name: Verify expanded behavioural ML, temporal leakage guards and calibration reporting
+        run: node --test test/behaviourModel.test.js
