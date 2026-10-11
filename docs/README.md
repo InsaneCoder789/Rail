@@ -322,6 +322,7 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
 | `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
 | `RAIL_BEHAVIOUR_MODEL_PATH` | Optional expanded `behaviour-v1` artifact. Uses trusted historical features after financial locks; takes precedence over the legacy model, remains shadow-only. |
+| `RAIL_ANOMALY_MODEL_PATH` | Optional `behaviour-anomaly-v1` reference-distance artifact. Runs alongside logistic inference with sufficient trusted history; detailed scores remain encrypted and shadow-only. |
 | `RAIL_REQUIRE_JSON_CONTENT_TYPE` | If not `false`, JSON routes require `Content-Type: application/json`. |
 | `RAIL_REQUEST_BODY_TIMEOUT_MS` | Absolute body-read deadline for JSON routes. Default 10000 ms; slow/stalled uploads receive 408. |
 | `RAIL_EXPOSE_INTERNAL_ERRORS` | If `true`, server responses expose internal error messages. |
@@ -435,6 +436,8 @@ The versioned deterministic policy reports amount deviation, velocity and budget
 New HTTP-runtime payments encrypt detailed features, model hashes and predictions in a separate AES-256-GCM/HMAC risk envelope, bound to the payment fingerprint. Their plaintext copies are not retained in the observation table, and the old probability-bearing shadow event is suppressed. Observation time, explanation codes and model availability/version/synthetic status remain queryable; the API verifies them against the envelope before returning `protection: verified`. Missing keys or failed verification return `verification_unavailable` without the assessment. Historical plaintext observations remain explicitly `legacy_plaintext`; they are not silently encrypted or removed. Real-label validation, retention/privacy approval, monitored key recovery and production fraud enforcement remain open.
 
 `npm run risk:monitor -- /private/path/cohorts.json` compares chronological reference/current cohorts with the expanded model. It reports aggregate feature/prediction shifts and missingness, not individual transactions or fraud accuracy. Exit codes are 0 for no detected shift, 2 for detected shift, 3 for insufficient samples and 1 for invalid input. This offline diagnostic does not auto-retrain or change payments; threshold validation, independently reviewed inputs, protected risk-record retention and live operational acceptance remain required.
+
+Optional `RAIL_ANOMALY_MODEL_PATH` adds a robust reference-distance baseline alongside logistic inference. Train it with `risk:train` using a `behaviour-anomaly-v1` dataset containing chronological training, calibration and test cohorts. It learns feature medians/scales from training only and calibrates an experimental threshold on the later calibration cohort. Unusualness is not fraud probability or a payment decision. Cold start, truncated history, future artifacts and currency mismatch return explicit unavailable statuses. The API's `anomaly` summary exposes availability/version/synthetic status, not distances or contributions; those remain in the protected observation. See `V2_TECHNICAL_GUIDE.md` for the algorithm, dataset requirements and limits.
 
 ### `GET /v1/payments/:txId/evidence`
 

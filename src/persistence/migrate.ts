@@ -169,6 +169,17 @@ ALTER TABLE rail_risk_observations DROP CONSTRAINT IF EXISTS rail_risk_observati
 ALTER TABLE rail_risk_observations ADD CONSTRAINT rail_risk_observations_model_status_check
   CHECK (model_status IN ('available','currency_mismatch','not_configured','not_yet_valid'));
 ALTER TABLE rail_risk_observations ADD COLUMN IF NOT EXISTS protection_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE rail_risk_observations ADD COLUMN IF NOT EXISTS anomaly_summary JSONB NOT NULL DEFAULT '{"status":"not_configured"}'::jsonb;
+ALTER TABLE rail_risk_observations DROP CONSTRAINT IF EXISTS rail_risk_anomaly_summary_check;
+ALTER TABLE rail_risk_observations ADD CONSTRAINT rail_risk_anomaly_summary_check CHECK ((
+  jsonb_typeof(anomaly_summary) = 'object' AND anomaly_summary - 'status' - 'modelVersion' - 'synthetic' = '{}'::jsonb
+    AND anomaly_summary->>'status' IN
+    ('not_configured','currency_mismatch','not_yet_valid','insufficient_history','available') AND
+  ((anomaly_summary->>'status' = 'available' AND protection_required AND jsonb_typeof(anomaly_summary->'modelVersion') = 'string'
+      AND length(anomaly_summary->>'modelVersion') BETWEEN 1 AND 128 AND length(btrim(anomaly_summary->>'modelVersion')) > 0
+      AND jsonb_typeof(anomaly_summary->'synthetic') = 'boolean') OR
+    (anomaly_summary->>'status' <> 'available' AND NOT (anomaly_summary ? 'modelVersion') AND NOT (anomaly_summary ? 'synthetic')))
+) IS TRUE);
 ALTER TABLE rail_risk_observations ALTER COLUMN feature_snapshot DROP NOT NULL;
 DO $$
 DECLARE name TEXT;

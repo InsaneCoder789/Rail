@@ -12,6 +12,7 @@ export interface RiskRecord {
   readonly modelHash: string | null;
   readonly synthetic: boolean | null;
   readonly prediction: unknown;
+  readonly anomaly?: { readonly summary: unknown; readonly modelHash: string | null; readonly prediction: unknown };
 }
 interface Binding { readonly txId: string; readonly requestFingerprint: string; }
 interface RiskEnvelope extends Binding {
@@ -32,6 +33,7 @@ interface ProtectedRiskSummary {
   readonly model_status: string;
   readonly model_version: string | null;
   readonly synthetic: boolean | null;
+  readonly anomaly_summary?: unknown;
 }
 function aad(record: RiskEnvelope | (Binding & { keyId: string; payloadHash: string })): string {
   return JSON.stringify(["rail:protected-risk:v1", record.keyId, record.txId, record.requestFingerprint, record.payloadHash]);
@@ -103,7 +105,8 @@ export class RiskProtectionStore {
     const record = decryptRiskRecord(envelope, binding, this.ring.get(envelope.keyId));
     if (hash(JSON.stringify(["rail:risk-commitment:v1", bytes(envelope), envelope.mac])) !== row.commitment ||
         record.observedAt !== new Date(row.observed_at).toISOString() || !isDeepStrictEqual(record.assessment, row.assessment) ||
-        record.modelStatus !== row.model_status || record.modelVersion !== row.model_version || record.synthetic !== row.synthetic) {
+        record.modelStatus !== row.model_status || record.modelVersion !== row.model_version || record.synthetic !== row.synthetic ||
+        !isDeepStrictEqual(record.anomaly?.summary ?? { status: "not_configured" }, row.anomaly_summary ?? { status: "not_configured" })) {
       throw new Error("protected_risk_summary_mismatch");
     }
   }

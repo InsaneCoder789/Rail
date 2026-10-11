@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readRiskJson, validateRiskModel } from "../risk/logisticRisk.js";
 import { validateBehaviourModel } from "../risk/behaviourModel.js";
+import { validateAnomalyModel } from "../risk/anomalyRisk.js";
 import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 import { RiskProtectionStore, loadRiskKeyRing } from "../persistence/riskProtection.js";
@@ -47,6 +48,8 @@ export async function createServerContext(options: {
     : undefined;
   const behaviourModel = process.env.RAIL_BEHAVIOUR_MODEL_PATH
     ? validateBehaviourModel(await readRiskJson(process.env.RAIL_BEHAVIOUR_MODEL_PATH)) : undefined;
+  const anomalyModel = process.env.RAIL_ANOMALY_MODEL_PATH
+    ? validateAnomalyModel(await readRiskJson(process.env.RAIL_ANOMALY_MODEL_PATH)) : undefined;
   const riskProtection = new RiskProtectionStore(loadRiskKeyRing(process.env.RAIL_RISK_RECORD_KEY_RING, paymentKeys));
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
@@ -88,7 +91,7 @@ export async function createServerContext(options: {
     idempotency,
     tracer,
     dlq: new MemoryDeadLetterQueue(),
-    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel, behaviourModel, riskProtection),
+    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel, behaviourModel, riskProtection, anomalyModel),
     riskProtectionRequired: true,
     evidence: evidenceStore,
     relay: (event) => eventStore.insertOutboxEvent(event),

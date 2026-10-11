@@ -14,6 +14,7 @@ import { isPaymentTransaction } from "../server/validation.js";
 import { persistBehaviourObservation } from "../risk/behaviourRisk.js";
 import { validateBehaviourModel, type BehaviourRiskModel } from "../risk/behaviourModel.js";
 import type { RiskProtectionStore } from "../persistence/riskProtection.js";
+import { validateAnomalyModel, type AnomalyModel } from "../risk/anomalyRisk.js";
 
 function emitStage(ctx: PaymentContext, stage: string, status: "start" | "ok" | "error"): void {
   const sequence = Number(ctx.state.eventSequence ?? 0) + 1;
@@ -50,7 +51,7 @@ function riskScoreStage(model?: LogisticRiskModel): Stage {
 
 /** Mutations use only the transaction supplied by the durable idempotency boundary. */
 function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel, behaviourModel?: BehaviourRiskModel,
-  protection?: RiskProtectionStore): Stage {
+  protection?: RiskProtectionStore, anomalyModel?: AnomalyModel): Stage {
   return async (ctx) => {
     const client = ctx.dbClient;
     if (!client) throw new Error("db_not_initialized");
@@ -82,7 +83,7 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
     }
     emitStage(ctx, "risk.behaviour", "start");
     if (ctx.state.requireRiskProtection === true && !protection) throw new Error("risk_protection_required");
-    await persistBehaviourObservation(client, txn, riskModel, behaviourModel, protection);
+    await persistBehaviourObservation(client, txn, riskModel, behaviourModel, protection, anomalyModel);
     emitStage(ctx, "risk.behaviour", "ok");
     await consumeReservation(client, txn.senderWalletId, txn.amountMinor, txn.currency);
     await creditWallet(client, txn.receiverWalletId, txn.amountMinor, txn.currency);
@@ -109,9 +110,11 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
 }
 
 export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel,
-  behaviourRiskModel?: BehaviourRiskModel, protection?: RiskProtectionStore): Stage {
+  behaviourRiskModel?: BehaviourRiskModel, protection?: RiskProtectionStore, anomalyRiskModel?: AnomalyModel): Stage {
   const model = riskModel ? validateRiskModel(riskModel) : undefined;
   const behaviourModel = behaviourRiskModel ? validateBehaviourModel(behaviourRiskModel) : undefined;
+  const anomalyModel = anomalyRiskModel ? validateAnomalyModel(anomalyRiskModel) : undefined;
+  if (anomalyModel && !protection) throw new Error("ANOMALY_MODEL_REQUIRES_RISK_PROTECTION");
   const limiter = new Semaphore(4);
   const parallelChecks: Stage = (ctx) => runParallelBounded([
     withSpan(tracer, "verify.signatures", async (context) => verifyTransactionSignatureIfRequired(context.txn)),
@@ -120,6 +123,6 @@ export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOffli
   return (ctx) => runSequential([
     withSpan(tracer, "validate.core", validateBasics),
     withSpan(tracer, "prechecks.parallel", parallelChecks),
-    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model, behaviourModel, protection)),
+    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model, behaviourModel, protection, anomalyModel)),
   ], ctx);
 }

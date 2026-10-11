@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.2 Explainable Anomaly Reference Baseline: 12 October 2026
+
+Added `src/risk/anomalyRisk.ts`, a fitted median/MAD reference-distance baseline over the nine non-intercept behavioural dimensions. It complements logistic inference rather than replacing it. Training fits medians/scales, a later calibration cohort sets an experimental nearest-rank p95 threshold with floor three, and later test observations affect neither. Scale flooring and capped named contributions keep constant/binary dimensions and extreme valid inputs finite. This is unusualness relative to a supplied reference cohort, not a fraud probability, neural network, false-positive guarantee or automatic payment decision. Correlated dimensions, narrow/contaminated references and declared source/history provenance require independent evaluation.
+
+The existing `risk:train` CLI now accepts `behaviour-anomaly-v1` datasets with ordered/disjoint training, calibration and test cohorts (20-10,000 rows each). Rows reuse strict feature validation and require sufficient nontruncated history. Metadata binds model/dataset versions, serialized input hash, currency, synthetic/reference-source status and calibration cutoff. Dense finite artifact parameters are copied and bounded. Private output refuses overwrite; reports contain aggregate distance/alert statistics, explicit unavailable fraud accuracy and separately measured bounded local-inference latency. No default artifact or authentic reference cohort was fabricated.
+
+Optional `RAIL_ANOMALY_MODEL_PATH` loads a validated 1-MiB-bounded artifact before pool creation. Runtime uses the already trusted financial-client features after locking. Cold start/truncation, currency mismatch and future cutoff produce explicit unavailable states, not substituted scores. Full anomaly prediction/hash lives only in the encrypted risk record. The additive SQL summary is constrained to status/version/synthetic fields and authenticated before participant disclosure; completed replay keeps the original snapshot. Older protected records without the optional anomaly field remain verifiable as `not_configured` without rewriting ciphertext. No anomaly flag denies a transfer, approves an agent or modifies offline authority.
+
+Verification: 205 local tests pass, zero failures/skips, including PostgreSQL. Thirteen added cases cover finite constant references, outlier resistance/deterministic fitting, calibration/test separation, chronology/duplicate/provenance/bounds, malformed/sparse artifacts, incomplete/future inference, clipping, private CLI/no-overwrite, bounded inference benchmarks, old encrypted-record compatibility, trusted runtime coexistence/replay, explicit unavailable models, summary tampering/plaintext-field rejection/atomic write rollback and startup validation. The first run's privacy assertion accidentally matched the synthetic warning prefix; it now checks actual event IDs. GitHub Actions has explicit anomaly coverage, not yet remotely run. Reports document algorithm/source and operational limitations. Durable audit batching/contract/worker, operator UI, legitimate labels, reviewed enforcement and real hosted/provider/key-recovery acceptance remain open; this is not full V2 completion.
+
 ### V2.2 Atomic Protected Risk Records: 12 October 2026
 
 Added `src/persistence/riskProtection.ts` and mandatory HTTP configuration `RAIL_RISK_RECORD_KEY_RING`. A purpose-bound AES-256-GCM envelope with independently keyed HMAC-SHA256 retains detailed features, assessment, model provenance and predictions. HTTP startup rejects absent/malformed rings and material shared with any configured payment-evidence version. No existing secrets were silently replaced. This is application-loaded symmetric encryption, not a public signature, KMS or whole-database encryption.
@@ -549,6 +559,11 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Contains the event listing and SSE stream endpoints.
 
 ### Risk Modules
+
+- `src/risk/anomalyRisk.ts`
+  Fits a bounded median/MAD reference baseline, calibrates an experimental threshold, validates artifacts and reports explainable shadow distances and local inference timing.
+- `test/anomalyRisk.test.js`
+  Covers fitting/calibration separation, temporal/provenance limits, artifact validation, constant/extreme inputs, private CLI and inference bounds.
 
 - `src/persistence/riskProtection.ts`
   Implements risk-purpose AES/GCM and HMAC envelopes, independent key-ring loading, atomic quotas/ciphertext persistence and authenticated summary verification.

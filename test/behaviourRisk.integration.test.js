@@ -17,6 +17,7 @@ import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { TransactionKeyRing } from "../dist/crypto/transactionProtection.js";
 import { RiskProtectionStore, decryptRiskRecord } from "../dist/persistence/riskProtection.js";
+import { trainAnomalyDataset } from "../dist/risk/anomalyRisk.js";
 
 dotenv.config();
 const databaseUrl = process.env.DATABASE_URL;
@@ -36,8 +37,8 @@ async function fixture(work) {
     await runMigrations(pool);
     await ensureOutboxSchema(pool);
     await pool.query("INSERT INTO wallets(wallet_id, balance) VALUES ('risk_sender', 1000000), ('risk_receiver', 0), ('risk_other', 0)");
-    const engine = (riskModel, after, behaviourModel, protection, required = false) => {
-      const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, riskModel, behaviourModel, protection);
+    const engine = (riskModel, after, behaviourModel, protection, required = false, anomalyModel) => {
+      const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, riskModel, behaviourModel, protection, anomalyModel);
       return new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
         riskProtectionRequired: required,
         dlq: new MemoryDeadLetterQueue(), pipeline: async ctx => { await pipeline(ctx); await after?.(ctx); } });
@@ -68,6 +69,101 @@ test("behaviour policy explicitly distinguishes cold start and unexplained devic
 });
 
 function riskKeys(keyId = "risk_test_v1") { return { keyId, encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) }; }
+
+function anomalyArtifact() {
+  const rows = start => Array.from({ length: 20 }, (_, index) => ({ eventId: `reference_${start + index}`, amountMinor: 100,
+    channel: "online", features: { schemaVersion: 1, observedAt: new Date(Date.UTC(2025, 0, 1 + start + index)).toISOString(),
+      source: "postgres_posted_payments", historyWindowDays: 30, historyCount: 20, historyTruncated: false,
+      recentCount: 1, receiverSeen: true, meanAmountMinor: 100, amountRatio: 1, amountZScore: 0,
+      agentBudgetExposure: null, deviceChange: "not_assessed" } }));
+  return trainAnomalyDataset({ featureSchema: "behaviour-anomaly-v1", modelVersion: "synthetic-runtime-anomaly",
+    datasetId: "synthetic-reference", currency: "INR", synthetic: true, referenceSource: "synthetic",
+    training: rows(0), calibration: rows(30), test: rows(60) }).model;
+}
+
+test("protected records written before anomaly support verify unchanged after the additive schema migration", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    const legacyWriter = { async persist(client, binding, record) {
+      const { anomaly, ...beforeAnomaly } = record;
+      await protection.persist(client, binding, beforeAnomaly);
+    } };
+    const txn = await transaction(); await engine(model, undefined, undefined, legacyWriter, true).execute(txn);
+    const before = (await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [txn.txId])).rows[0];
+    // Recreate the prior schema shape inside this isolated fixture before the additive upgrade.
+    await pool.query("ALTER TABLE rail_risk_observations DROP CONSTRAINT rail_risk_anomaly_summary_check");
+    await pool.query("ALTER TABLE rail_risk_observations DROP COLUMN anomaly_summary");
+    await runMigrations(pool);
+    const response = await readBehaviourObservation(pool, txn.txId, "risk_sender", protection);
+    assert.equal(response.protection, "verified");
+    assert.deepEqual(response.anomaly, { status: "not_configured" });
+    assert.deepEqual((await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [txn.txId])).rows[0], before);
+  });
+});
+
+test("anomaly runtime uses trusted history alongside ML and keeps detailed distances encrypted across replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key])), artifact = anomalyArtifact();
+    const runtime = engine(model, undefined, undefined, protection, true, artifact);
+    artifact.centers[0] = 2;
+    const first = await transaction(); await runtime.execute(first);
+    const cold = (await readBehaviourObservation(pool, first.txId, "risk_sender", protection)).anomaly;
+    assert.deepEqual(cold, { status: "insufficient_history" });
+    for (let i = 0; i < 5; i++) await runtime.execute(await transaction());
+    const txn = await transaction(100000, "risk_other");
+    const receipt = await runtime.execute({ ...txn, anomalyScore: 0, features: { historyCount: 0 } });
+    assert.equal(receipt.status, "accepted");
+    const row = (await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [txn.txId])).rows[0];
+    const decoded = decryptRiskRecord(row.envelope, { txId: txn.txId, requestFingerprint: row.request_fingerprint }, key);
+    assert.equal(decoded.anomaly.summary.status, "available");
+    assert.equal(decoded.anomaly.prediction.unusual, true);
+    assert.ok(Number.isFinite(decoded.prediction.probability));
+    assert.match(decoded.anomaly.modelHash, /^[a-f0-9]{64}$/);
+    const summary = await readBehaviourObservation(pool, txn.txId, "risk_sender", protection);
+    assert.deepEqual(summary.anomaly, { status: "available", modelVersion: "synthetic-runtime-anomaly", synthetic: true });
+    assert.ok(!JSON.stringify(summary).includes("distance"));
+    await engine(model, undefined, undefined, protection, true, { ...anomalyArtifact(), modelVersion: "replacement" }).execute(txn);
+    assert.deepEqual((await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [txn.txId])).rows[0], row);
+    await runMigrations(pool);
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_sender", protection)).protection, "verified");
+  });
+});
+
+test("anomaly runtime explicitly records unavailable models without a fallback or transfer denial", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    for (const [change, expected] of [[{ currency: "USD" }, "currency_mismatch"], [{ trainingCutoff: "2099-01-01T00:00:00.000Z" }, "not_yet_valid"]]) {
+      const txn = await transaction();
+      assert.equal((await engine(model, undefined, undefined, protection, true, { ...anomalyArtifact(), ...change }).execute(txn)).status, "accepted");
+      assert.deepEqual((await readBehaviourObservation(pool, txn.txId, "risk_sender", protection)).anomaly, { status: expected });
+      const row = (await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [txn.txId])).rows[0];
+      const record = decryptRiskRecord(row.envelope, { txId: txn.txId, requestFingerprint: row.request_fingerprint }, key);
+      assert.equal(record.anomaly.prediction, null);
+    }
+  });
+});
+
+test("anomaly summary tampering fails authenticated reads and failed observations roll back money", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    const runtime = engine(undefined, undefined, undefined, protection, true, anomalyArtifact());
+    const txn = await transaction(); await runtime.execute(txn);
+    await pool.query("ALTER TABLE rail_risk_observations DISABLE TRIGGER rail_risk_immutable");
+    await assert.rejects(pool.query("UPDATE rail_risk_observations SET anomaly_summary = '{\"status\":\"insufficient_history\",\"distance\":99}' WHERE tx_id = $1", [txn.txId]),
+      /rail_risk_anomaly_summary_check/);
+    await pool.query("UPDATE rail_risk_observations SET anomaly_summary = '{\"status\":\"not_configured\"}' WHERE tx_id = $1", [txn.txId]);
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_sender", protection)).reason, "verification_failed");
+    await pool.query("ALTER TABLE rail_risk_observations ENABLE TRIGGER rail_risk_immutable");
+    await pool.query(`CREATE FUNCTION fail_anomaly_observation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'anomaly_observation_failure'; END $$;
+      CREATE TRIGGER fail_anomaly_observation BEFORE INSERT ON rail_risk_observations FOR EACH ROW EXECUTE FUNCTION fail_anomaly_observation()`);
+    const next = await transaction();
+    await assert.rejects(runtime.execute(next), /anomaly_observation_failure/);
+    assert.equal((await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [next.txId])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries WHERE tx_id = $1", [next.txId])).rowCount, 0);
+    await pool.query("DROP TRIGGER fail_anomaly_observation ON rail_risk_observations");
+    assert.equal((await runtime.execute(next)).status, "accepted");
+  });
+});
 
 test("protected risk commits ciphertext without raw features, model hashes or probabilities in relational/event copies", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, engine, transaction }) => {

@@ -20,7 +20,7 @@ export interface BehaviourRiskModel {
   readonly weights: readonly number[];
 }
 
-interface BehaviourInput {
+export interface BehaviourInput {
   readonly amountMinor: number;
   readonly channel: PaymentTransaction["channel"];
   readonly features: BehaviourFeatures;

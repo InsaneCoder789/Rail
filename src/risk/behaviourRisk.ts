@@ -5,6 +5,7 @@ import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
 import { predictRisk, type LogisticRiskModel } from "./logisticRisk.js";
 import { predictBehaviourRisk, type BehaviourRiskModel } from "./behaviourModel.js";
 import type { RiskProtectionStore } from "../persistence/riskProtection.js";
+import { predictAnomaly, type AnomalyModel } from "./anomalyRisk.js";
 
 export interface BehaviourFeatures {
   readonly schemaVersion: 1;
@@ -37,7 +38,8 @@ export function explainBehaviour(features: BehaviourFeatures): { level: "insuffi
 
 /** Called after financial authority checks and sorted wallet locks, before posting this payment. */
 export async function persistBehaviourObservation(client: PoolClient, txn: PaymentTransaction, model?: LogisticRiskModel,
-  behaviourModel?: BehaviourRiskModel, protection?: RiskProtectionStore): Promise<void> {
+  behaviourModel?: BehaviourRiskModel, protection?: RiskProtectionStore, anomalyModel?: AnomalyModel): Promise<void> {
+  if (anomalyModel && !protection) throw new Error("ANOMALY_MODEL_REQUIRES_RISK_PROTECTION");
   const history = await client.query(`WITH timestamp AS (SELECT clock_timestamp() AS now)
     SELECT timestamp.now, history.amount_minor, history.receiver_wallet_id, history.committed_at
     FROM timestamp LEFT JOIN LATERAL (
@@ -88,19 +90,28 @@ export async function persistBehaviourObservation(client: PoolClient, txn: Payme
   const fingerprint = createHash("sha256").update(canonicalTransactionPayload(txn)).digest("hex");
   const summary = { policyVersion: "behaviour-shadow-v1", mode: "shadow", ...assessment };
   const modelHash = matching ? createHash("sha256").update(JSON.stringify(matching)).digest("hex") : null;
+  const anomalyStatus = !anomalyModel ? "not_configured" : anomalyModel.currency !== txn.currency ? "currency_mismatch" :
+    Date.parse(anomalyModel.trainingCutoff) >= Date.parse(observedAt) ? "not_yet_valid" :
+    features.historyCount < 5 || features.historyTruncated ? "insufficient_history" : "available";
+  const anomalySummary = anomalyStatus === "available" ? { status: anomalyStatus, modelVersion: anomalyModel!.modelVersion,
+    synthetic: anomalyModel!.synthetic } : { status: anomalyStatus };
+  const anomaly = { summary: anomalySummary, modelHash: anomalyStatus === "available" ?
+    createHash("sha256").update(JSON.stringify(anomalyModel)).digest("hex") : null,
+    prediction: anomalyStatus === "available" ? predictAnomaly(anomalyModel!, { amountMinor: txn.amountMinor, channel: txn.channel, features }) : null };
   if (protection) await protection.persist(client, { txId: txn.txId, requestFingerprint: fingerprint }, { observedAt,
     features, assessment: summary, modelStatus, modelVersion: matching?.modelVersion ?? null,
-    modelHash, synthetic: matching?.synthetic ?? null, prediction });
+    modelHash, synthetic: matching?.synthetic ?? null, prediction, anomaly });
   await client.query(`INSERT INTO rail_risk_observations(tx_id, request_fingerprint, observed_at, feature_snapshot, assessment,
-    model_status, model_version, model_hash, synthetic, prediction, protection_required)
-    VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8,$9,$10::jsonb,$11)`, [txn.txId, fingerprint, observedAt,
+    model_status, model_version, model_hash, synthetic, prediction, protection_required, anomaly_summary)
+    VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8,$9,$10::jsonb,$11,$12::jsonb)`, [txn.txId, fingerprint, observedAt,
     protection ? null : JSON.stringify(features), JSON.stringify(summary), modelStatus, matching?.modelVersion ?? null,
-    protection ? null : modelHash, matching?.synthetic ?? null, !protection && prediction ? JSON.stringify(prediction) : null, Boolean(protection)]);
+    protection ? null : modelHash, matching?.synthetic ?? null, !protection && prediction ? JSON.stringify(prediction) : null,
+    Boolean(protection), JSON.stringify(anomalySummary)]);
 }
 
 export async function readBehaviourObservation(client: Pick<PoolClient, "query">, txId: string, walletId: string, protection?: RiskProtectionStore) {
   const result = await client.query(`SELECT observation.observed_at, observation.assessment, observation.model_status,
-    observation.model_version, observation.synthetic, observation.protection_required, execution.request_fingerprint,
+    observation.model_version, observation.synthetic, observation.protection_required, observation.anomaly_summary, execution.request_fingerprint,
     protected.envelope, protected.commitment FROM rail_payment_executions execution
     JOIN authorizations auth ON auth.tx_id = execution.tx_id
     LEFT JOIN rail_risk_observations observation ON observation.tx_id = execution.tx_id
@@ -122,5 +133,7 @@ export async function readBehaviourObservation(client: Pick<PoolClient, "query">
     protection: row.protection_required ? "verified" : "legacy_plaintext",
     assessment: { mode: row.assessment.mode, policyVersion: row.assessment.policyVersion,
       level: row.assessment.level, reasons: row.assessment.reasons },
-    modelStatus: row.model_status, modelVersion: row.model_version, synthetic: row.synthetic };
+    modelStatus: row.model_status, modelVersion: row.model_version, synthetic: row.synthetic,
+    anomaly: { status: row.anomaly_summary.status, ...(row.anomaly_summary.status === "available" ? {
+      modelVersion: row.anomaly_summary.modelVersion, synthetic: row.anomaly_summary.synthetic } : {}) } };
 }

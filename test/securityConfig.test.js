@@ -80,6 +80,21 @@ test("serverless runtime does not implicitly trust client proxy headers", () => 
   assert.equal(loadServerConfig().trustProxyHeaders, true);
 }));
 
+test("HTTP startup refuses invalid anomaly artifacts before creating a database pool", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "rail-anomaly-startup-")), path = join(directory, "model.json");
+  try {
+    await writeFile(path, JSON.stringify({ featureSchema: "behaviour-anomaly-v1", privateMetadata: "never_echo_this" }));
+    await withEnvironment({ NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_RISK_MODEL_PATH: undefined,
+      RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: path,
+      RAIL_EVIDENCE_KEY_RING: JSON.stringify({ activeKeyId: "anomaly_startup_test", keys: [{ keyId: "anomaly_startup_test",
+        encryptionKey: randomBytes(32).toString("base64"), authenticationKey: randomBytes(32).toString("base64") }] }) }, async () => {
+      await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }), { message: "INVALID_ANOMALY_MODEL_OR_DATA" });
+      await writeFile(path, Buffer.alloc(1024 * 1024 + 1));
+      await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }), { message: "RISK_JSON_SIZE_LIMIT" });
+    });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("HTTP startup requires a separately provisioned risk key ring without changing existing secrets", () => {
   const encryptionKey = randomBytes(32).toString("base64"), authenticationKey = randomBytes(32).toString("base64");
   return withEnvironment({ NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_RISK_MODEL_PATH: undefined,

@@ -59,7 +59,7 @@ The command writes a model artifact with provenance and weights, refuses to over
 
 Log loss measures confidence in the correct label. Brier score measures squared probability error. Precision and recall are reported at threshold 0.5; this is an experiment threshold rather than a payment policy. Temporal split, customer leakage prevention, class imbalance, calibration, threshold costs and drift monitoring still require dedicated validation. The command accepts supplied splits; it cannot establish their independence or verify the truth of the labels.
 
-`RAIL_RISK_MODEL_PATH` points to a validated model JSON loaded once at server-context creation. An invalid configured model stops initialization. Without this variable, there is no ML inference. No default trained model is shipped because this repository contains no validated real fraud dataset.
+`RAIL_RISK_MODEL_PATH` points to the legacy validated model JSON loaded once at server-context creation. An invalid configured model stops initialization. Expanded logistic and anomaly artifacts have their own optional variables described below; without any configured artifact, there is no trained inference. No default trained model is shipped because this repository contains no validated real fraud dataset.
 
 Legacy unprotected library callers using the amount/channel model append `risk.shadow_assessed` with probability and contributions. Protected HTTP runtimes suppress that event to avoid retaining an unencrypted inference copy; inference is captured after financial locking inside the protected risk record instead. Safe `risk.behaviour` lifecycle events still share the financial transaction. The existing worker delivers at least once; consumers must deduplicate delivery IDs. External acknowledgement and production delivery acceptance remain separate from event persistence.
 
@@ -165,6 +165,39 @@ This diagram is the integration design. Only commitment/proof computation is imp
 Anchoring must run after financial commit. A chain outage must delay an audit anchor rather than reverse a completed payment. Reorganizations need confirmation policy and re-anchoring. An independent verifier must have a trusted root/checkpoint; a database administrator can rewrite a locally stored tree and its root together.
 
 A valid proof shows inclusion of the supplied commitment under a trusted root. It does not establish settlement, authorization validity, correctness of the input data or completeness of the batch. Merkle roots are not encryption. Clients should receive proofs only for records they are permitted to inspect.
+
+## Explainable Anomaly Baseline
+
+`src/risk/anomalyRisk.ts` implements a fitted robust-distance baseline, not a neural network or a fraud classifier. It reuses the nine non-intercept behavioural dimensions and trusted runtime feature validation. Separate per-feature training medians and median absolute deviations describe the supplied reference population. [NIST describes MAD as a robust scale alternative](https://www.itl.nist.gov/div898/software/dataplot/refman2/auxillar/mad.htm); that does not validate Rail's multivariate score or thresholds.
+
+Each scale is `max(0.05, 1.4826 * MAD)`. The floor prevents division by zero for constant/binary reference dimensions; no Gaussian distribution or calibrated probability is assumed. Inference takes absolute standardized distances, caps each at 20 and reports their root-mean-square across nine dimensions. Named contributions include a saturation flag. Binary and missing-budget indicators can dominate a narrow reference cohort; correlated dimensions are not decorrelated. Large legitimate payments, new recipients or a population shift can therefore be unusual without being fraudulent.
+
+The artifact's experimental threshold is `max(3, calibration p95 distance)`, using the nearest-rank empirical quantile. The calibration cohort sets only the threshold; training alone fits centers/scales, and the later test cohort changes neither. Ties and the floor mean no fixed alert rate is promised. This is not a conformal guarantee, significance test, supervised detection rate or general-population false-positive bound.
+
+### Dataset and Artifact
+
+Run `npm run risk:train -- /private/path/anomaly-dataset.json /private/path/anomaly-model.json`. Input is limited to 20 MiB. Declare `featureSchema: "behaviour-anomaly-v1"`, `modelVersion`, `datasetId`, three-letter `currency`, boolean `synthetic` and `referenceSource` (`synthetic` or `reviewed_reference`, matching the flag). Supply `training`, `calibration` and `test` arrays of 20-10,000 observations each. Twenty is a validation floor, not proof of adequate sample size or privacy.
+
+Each observation includes unique `eventId`, `amountMinor`, `channel` and the complete `BehaviourFeatures` snapshot described above. Reference rows require at least five prior sampled payments and nontruncated history. Observations must be ordered, events disjoint across cohorts, and each period must end strictly before the next begins. Labels are not required or inferred. Currency/source/history timestamps are supplied declarations in offline datasets; validation cannot authenticate an export or prove reference transactions benign. Review reference selection and future-feature/entity leakage independently.
+
+The artifact stores schema, copied dense finite centers/scales, threshold, model/dataset identifiers, serialized supplied-dataset hash, reference-source/synthetic declarations, training/calibration counts and the last calibration timestamp as `trainingCutoff`. Later runtime observations must be after that cutoff. The complete input hash changes if test data changes, but test rows do not fit parameters. Output is mode 0600 and refuses overwrite. Aggregate reports include unusual counts/rates and distance quantiles; accuracy is explicitly unavailable without independent outcomes. A separate bounded warmed benchmark reports local inference p50/p95/max, not database, encryption, network or end-to-end latency.
+
+### Runtime and Privacy
+
+`RAIL_ANOMALY_MODEL_PATH` optionally loads a 1-MiB-bounded validated artifact before database creation. The pipeline snapshots it alongside—not in place of—the logistic artifact. It requires the risk-protection store. After authority checks and financial locks, valid matching-currency observations with at least five nontruncated prior samples get an anomaly prediction. Other states are `not_configured`, `currency_mismatch`, `not_yet_valid` or `insufficient_history`; there is no fabricated score or alternate-model fallback.
+
+The full prediction/hash and a safe summary share the encrypted risk observation and financial commit. SQL constrains the summary to status/version/synthetic fields only, excluding plaintext distances/contributions. Participant reads authenticate that summary and expose only availability/version/synthetic status. Previously encrypted records without anomaly fields remain `not_configured` and verify without ciphertext changes. Required writes fail atomically, completed retries preserve the original model and no detailed anomaly event is emitted. Neither `unusual` nor `routine` changes funds, approvals, offline allowances or fraud policy. Actual anomaly review/enforcement and live monitoring remain independently evaluated work.
+
+```mermaid
+flowchart LR
+  Reference[Reviewed reference training cohort] --> Fit[Median and MAD parameters]
+  Fit --> Calibrate[Later cohort sets experimental threshold]
+  Calibrate --> Artifact[Validated private artifact]
+  Artifact --> Runtime[Trusted locked database features]
+  Runtime --> Protected[Encrypted shadow observation]
+  Protected --> Summary[Authenticated availability summary]
+  Calibrate --> Holdout[Later test reports only]
+```
 
 ## Why these choices
 
