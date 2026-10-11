@@ -423,6 +423,45 @@ BEGIN
     RAISE EXCEPTION 'agent_budget_reservation_mismatch' USING ERRCODE = '23514';
   END IF;
 END $$;
+CREATE OR REPLACE FUNCTION rail_protect_agent_control() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'agent_control_history_is_immutable' USING ERRCODE = '23514';
+  END IF;
+  IF TG_TABLE_NAME = 'rail_agents' THEN
+    IF ROW(NEW.agent_id, NEW.owner_wallet_id, NEW.name, NEW.created_at)
+      IS DISTINCT FROM ROW(OLD.agent_id, OLD.owner_wallet_id, OLD.name, OLD.created_at)
+      OR (OLD.status = 'revoked' AND NEW.status <> 'revoked') THEN
+      RAISE EXCEPTION 'agent_identity_is_immutable' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'rail_agent_credentials' THEN
+    IF ROW(NEW.credential_id, NEW.agent_id, NEW.token_hash, NEW.scope, NEW.created_at, NEW.expires_at)
+      IS DISTINCT FROM ROW(OLD.credential_id, OLD.agent_id, OLD.token_hash, OLD.scope, OLD.created_at, OLD.expires_at) THEN
+      RAISE EXCEPTION 'agent_credential_is_immutable' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'rail_agent_mandates' THEN
+    IF ROW(NEW.mandate_id, NEW.agent_id, NEW.owner_wallet_id, NEW.mode, NEW.currency,
+        NEW.per_payment_limit_minor, NEW.total_budget_minor, NEW.allowed_receiver_wallet_ids, NEW.created_at, NEW.expires_at)
+      IS DISTINCT FROM ROW(OLD.mandate_id, OLD.agent_id, OLD.owner_wallet_id, OLD.mode, OLD.currency,
+        OLD.per_payment_limit_minor, OLD.total_budget_minor, OLD.allowed_receiver_wallet_ids, OLD.created_at, OLD.expires_at) THEN
+      RAISE EXCEPTION 'agent_mandate_policy_is_immutable' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  IF OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at THEN
+    RAISE EXCEPTION 'agent_revocation_is_permanent' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_control_immutable ON rail_agents;
+CREATE TRIGGER rail_agent_control_immutable BEFORE UPDATE OR DELETE ON rail_agents
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_agent_control();
+DROP TRIGGER IF EXISTS rail_agent_credential_immutable ON rail_agent_credentials;
+CREATE TRIGGER rail_agent_credential_immutable BEFORE UPDATE OR DELETE ON rail_agent_credentials
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_agent_control();
+DROP TRIGGER IF EXISTS rail_agent_mandate_immutable ON rail_agent_mandates;
+CREATE TRIGGER rail_agent_mandate_immutable BEFORE UPDATE OR DELETE ON rail_agent_mandates
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_agent_control();
 CREATE OR REPLACE FUNCTION rail_check_agent_budget() RETURNS TRIGGER
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN

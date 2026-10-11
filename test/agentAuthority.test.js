@@ -50,10 +50,29 @@ async function fixture(work, max = 2, ownerBalance = 10000) {
   }
 }
 
-async function intentSetup(store, owner, mode = "approval_required", totalBudgetMinor = 1000) {
+// Seed deadlines at creation: production authority history must never be rewritten to advance a test clock.
+async function datedCredential(pool, agentId, scope = "payments:propose", seconds = -1) {
+  const credentialId = randomUUID();
+  const token = `rail_agent_${randomBytes(32).toString("base64url")}`;
+  await pool.query(`INSERT INTO rail_agent_credentials(credential_id, agent_id, token_hash, scope, created_at, expires_at)
+    VALUES ($1, $2, $3, $4, clock_timestamp() - interval '1 hour', clock_timestamp() + $5 * interval '1 second')`,
+    [credentialId, agentId, createHash("sha256").update(token).digest("hex"), scope, seconds]);
+  return { credentialId, token };
+}
+
+async function datedMandate(pool, owner, agentId, input, seconds = -1) {
+  const mandateId = randomUUID();
+  await pool.query(`INSERT INTO rail_agent_mandates(mandate_id, agent_id, owner_wallet_id, mode, currency,
+    per_payment_limit_minor, total_budget_minor, allowed_receiver_wallet_ids, created_at, expires_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp() - interval '1 hour',clock_timestamp() + $9 * interval '1 second')`,
+    [mandateId, agentId, owner, input.mode, input.currency, input.perPaymentLimitMinor, input.totalBudgetMinor, input.allowedReceiverWalletIds, seconds]);
+  return { mandateId };
+}
+
+async function intentSetup(store, owner, mode = "approval_required", totalBudgetMinor = 1000, createMandate) {
   const agent = await store.createAgent(owner, { name: "Intent agent" });
   const credential = await store.issueCredential(owner, agent.agentId, {});
-  const mandate = await store.createMandate(owner, agent.agentId, { ...policy, mode, totalBudgetMinor });
+  const mandate = await (createMandate ?? ((id, input) => store.createMandate(owner, id, input)))(agent.agentId, { ...policy, mode, totalBudgetMinor });
   const input = { mandateId: mandate.mandateId, clientRequestId: "intent_request_001", receiverWalletId: "agent_receiver", amountMinor: 100, currency: "INR", ttlSeconds: 300 };
   return { agent, credential, mandate, input };
 }
@@ -121,8 +140,7 @@ test("credential revocation and database-clock expiry immediately invalidate sub
     await store.revokeCredential(owner, agent.agentId, first.credentialId);
     assert.equal((await store.listCredentials(owner, agent.agentId))[0].revokedAt, before);
     await assert.rejects(store.resolveCredential(first.token), { status: 401 });
-    const second = await store.issueCredential(owner, agent.agentId, {});
-    await pool.query("UPDATE rail_agent_credentials SET created_at = clock_timestamp() - interval '2 hours', expires_at = clock_timestamp() - interval '1 hour' WHERE credential_id = $1", [second.credentialId]);
+    const second = await datedCredential(pool, agent.agentId);
     await assert.rejects(store.resolveCredential(second.token), { status: 401 });
     for (const token of [undefined, "bad", first.token + "\n"]) await assert.rejects(store.resolveCredential(token), { status: 401 });
   });
@@ -161,12 +179,88 @@ test("mandates bind valid receivers, owner currency, approval mode and bounded b
     for (const value of [{ ...policy, currency: "USD" }, { ...policy, allowedReceiverWalletIds: [owner] },
       { ...policy, allowedReceiverWalletIds: ["missing_wallet"] }]) await assert.rejects(store.createMandate(owner, agent.agentId, value), { status: 422 });
     const mandates = await store.listMandates(owner, agent.agentId);
-    await pool.query("UPDATE rail_agent_mandates SET created_at = clock_timestamp() - interval '2 hours', expires_at = clock_timestamp() - interval '1 hour' WHERE mandate_id = $1", [mandates[0].mandateId]);
-    assert.equal((await store.listMandates(owner, agent.agentId)).find(item => item.mandateId === mandates[0].mandateId).status, "expired");
+    const expired = await datedMandate(pool, owner, agent.agentId, policy);
+    assert.equal((await store.listMandates(owner, agent.agentId)).find(item => item.mandateId === expired.mandateId).status, "expired");
     assert.equal((await store.revokeMandate(owner, agent.agentId, mandates[1].mandateId)).status, "revoked");
     assert.deepEqual((await wallets()).rows, before);
     assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
     assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 0);
+  });
+});
+
+test("database prevents agent ownership and identity rewrites", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const agent = await store.createAgent(owner, { name: "Fixed owner" });
+    for (const assignment of ["owner_wallet_id = 'other_owner'", "name = 'Impersonated owner'",
+      "agent_id = gen_random_uuid()", "created_at = created_at - interval '1 hour'"]) {
+      await assert.rejects(pool.query(`UPDATE rail_agents SET ${assignment} WHERE agent_id = $1`, [agent.agentId]),
+        { code: "23514", message: "agent_identity_is_immutable" });
+    }
+    assert.equal((await store.listAgents(owner))[0].name, "Fixed owner");
+  });
+});
+
+test("database prevents credential promotion, rebinding, replacement and lifetime extension", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const first = await store.createAgent(owner, { name: "First agent" });
+    const second = await store.createAgent(owner, { name: "Second agent" });
+    const credential = await store.issueCredential(owner, first.agentId, {});
+    for (const assignment of ["scope = 'payments:execute'", `agent_id = '${second.agentId}'`,
+      "token_hash = repeat('a', 64)", "credential_id = gen_random_uuid()",
+      "expires_at = expires_at + interval '1 hour'", "created_at = created_at - interval '1 hour'"]) {
+      await assert.rejects(pool.query(`UPDATE rail_agent_credentials SET ${assignment} WHERE credential_id = $1`, [credential.credentialId]),
+        { code: "23514", message: "agent_credential_is_immutable" });
+    }
+    assert.equal((await store.resolveCredential(credential.token)).scope, "payments:propose");
+  });
+});
+
+test("database prevents silently relaxing owner-approved mandate policy", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const agent = await store.createAgent(owner, { name: "Fixed policy" });
+    const mandate = await store.createMandate(owner, agent.agentId, { ...policy, mode: "approval_required" });
+    for (const assignment of ["mode = 'budgeted'", "currency = 'USD'", "per_payment_limit_minor = 200",
+      "total_budget_minor = 2000", "allowed_receiver_wallet_ids = ARRAY['other_owner']",
+      "owner_wallet_id = 'other_owner'", "agent_id = gen_random_uuid()", "mandate_id = gen_random_uuid()",
+      "expires_at = expires_at + interval '1 hour'", "created_at = created_at - interval '1 hour'"]) {
+      await assert.rejects(pool.query(`UPDATE rail_agent_mandates SET ${assignment} WHERE mandate_id = $1`, [mandate.mandateId]),
+        { code: "23514", message: "agent_mandate_policy_is_immutable" });
+    }
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].mode, "approval_required");
+    await store.createMandate(owner, agent.agentId, policy);
+    assert.equal((await store.listMandates(owner, agent.agentId)).length, 2);
+  });
+});
+
+test("revocation cannot be reversed or rewritten and repeated owner revocation remains safe", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, mandate } = await intentSetup(store, owner);
+    await store.revokeAgent(owner, agent.agentId);
+    await store.revokeAgent(owner, agent.agentId);
+    for (const [table, column, id] of [["rail_agents", "agent_id", agent.agentId],
+      ["rail_agent_credentials", "credential_id", credential.credentialId], ["rail_agent_mandates", "mandate_id", mandate.mandateId]]) {
+      for (const value of ["NULL", "revoked_at + interval '1 second'"]) {
+        await assert.rejects(pool.query(`UPDATE ${table} SET revoked_at = ${value} WHERE ${column} = $1`, [id]),
+          { code: "23514", message: "agent_revocation_is_permanent" });
+      }
+    }
+    await assert.rejects(pool.query("UPDATE rail_agents SET status = 'active', revoked_at = NULL WHERE agent_id = $1", [agent.agentId]),
+      { code: "23514", message: "agent_identity_is_immutable" });
+    await assert.rejects(store.resolveCredential(credential.token), { status: 401 });
+  });
+});
+
+test("authority history survives deletion attempts and repeated migrations", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, mandate } = await intentSetup(store, owner);
+    await runMigrations(pool);
+    for (const [table, column, id] of [["rail_agent_mandates", "mandate_id", mandate.mandateId],
+      ["rail_agent_credentials", "credential_id", credential.credentialId], ["rail_agents", "agent_id", agent.agentId]]) {
+      await assert.rejects(pool.query(`DELETE FROM ${table} WHERE ${column} = $1`, [id]),
+        { code: "23514", message: "agent_control_history_is_immutable" });
+    }
+    assert.equal((await store.resolveCredential(credential.token)).agentId, agent.agentId);
+    assert.equal((await store.listMandates(owner, agent.agentId)).length, 1);
   });
 });
 
@@ -323,10 +417,10 @@ test("budgeted intents receive preapproval but concurrent proposals cannot excee
 
 test("mandate expiry releases intent budget and cannot renew old request IDs", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, store, owner }) => {
-    const { agent, credential, mandate, input } = await intentSetup(store, owner);
+    const { agent, credential, mandate, input } = await intentSetup(store, owner, "approval_required", 1000,
+      (id, value) => datedMandate(pool, owner, id, value, 2));
     const intent = await store.createIntent(credential.token, input);
-    // Historical fixture simulates an elapsed mandate deadline, without changing intent history.
-    await pool.query("UPDATE rail_agent_mandates SET created_at = clock_timestamp() - interval '2 hours', expires_at = clock_timestamp() - interval '1 hour' WHERE mandate_id = $1", [mandate.mandateId]);
+    await pool.query("SELECT pg_sleep(2.1)");
     assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "expired");
     assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
     assert.equal((await store.createIntent(credential.token, input)).status, "expired");
@@ -506,9 +600,12 @@ function executionStore(pool, afterPayment, failEvidence = false, riskProtection
   return new AgentAuthorityStore(pool, engine);
 }
 
-async function executionSetup(pool, owner, mode = "approval_required", budget = 1000, store = executionStore(pool)) {
-  const setup = await intentSetup(store, owner, mode, budget);
-  const executionCredential = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+async function executionSetup(pool, owner, mode = "approval_required", budget = 1000, store = executionStore(pool), deadlineTarget) {
+  const setup = await intentSetup(store, owner, mode, budget, deadlineTarget === "mandate"
+    ? (id, value) => datedMandate(pool, owner, id, value, 2) : undefined);
+  const executionCredential = deadlineTarget === "credential"
+    ? await datedCredential(pool, setup.agent.agentId, "payments:execute", 2)
+    : await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
   const intent = await store.createIntent(setup.credential.token, setup.input);
   const request = { requestFingerprint: intent.requestFingerprint };
   return { ...setup, store, executionCredential, intent, request };
@@ -653,14 +750,11 @@ test("agent execution rechecks credential and mandate deadlines after financial 
   await fixture(async ({ pool, owner }) => {
     for (const target of ["credential", "mandate"]) {
       let setup;
-      const store = executionStore(pool, async ctx => {
-        if (target === "credential") await ctx.dbClient.query("UPDATE rail_agent_credentials SET expires_at = clock_timestamp() - interval '1 millisecond' WHERE credential_id = $1", [setup.executionCredential.credentialId]);
-        else await ctx.dbClient.query("UPDATE rail_agent_mandates SET expires_at = clock_timestamp() - interval '1 millisecond' WHERE mandate_id = $1", [setup.mandate.mandateId]);
-      });
-      setup = await executionSetup(pool, owner, "budgeted", 1000, store);
+      const store = executionStore(pool, async ctx => { await ctx.dbClient.query("SELECT pg_sleep(2.1)"); });
+      setup = await executionSetup(pool, owner, "budgeted", 1000, store, target);
       await assert.rejects(store.executeIntent(setup.executionCredential.token, setup.intent.intentId, setup.request), { status: target === "credential" ? 401 : 409 });
       assert.equal((await store.listMandates(owner, setup.agent.agentId))[0].spentBudgetMinor, 0);
-      assert.equal((await store.listIntents(owner, setup.agent.agentId))[0].status, "approved");
+      assert.equal((await store.listIntents(owner, setup.agent.agentId))[0].status, target === "mandate" ? "expired" : "approved");
     }
     assert.equal((await pool.query("SELECT * FROM authorizations")).rowCount, 0);
     assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);

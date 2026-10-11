@@ -46,6 +46,10 @@ Severity measures potential impact. A finding does not imply every issue is reac
 
 ## Verification and release gates
 
+Latest authority increment: 249 local tests pass, zero failures/skips, on 12 October 2026, including live PostgreSQL; the explicit agent suite passes 43. Five new cases cover SQL identity/policy/scope rewrites, revocation reversal and deletion after repeat migration. Expiry tests set deadlines at creation and verify elapsed database time during execution. Existing human, offline, atomic execution and revocation-race tests remain passing. Remote CI/deployment remain unverified for this increment.
+
+- SEC-36 (High): agent identity, credentials and mandates accepted ordinary SQL updates/deletes, allowing a faulty trusted writer to relax previously approved authority or erase history. Fixed with pinned-search-path update/delete guards and permanent revocation. Budget counters remain under deferred consistency guards. This does not prevent DDL, malicious direct inserts by compromised trusted writers or owner-session theft. Runtime roles must not own schema/DDL; agents must have no SQL or owner-key access. Protected authority receipts and independent checkpoints remain planned.
+
 Latest quota increment: 244 local tests pass, zero failures/skips, on 12 October 2026, including live PostgreSQL. Twenty-two new cases cover independent source/identity enforcement, IP/body rotation, pre-authentication protection, malformed requests, event/agent/auth boundaries, concurrent real-database limiter instances, database-clock consistency, invalid parameters, SQL deadlines/failed-client disposal and allowed frontend retry-header visibility. Existing ownership/stream/body-deadline/revocation and financial regressions remain passing. `git diff --check` passes. Explicit CI coverage is configured but not remotely run; no push, chain publication or hosted acceptance occurred. Older counts below are historical.
 
 ### Audit and Quota Findings

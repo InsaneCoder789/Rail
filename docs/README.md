@@ -2,14 +2,14 @@
 
 # Rail
 
-**A payment control and execution backend for people and owner-approved software agents.**
+**Owner-controlled payment execution for AI agents, with human payments on the same accounting foundation.**
 
 [![Rail CI](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml/badge.svg)](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](../LICENSE)
 
 Rail started with a question: how should a payment backend behave when connectivity disappears, requests repeat, or a process fails halfway through a transfer?
 
-The answer is not another transfer endpoint. It is a controlled execution path: permission before spending, durable accounting, one committed result for an identical retry, and evidence of what actually happened. Rail now applies the same foundation to delegated agent payments, with owner-defined recipients, budgets, expiry and exact-request approvals.
+The answer is not another transfer endpoint. It is a controlled execution path: permission before spending, durable accounting, one committed result for an identical retry, and evidence of what actually happened. Rail's main direction is now delegated AI-agent payments: an agent can request a transfer, but cannot grant itself spending authority. Owners define recipients, budgets, expiry and exact-request approvals. Human payments and the original offline-aware foundation remain supported.
 
 **PostgreSQL is the financial source of truth. ML supplies shadow risk observations, not spending authority. Audit proofs establish local inclusion, not bank settlement.** Rail does not replace UPI, card networks or PSPs, and has no live settlement connector. It is an engineering project with tested internal guarantees and explicit production-release gates.
 
@@ -23,14 +23,14 @@ The answer is not another transfer endpoint. It is a controlled execution path: 
 | Transaction safety | Execution coordinates authorization use, token accounting, wallets, ledger, risk, evidence, events and replay through one PostgreSQL transaction. |
 | Retry protection | Durable idempotency binds a key to a canonical request fingerprint and committed result; changed payloads cannot reuse that key. |
 | Offline foundation | Wallet/device/currency-bound tokens, bounded spend headroom and reconnect synchronization through the same execution engine. |
-| Agent control | Owner-managed identities, hashed expiring credentials, scoped permissions, spending mandates, immutable intents and atomic budget consumption. |
+| Agent control | Owner-managed identities, hashed expiring credentials, immutable authority policies and intents, permanent revocation and atomic budget consumption. |
 | Protected records | Required HTTP payment evidence and detailed risk records use independently keyed AES-256-GCM and HMAC-SHA256 envelopes. |
 | Risk diagnostics | Optional behavioural logistic regression, robust median/MAD anomaly assessment and bounded offline drift diagnostics. All remain shadow-only. |
 | Audit evidence | Durable pending queue, verified Merkle batches, immutable inclusion proofs and participant-only reads. Roots remain unanchored. |
 | Event delivery | Transactional outbox with leases, retries, acknowledgement and dead letters; wallet-scoped REST history and advisory SSE on persistent servers. |
 | Operational checks | Accounting reconciliation, authorization expiry cleanup, bounded request parsing and shared source/identity quotas. |
 
-The latest backend verification passed **244 tests with zero failures or skips**, including real PostgreSQL integration tests, on 12 October 2026. The badge links to live CI results; that local count is not a statement that every future revision or deployment has passed. The suite includes concurrent requests, response-loss recovery, backend termination, tampering, revocation races and failed final commits.
+The latest backend verification passed **249 tests with zero failures or skips**, including real PostgreSQL integration tests, on 12 October 2026. The badge links to live CI results; that local count is not a statement that every future revision or deployment has passed. The suite includes concurrent requests, response-loss recovery, backend termination, policy tampering, revocation races and failed final commits.
 
 ## Runtime Flow
 
@@ -107,6 +107,10 @@ flowchart LR
 
 Pending/approved intents hold mandate budget, not wallet funds. Execution consumes that held policy allowance only with the committed payment. Expiry, rejection and revocation release unexecuted holds; they do not restore already spent budget. Approvals cannot override recipient/currency/budget restrictions, and changing a request invalidates its fingerprint. Agent execution is online-only and requires explicit `payments:execute` scope. Fresh execution and agent replay both check live authority.
 
+Stored owner/agent bindings, credential scopes and deadlines, and mandate policies reject ordinary SQL updates and deletes. Revocation is one-way; changing permissions requires a new owner-created credential or mandate. Budget counters remain constrained by the associated intents and committed executions. These guards are defense in depth, not protection against a database administrator disabling them.
+
+`approval_required` means an owner decision for the exact request. `budgeted` means advance owner permission within fixed limits, not a new human acknowledgement for every transfer. Never give an agent an owner JWT, privileged service key, database access or server signing keys. Rail authorizes software callers; it does not prove a human was physically present or prevent a compromised operator from changing application code. See the [agent security boundaries and implementation roadmap](AGENT_PAYMENT_SECURITY.md).
+
 ## Risk and Protected Evidence
 
 ### Explainable Intelligence, Without Payment Authority
@@ -138,6 +142,8 @@ flowchart LR
 The finite `audit:batch` worker handles 1-256 pending records per run, default 128. It does not run inside a payment request. Missing historical keys or corrupt records stop batching instead of silently omitting evidence. Participant reads disclose only that payment's commitments, inclusion path and batch metadata after verification.
 
 **Current proof status is local-only and unanchored.** No contract, signer, publisher, finality/reorg tracker or independent checkpoint has been implemented. Inclusion does not establish complete historical coverage, truthful original inputs or external settlement.
+
+The planned blockchain role is independently checkable evidence after execution, not permission to spend. Current audit leaves bind protected payment and risk commitments; they do not yet cryptographically bind the full mandate policy or owner-decision provenance. Those authority receipts must be implemented before claiming blockchain-verifiable owner controls.
 
 ## Run Locally
 
@@ -280,6 +286,7 @@ Rail is a modular monolith. Keeping financial state in one transactional databas
 - [V2 technical guide](V2_TECHNICAL_GUIDE.md): agent, intelligence and protected-record contracts.
 - [Deployment guide](DEPLOYMENT.md): configuration, migration, workers, key retention and operational boundaries.
 - [Security review](SECURITY_REVIEW.md): findings, regressions and unpassed release gates.
+- [Agent payment security](AGENT_PAYMENT_SECURITY.md): caller boundaries, abuse cases, owner transparency and the staged agent-first roadmap.
 - [V1 acceptance record](V1_SIGN_OFF.md): baseline verification and explicit demonstration/production boundaries.
 
 ## Remaining Work

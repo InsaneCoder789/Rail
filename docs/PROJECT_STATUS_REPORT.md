@@ -38,6 +38,18 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Agent-First Direction and Immutable Authority: 12 October 2026
+
+At the owner's request, Rail now leads with owner-controlled AI-agent transaction execution while preserving human payments and its offline-aware foundation. PostgreSQL still enforces money and policy; ML remains shadow-only and audit roots remain unanchored.
+
+Fixed an ordinary-SQL authority mutation gap. `src/persistence/migrate.ts` now installs update/delete guards on `rail_agents`, `rail_agent_credentials` and `rail_agent_mandates`. Owner/agent identity, credential hash/scope/lifetime, and mandate mode/currency/recipients/limits/lifetime cannot be rewritten. Revocation timestamps cannot be cleared or changed, and revoked agents cannot be revived. Permission changes require a new owner-created record. Budget counters remain governed by existing deferred intent/payment consistency checks; repeat revocation and atomic execution still work. Repeated migrations preserve controls.
+
+Five new regression cases cover identity reassignment, credential promotion/replacement, policy relaxation, revocation reversal and deleted history. Expiry tests now seed deadlines at insertion and let database time elapse rather than rewriting authority history. Expiry after financial work still rolls back the payment; lazy cleanup releases expired holds.
+
+Added `docs/AGENT_PAYMENT_SECURITY.md`: caller boundaries, both acknowledgement modes, abuse cases, owner-visible data and staged receipt/chain/UI/production work. README reflects agent-first positioning. No blockchain publisher, SDK, owner step-up or protected policy receipt is claimed as delivered. Current payment/risk leaves do not prove full policy consent. Agents must never receive owner JWTs, privileged service keys, database access or server keys. Database owners can disable guards; compromised trusted writers can forge inserts.
+
+Verification: 249 full-suite tests pass, zero failures/skips, including live PostgreSQL; 43 explicit agent tests pass. Existing GitHub Actions runs both on Node 22/24 and PostgreSQL 16. Remote CI and deployment were not run for this increment. Unrelated working-tree files were preserved.
+
 ### README and Repository Banner Refresh: 12 October 2026
 
 Rebuilt `docs/README.md` around the current payment control/execution backend rather than the earlier transfer-only overview. It preserves offline-aware scope while explaining available/reserved accounting, exact authorization, atomic execution/replay, owner-controlled agents, encrypted evidence/risk, optional shadow intelligence, durable local Merkle batches and event delivery. Three Mermaid flows cover execution, agent authority and audit batching, with future chain publication visually separated. Removed the stale statement that durable audit storage is not implemented; the contract/publisher/finality and production gates remain explicitly unfinished.
