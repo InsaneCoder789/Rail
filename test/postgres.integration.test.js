@@ -20,6 +20,7 @@ import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
 import { createHash, randomBytes } from "node:crypto";
 import { TransactionKeyRing, verifyAndDecryptTransaction } from "../dist/crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../dist/persistence/transactionEvidence.js";
+import { RiskProtectionStore, decryptRiskRecord } from "../dist/persistence/riskProtection.js";
 import { legacyTransactionPayload, canonicalTransactionPayload } from "../dist/crypto/transactionSigning.js";
 import { dispatchOutboxBatch } from "../dist/persistence/outboxWorker.js";
 import { findReconciliationIssues, recordWalletOpeningBalance } from "../dist/persistence/reconciliation.js";
@@ -315,6 +316,28 @@ function authorizationInput(txn, suffix = "composed") {
   return { txId: `${txn.txId}_${suffix}`, senderWalletId: txn.senderWalletId, receiverWalletId: txn.receiverWalletId,
     amountMinor: txn.amountMinor, currency: txn.currency };
 }
+
+test("protected offline risk failure rolls back token headroom and retry retains one device-bound record", { skip: !databaseUrl }, async () => {
+  await paymentFixture(async ({ pool, txn, tokens, makeEngine }) => {
+    const key = { keyId: "offline_risk_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+    const protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    const pipeline = buildHardenedPaymentPipeline(noopTracer, tokens, undefined, undefined, protection);
+    const engine = makeEngine(undefined, pipeline);
+    await pool.query(`CREATE FUNCTION reject_risk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'offline_risk_write_failure'; END $$;
+      CREATE TRIGGER reject_risk BEFORE INSERT ON rail_protected_risk FOR EACH ROW EXECUTE FUNCTION reject_risk()`);
+    await assert.rejects(engine.execute(txn), /offline_risk_write_failure/);
+    assert.equal((await pool.query("SELECT remaining_minor FROM rail_offline_tokens WHERE token_id = $1", [txn.offlineTokenId])).rows[0].remaining_minor, "5000");
+    for (const table of ["ledger_entries", "rail_offline_spends", "rail_protected_risk", "rail_risk_key_usage", "rail_idempotency"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    await pool.query("DROP TRIGGER reject_risk ON rail_protected_risk");
+    await Promise.all(Array.from({ length: 5 }, () => engine.execute(txn)));
+    assert.equal((await pool.query("SELECT remaining_minor FROM rail_offline_tokens WHERE token_id = $1", [txn.offlineTokenId])).rows[0].remaining_minor, "2500");
+    const row = (await pool.query("SELECT * FROM rail_protected_risk")).rows[0];
+    assert.equal(decryptRiskRecord(row.envelope, { txId: txn.txId, requestFingerprint: row.request_fingerprint }, key).features.historyCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_protected_risk")).rowCount, 1);
+    await assert.rejects(engine.execute({ ...txn, deviceId: "other_device" }), /IDEMPOTENCY_KEY_REUSED/);
+  });
+});
 
 test("transaction composition: autocommit clients cannot issue authority or execute work", { skip: !databaseUrl }, async () => {
   await paymentFixture(async ({ pool, txn, store, makeEngine }) => {

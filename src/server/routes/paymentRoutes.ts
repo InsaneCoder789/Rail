@@ -105,7 +105,7 @@ export async function handlePaymentRoutes(
     if (!isSafeText(txId, 8, 128)) throw new RequestError(400, "invalid_transaction_id", "invalid transaction ID");
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "risk_read", discriminator: walletId,
       limit: 30, windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
-    const risk = await readBehaviourObservation(context.pool, txId, walletId);
+    const risk = await readBehaviourObservation(context.pool, txId, walletId, context.riskProtection);
     if (!risk) throw new RequestError(404, "payment_not_found", "payment not found");
     res.setHeader("Cache-Control", "no-store");
     json(res, 200, { risk });

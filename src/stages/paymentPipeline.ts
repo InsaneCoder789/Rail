@@ -13,6 +13,7 @@ import { predictRisk, validateRiskModel, type LogisticRiskModel } from "../risk/
 import { isPaymentTransaction } from "../server/validation.js";
 import { persistBehaviourObservation } from "../risk/behaviourRisk.js";
 import { validateBehaviourModel, type BehaviourRiskModel } from "../risk/behaviourModel.js";
+import type { RiskProtectionStore } from "../persistence/riskProtection.js";
 
 function emitStage(ctx: PaymentContext, stage: string, status: "start" | "ok" | "error"): void {
   const sequence = Number(ctx.state.eventSequence ?? 0) + 1;
@@ -48,7 +49,8 @@ function riskScoreStage(model?: LogisticRiskModel): Stage {
 }
 
 /** Mutations use only the transaction supplied by the durable idempotency boundary. */
-function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel, behaviourModel?: BehaviourRiskModel): Stage {
+function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel, behaviourModel?: BehaviourRiskModel,
+  protection?: RiskProtectionStore): Stage {
   return async (ctx) => {
     const client = ctx.dbClient;
     if (!client) throw new Error("db_not_initialized");
@@ -79,7 +81,8 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
       if (!gate.ok) throw new PipelineError(gate.reason, gate.reason);
     }
     emitStage(ctx, "risk.behaviour", "start");
-    await persistBehaviourObservation(client, txn, riskModel, behaviourModel);
+    if (ctx.state.requireRiskProtection === true && !protection) throw new Error("risk_protection_required");
+    await persistBehaviourObservation(client, txn, riskModel, behaviourModel, protection);
     emitStage(ctx, "risk.behaviour", "ok");
     await consumeReservation(client, txn.senderWalletId, txn.amountMinor, txn.currency);
     await creditWallet(client, txn.receiverWalletId, txn.amountMinor, txn.currency);
@@ -92,8 +95,9 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
     if (txn.channel !== "online") await tokenStore!.finalizeOfflineSpend(txn, client);
     const result = { status: "accepted" as const, ledgerEntryId: `leg_${txn.txId}` };
     await client.query(
-      `INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json, evidence_required, risk_required)
-       VALUES ($1, $2, $3, $4::jsonb, $5, TRUE)`, [txn.txId, txn.idempotencyKey, fingerprint, JSON.stringify(result), ctx.state.requireEvidence === true]);
+      `INSERT INTO rail_payment_executions (tx_id, idempotency_key, request_fingerprint, result_json, evidence_required, risk_required, risk_protection_required)
+       VALUES ($1, $2, $3, $4::jsonb, $5, TRUE, $6)`, [txn.txId, txn.idempotencyKey, fingerprint, JSON.stringify(result),
+        ctx.state.requireEvidence === true, Boolean(protection) || ctx.state.requireRiskProtection === true]);
     ctx.outbox.append({ type: "payments.ledger_posted", payload: {
       txId: txn.txId, amountMinor: txn.amountMinor, currency: txn.currency, channel: txn.channel,
       offline: txn.channel !== "online", senderWalletId: txn.senderWalletId, receiverWalletId: txn.receiverWalletId,
@@ -105,17 +109,17 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
 }
 
 export function buildHardenedPaymentPipeline(tracer: Tracer, tokenStore?: IOfflineTokenStore, riskModel?: LogisticRiskModel,
-  behaviourRiskModel?: BehaviourRiskModel): Stage {
+  behaviourRiskModel?: BehaviourRiskModel, protection?: RiskProtectionStore): Stage {
   const model = riskModel ? validateRiskModel(riskModel) : undefined;
   const behaviourModel = behaviourRiskModel ? validateBehaviourModel(behaviourRiskModel) : undefined;
   const limiter = new Semaphore(4);
   const parallelChecks: Stage = (ctx) => runParallelBounded([
     withSpan(tracer, "verify.signatures", async (context) => verifyTransactionSignatureIfRequired(context.txn)),
-    withSpan(tracer, "risk.score", riskScoreStage(behaviourModel ? undefined : model)),
+    withSpan(tracer, "risk.score", riskScoreStage(behaviourModel || protection ? undefined : model)),
   ], ctx, limiter);
   return (ctx) => runSequential([
     withSpan(tracer, "validate.core", validateBasics),
     withSpan(tracer, "prechecks.parallel", parallelChecks),
-    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model, behaviourModel)),
+    withSpan(tracer, "funds_and_ledger.transaction", transferAndLedger(tokenStore, model, behaviourModel, protection)),
   ], ctx);
 }

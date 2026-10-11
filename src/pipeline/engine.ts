@@ -24,6 +24,7 @@ export interface PaymentPipelineEngineOptions {
   readonly pipeline: Stage;
   readonly relay?: OutboxRelay;
   readonly evidence?: TransactionEvidenceStore;
+  readonly riskProtectionRequired?: boolean;
 }
 
 /**
@@ -65,6 +66,7 @@ export class PaymentPipelineEngine {
         const outbox = new MemoryOutbox();
         const ctx = createPaymentContext(randomId(), randomId(), txn, outbox, client);
         ctx.state.requireEvidence = Boolean(this.opts.evidence);
+        ctx.state.requireRiskProtection = this.opts.riskProtectionRequired === true;
         const root = withSpan(this.opts.tracer, "payment_pipeline", this.opts.pipeline);
         await root(ctx);
         if (!ctx.result) {

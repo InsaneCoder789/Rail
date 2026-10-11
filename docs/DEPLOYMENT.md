@@ -19,6 +19,7 @@ RAIL_API_KEY_SCOPES=offline_tokens:issue,sync:write
 RAIL_SIGNING_SECRET=<long-random-signing-secret>
 JWT_SECRET=<long-random-jwt-secret>
 RAIL_EVIDENCE_KEY_RING=<private JSON key ring described below>
+RAIL_RISK_RECORD_KEY_RING=<independent private JSON key ring described below>
 RAIL_ALLOWED_ORIGINS=https://your-frontend.example
 RAIL_REQUIRE_JSON_CONTENT_TYPE=true
 RAIL_EXPOSE_INTERNAL_ERRORS=false
@@ -58,6 +59,14 @@ Apply migrations before the new runtime. New required-evidence payments cannot c
 The library engine keeps evidence optional for isolated V1 regression/demo callers; the HTTP runtime always supplies the evidence store. Direct library integrations must opt in explicitly. Ledger fields and existing event payloads remain relational/plaintext; this phase encrypts the canonical audit copy only. Least-privilege database roles, retention, secure secret storage, monitoring and a production key-provider review remain release gates.
 
 ## Database setup
+
+### Protected risk-record cutover
+
+HTTP startup also requires `RAIL_RISK_RECORD_KEY_RING`, using the same JSON shape as the evidence ring but independently generated AES and HMAC material. Startup rejects material shared with any currently configured or retained payment-evidence key. Maintain an operator key inventory for older, removed versions too; application configuration cannot check unknown historical material. No existing secret is automatically replaced or generated. Provision both rings in secret storage before starting the updated runtime.
+
+Apply migrations and stop/drain older writers before cutover. New HTTP payments require a bound protected risk row at financial commit. Detailed features, model hashes and predictions are stored only in that encrypted record; observation time, explanation codes and model availability/version/synthetic flag remain queryable. Participant reads verify that summary against the record. Missing retained keys or verification errors suppress the summary rather than falling back to clear data. Existing plaintext observations are marked `legacy_plaintext`, not backfilled or deleted. Optional library callers must supply the risk store and enable the engine requirement explicitly.
+
+Risk key versions have their own committed-record quotas and nonce uniqueness checks. Rotation and retention follow the evidence procedure: distribute both old and fresh independent versions before switching active IDs, retain decryption keys and verify isolated restore. Quota exhaustion aborts new payments; replay consumes no new quota. Rollbacks undo the counter, so failed-attempt monitoring remains operational work. Do not delete risk records or key-usage counters to bypass limits. No automatic retention, historical encryption migration, KMS integration or verified production recovery is delivered by this cutover. Pending agent-intent fields, financial relational data and remaining lifecycle events are not encrypted by these envelopes.
 
 The current payment path requires the `rail_payment_executions` table and transactional outbox schema. Apply migrations before updating API instances. PostgreSQL deduplication uses transaction-scoped advisory locks, not session locks. Verify the selected provider's transaction pooling and deadline behavior in its sandbox before live use.
 
@@ -107,7 +116,7 @@ Apply the observation schema migration before rolling out the updated pipeline. 
 
 Optional `RAIL_RISK_MODEL_PATH` loads the legacy amount/channel model; `RAIL_BEHAVIOUR_MODEL_PATH` loads the expanded `behaviour-v1` artifact and takes precedence. Runtime files are limited to 1 MiB and validated/copied before opening the pool. Invalid configured artifacts fail startup. Expanded currency mismatch or a training cutoff not earlier than observation stores `currency_mismatch`/`not_yet_valid`, without silent legacy fallback or a fabricated score. Matching predictions/hashes are retained privately with the observation. Both models remain shadow-only; no model or `review` does not independently reject a payment.
 
-Migrate the expanded model-status constraint before updating hosted writers. Train expanded artifacts with the existing `risk:train` command using strict chronological training/validation/test arrays and label-availability timestamps. Keep datasets and model artifacts outside the repository; inspect held-out and calibration reports before a reviewed configuration rollout. Restart/cut over to a retained approved artifact for rollback; already committed snapshots remain unchanged. Do not enable fraud enforcement based on synthetic reports or experimental threshold 0.5. Feature snapshots are sensitive relational records, not encrypted transaction evidence; production retention, least-privilege access, label provenance, drift and independent evaluation remain required.
+Migrate the expanded model-status and protected-risk schema before updating hosted writers. Train expanded artifacts with the existing `risk:train` command using strict chronological training/validation/test arrays and label-availability timestamps. Keep datasets and model artifacts outside the repository; inspect held-out and calibration reports before a reviewed configuration rollout. Restart/cut over to a retained approved artifact for rollback; already committed snapshots remain unchanged. Do not enable fraud enforcement based on synthetic reports or experimental threshold 0.5. New HTTP feature snapshots use separate risk encryption as described above; historical plaintext, retention, least-privilege access, label provenance and independent evaluation still require review.
 
 ### Offline Drift Checks
 

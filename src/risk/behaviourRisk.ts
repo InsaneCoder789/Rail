@@ -4,6 +4,7 @@ import type { PaymentTransaction } from "../domain/types.js";
 import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
 import { predictRisk, type LogisticRiskModel } from "./logisticRisk.js";
 import { predictBehaviourRisk, type BehaviourRiskModel } from "./behaviourModel.js";
+import type { RiskProtectionStore } from "../persistence/riskProtection.js";
 
 export interface BehaviourFeatures {
   readonly schemaVersion: 1;
@@ -36,7 +37,7 @@ export function explainBehaviour(features: BehaviourFeatures): { level: "insuffi
 
 /** Called after financial authority checks and sorted wallet locks, before posting this payment. */
 export async function persistBehaviourObservation(client: PoolClient, txn: PaymentTransaction, model?: LogisticRiskModel,
-  behaviourModel?: BehaviourRiskModel): Promise<void> {
+  behaviourModel?: BehaviourRiskModel, protection?: RiskProtectionStore): Promise<void> {
   const history = await client.query(`WITH timestamp AS (SELECT clock_timestamp() AS now)
     SELECT timestamp.now, history.amount_minor, history.receiver_wallet_id, history.committed_at
     FROM timestamp LEFT JOIN LATERAL (
@@ -85,24 +86,40 @@ export async function persistBehaviourObservation(client: PoolClient, txn: Payme
     { amountMinor: txn.amountMinor, channel: txn.channel, features }) } : { modelKind: "amount-channel-v1", ...predictRisk(model!, txn) } : null;
   const modelStatus = matching ? "available" : !selected ? "not_configured" : selected.currency !== txn.currency ? "currency_mismatch" : "not_yet_valid";
   const fingerprint = createHash("sha256").update(canonicalTransactionPayload(txn)).digest("hex");
+  const summary = { policyVersion: "behaviour-shadow-v1", mode: "shadow", ...assessment };
+  const modelHash = matching ? createHash("sha256").update(JSON.stringify(matching)).digest("hex") : null;
+  if (protection) await protection.persist(client, { txId: txn.txId, requestFingerprint: fingerprint }, { observedAt,
+    features, assessment: summary, modelStatus, modelVersion: matching?.modelVersion ?? null,
+    modelHash, synthetic: matching?.synthetic ?? null, prediction });
   await client.query(`INSERT INTO rail_risk_observations(tx_id, request_fingerprint, observed_at, feature_snapshot, assessment,
-    model_status, model_version, model_hash, synthetic, prediction)
-    VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8,$9,$10::jsonb)`, [txn.txId, fingerprint, observedAt,
-    JSON.stringify(features), JSON.stringify({ policyVersion: "behaviour-shadow-v1", mode: "shadow", ...assessment }),
-    modelStatus, matching?.modelVersion ?? null, matching ? createHash("sha256").update(JSON.stringify(matching)).digest("hex") : null,
-    matching?.synthetic ?? null, prediction ? JSON.stringify(prediction) : null]);
+    model_status, model_version, model_hash, synthetic, prediction, protection_required)
+    VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8,$9,$10::jsonb,$11)`, [txn.txId, fingerprint, observedAt,
+    protection ? null : JSON.stringify(features), JSON.stringify(summary), modelStatus, matching?.modelVersion ?? null,
+    protection ? null : modelHash, matching?.synthetic ?? null, !protection && prediction ? JSON.stringify(prediction) : null, Boolean(protection)]);
 }
 
-export async function readBehaviourObservation(client: Pick<PoolClient, "query">, txId: string, walletId: string) {
+export async function readBehaviourObservation(client: Pick<PoolClient, "query">, txId: string, walletId: string, protection?: RiskProtectionStore) {
   const result = await client.query(`SELECT observation.observed_at, observation.assessment, observation.model_status,
-    observation.model_version, observation.synthetic FROM rail_payment_executions execution
+    observation.model_version, observation.synthetic, observation.protection_required, execution.request_fingerprint,
+    protected.envelope, protected.commitment FROM rail_payment_executions execution
     JOIN authorizations auth ON auth.tx_id = execution.tx_id
     LEFT JOIN rail_risk_observations observation ON observation.tx_id = execution.tx_id
+    LEFT JOIN rail_protected_risk protected ON protected.tx_id = execution.tx_id
     WHERE execution.tx_id = $1 AND (auth.sender_wallet_id = $2 OR auth.receiver_wallet_id = $2)`, [txId, walletId]);
   const row = result.rows[0];
   if (!row) return undefined;
   if (!row.assessment) return { txId, status: "legacy_unobserved" as const };
+  if (row.protection_required) {
+    try {
+      if (!protection) throw new Error("transaction_evidence_key_unavailable");
+      protection.verify(row, { txId, requestFingerprint: row.request_fingerprint });
+    } catch (error) {
+      return { txId, status: "verification_unavailable" as const, reason: error instanceof Error &&
+        error.message === "transaction_evidence_key_unavailable" ? "key_unavailable" : "verification_failed" };
+    }
+  }
   return { txId, status: "observed" as const, observedAt: new Date(row.observed_at).toISOString(),
+    protection: row.protection_required ? "verified" : "legacy_plaintext",
     assessment: { mode: row.assessment.mode, policyVersion: row.assessment.policyVersion,
       level: row.assessment.level, reasons: row.assessment.reasons },
     modelStatus: row.model_status, modelVersion: row.model_version, synthetic: row.synthetic };

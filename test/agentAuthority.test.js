@@ -19,6 +19,7 @@ import { buildHardenedPaymentPipeline } from "../dist/stages/paymentPipeline.js"
 import { TransactionKeyRing } from "../dist/crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../dist/persistence/transactionEvidence.js";
 import { findReconciliationIssues } from "../dist/persistence/reconciliation.js";
+import { RiskProtectionStore, decryptRiskRecord } from "../dist/persistence/riskProtection.js";
 
 dotenv.config();
 const databaseUrl = process.env.DATABASE_URL;
@@ -494,12 +495,13 @@ test("agent intent quotas remain shared when request source addresses change", {
   });
 });
 
-function executionStore(pool, afterPayment, failEvidence = false) {
+function executionStore(pool, afterPayment, failEvidence = false, riskProtection) {
   const key = { keyId: "agent_execution_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
   const evidence = new TransactionEvidenceStore(new TransactionKeyRing(key.keyId, [key]));
-  const pipeline = buildHardenedPaymentPipeline(noopTracer);
+  const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, undefined, undefined, riskProtection);
   const engine = new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
-    dlq: new MemoryDeadLetterQueue(), pipeline: async ctx => { await pipeline(ctx); await afterPayment?.(ctx); },
+    dlq: new MemoryDeadLetterQueue(), riskProtectionRequired: Boolean(riskProtection),
+    pipeline: async ctx => { await pipeline(ctx); await afterPayment?.(ctx); },
     evidence: failEvidence ? { async persist(client, txn) { await evidence.persist(client, txn); throw new Error("injected_agent_evidence_failure"); } } : evidence });
   return new AgentAuthorityStore(pool, engine);
 }
@@ -511,6 +513,31 @@ async function executionSetup(pool, owner, mode = "approval_required", budget = 
   const request = { requestFingerprint: intent.requestFingerprint };
   return { ...setup, store, executionCredential, intent, request };
 }
+
+test("protected agent risk failure preserves held budget and retry commits one encrypted observation", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const key = { keyId: "agent_risk_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+    const protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    const store = executionStore(pool, undefined, false, protection);
+    const { agent, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted", 100, store);
+    await pool.query(`CREATE FUNCTION reject_risk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'agent_risk_write_failure'; END $$;
+      CREATE TRIGGER reject_risk BEFORE INSERT ON rail_protected_risk FOR EACH ROW EXECUTE FUNCTION reject_risk()`);
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), /agent_risk_write_failure/);
+    const held = (await store.listMandates(owner, agent.agentId))[0];
+    assert.equal(held.reservedBudgetMinor, 100); assert.equal(held.spentBudgetMinor, 0);
+    for (const table of ["ledger_entries", "rail_protected_risk", "rail_risk_key_usage", "rail_transaction_evidence", "rail_idempotency"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    await pool.query("DROP TRIGGER reject_risk ON rail_protected_risk");
+    const results = await Promise.all(Array.from({ length: 6 }, () => store.executeIntent(executionCredential.token, intent.intentId, request)));
+    assert.ok(results.every(result => JSON.stringify(result) === JSON.stringify(results[0])));
+    const row = (await pool.query("SELECT * FROM rail_protected_risk")).rows[0];
+    const decoded = decryptRiskRecord(row.envelope, { txId: row.tx_id, requestFingerprint: row.request_fingerprint }, key);
+    assert.equal(decoded.features.agentBudgetExposure, 1);
+    assert.equal((await pool.query("SELECT feature_snapshot FROM rail_risk_observations")).rows[0].feature_snapshot, null);
+    assert.equal((await pool.query("SELECT * FROM rail_protected_risk")).rowCount, 1);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 100);
+  }, 1);
+});
 
 test("agent execution fails closed with a missing or short signing secret", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, owner }) => {

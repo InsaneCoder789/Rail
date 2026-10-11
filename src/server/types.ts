@@ -7,6 +7,7 @@ import type { ServerConfig } from "./config.js";
 import type { RateLimiter } from "./http.js";
 import type { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 import type { AgentAuthorityStore } from "../persistence/agentAuthority.js";
+import type { RiskProtectionStore } from "../persistence/riskProtection.js";
 
 export interface AuthenticatedViewer {
   readonly walletId: string;
@@ -49,6 +50,7 @@ export interface ServerContext {
   readonly idempotency: PostgresIdempotencyStore;
   readonly engine: PaymentPipelineEngine;
   readonly evidenceStore: TransactionEvidenceStore;
+  readonly riskProtection: RiskProtectionStore;
   readonly agentStore: AgentAuthorityStore;
   readonly rateLimiter: RateLimiter;
   readonly authResolver: AuthResolver;

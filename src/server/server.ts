@@ -7,6 +7,7 @@ import { readRiskJson, validateRiskModel } from "../risk/logisticRisk.js";
 import { validateBehaviourModel } from "../risk/behaviourModel.js";
 import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
+import { RiskProtectionStore, loadRiskKeyRing } from "../persistence/riskProtection.js";
 import { AgentAuthorityStore } from "../persistence/agentAuthority.js";
 dotenv.config();
 
@@ -39,12 +40,14 @@ export async function createServerContext(options: {
   const config = loadServerConfig();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl?.trim()) throw new Error("DATABASE_URL_REQUIRED_FOR_SERVER");
-  const evidenceStore = new TransactionEvidenceStore(loadTransactionKeyRing(process.env.RAIL_EVIDENCE_KEY_RING));
+  const paymentKeys = loadTransactionKeyRing(process.env.RAIL_EVIDENCE_KEY_RING);
+  const evidenceStore = new TransactionEvidenceStore(paymentKeys);
   const riskModel = process.env.RAIL_RISK_MODEL_PATH
     ? validateRiskModel(await readRiskJson(process.env.RAIL_RISK_MODEL_PATH))
     : undefined;
   const behaviourModel = process.env.RAIL_BEHAVIOUR_MODEL_PATH
     ? validateBehaviourModel(await readRiskJson(process.env.RAIL_BEHAVIOUR_MODEL_PATH)) : undefined;
+  const riskProtection = new RiskProtectionStore(loadRiskKeyRing(process.env.RAIL_RISK_RECORD_KEY_RING, paymentKeys));
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
   const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
@@ -85,7 +88,8 @@ export async function createServerContext(options: {
     idempotency,
     tracer,
     dlq: new MemoryDeadLetterQueue(),
-    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel, behaviourModel),
+    pipeline: buildHardenedPaymentPipeline(tracer, offlineTokenStore, riskModel, behaviourModel, riskProtection),
+    riskProtectionRequired: true,
     evidence: evidenceStore,
     relay: (event) => eventStore.insertOutboxEvent(event),
   });
@@ -98,6 +102,7 @@ export async function createServerContext(options: {
     idempotency,
     engine,
     evidenceStore,
+    riskProtection,
     agentStore: new AgentAuthorityStore(pool, engine),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({

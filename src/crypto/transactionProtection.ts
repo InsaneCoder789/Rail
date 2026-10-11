@@ -51,6 +51,11 @@ export class TransactionKeyRing {
     if (!key) throw new Error("transaction_evidence_key_unavailable");
     return { keyId, encryptionKey: Buffer.from(key.encryptionKey), authenticationKey: Buffer.from(key.authenticationKey) };
   }
+
+  materialFingerprints(): readonly string[] {
+    return [...this.keys.values()].flatMap(key => [key.encryptionKey, key.authenticationKey]
+      .map(value => createHash("sha256").update(value).digest("hex")));
+  }
 }
 
 export function loadTransactionKeyRing(raw: string | undefined): TransactionKeyRing {

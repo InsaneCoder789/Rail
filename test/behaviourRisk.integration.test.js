@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import dotenv from "dotenv";
 import { Pool } from "pg";
@@ -15,6 +15,8 @@ import { createAuthorization } from "../dist/stages/authorizationStage.js";
 import { explainBehaviour, persistBehaviourObservation, readBehaviourObservation } from "../dist/risk/behaviourRisk.js";
 import { handlePaymentRoutes } from "../dist/server/routes/paymentRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
+import { TransactionKeyRing } from "../dist/crypto/transactionProtection.js";
+import { RiskProtectionStore, decryptRiskRecord } from "../dist/persistence/riskProtection.js";
 
 dotenv.config();
 const databaseUrl = process.env.DATABASE_URL;
@@ -34,9 +36,10 @@ async function fixture(work) {
     await runMigrations(pool);
     await ensureOutboxSchema(pool);
     await pool.query("INSERT INTO wallets(wallet_id, balance) VALUES ('risk_sender', 1000000), ('risk_receiver', 0), ('risk_other', 0)");
-    const engine = (riskModel, after, behaviourModel) => {
-      const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, riskModel, behaviourModel);
+    const engine = (riskModel, after, behaviourModel, protection, required = false) => {
+      const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, riskModel, behaviourModel, protection);
       return new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
+        riskProtectionRequired: required,
         dlq: new MemoryDeadLetterQueue(), pipeline: async ctx => { await pipeline(ctx); await after?.(ctx); } });
     };
     const transaction = async (amountMinor = 100, receiverWalletId = "risk_receiver", createdAt = new Date().toISOString()) => {
@@ -62,6 +65,95 @@ test("behaviour policy explicitly distinguishes cold start and unexplained devic
   assert.equal(explainBehaviour({ ...features, historyCount: 5, receiverSeen: true }).level, "normal");
   assert.equal(explainBehaviour({ ...features, historyCount: 5, historyTruncated: true }).level, "insufficient_history");
   assert.ok(explainBehaviour({ ...features, agentBudgetExposure: 0.9 }).reasons.includes("high_agent_budget_exposure"));
+});
+
+function riskKeys(keyId = "risk_test_v1") { return { keyId, encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) }; }
+
+test("protected risk commits ciphertext without raw features, model hashes or probabilities in relational/event copies", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    const runtime = engine(model, undefined, undefined, protection, true), txn = await transaction();
+    const result = await runtime.execute(txn);
+    await Promise.all(Array.from({ length: 5 }, () => runtime.execute(txn)));
+    const row = (await pool.query("SELECT * FROM rail_risk_observations WHERE tx_id = $1", [txn.txId])).rows[0];
+    assert.equal(row.protection_required, true);
+    assert.equal(row.feature_snapshot, null); assert.equal(row.model_hash, null); assert.equal(row.prediction, null);
+    const protectedRow = (await pool.query("SELECT * FROM rail_protected_risk WHERE tx_id = $1", [txn.txId])).rows[0];
+    const decoded = decryptRiskRecord(protectedRow.envelope, { txId: txn.txId, requestFingerprint: row.request_fingerprint }, key);
+    assert.equal(decoded.features.historyCount, 0);
+    assert.ok(Number.isFinite(decoded.prediction.probability));
+    assert.match(decoded.modelHash, /^[a-f0-9]{64}$/);
+    assert.equal((await pool.query("SELECT * FROM rail_protected_risk")).rowCount, 1);
+    assert.equal((await pool.query("SELECT * FROM rail_risk_key_usage")).rows[0].record_count, "1");
+    assert.equal((await pool.query("SELECT * FROM outbox WHERE type = 'risk.shadow_assessed'")).rowCount, 0);
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_sender", protection)).protection, "verified");
+    assert.equal(await readBehaviourObservation(pool, txn.txId, "risk_other", protection), undefined);
+    assert.deepEqual(await runtime.execute(txn), result);
+    await assert.rejects(pool.query("DELETE FROM rail_protected_risk WHERE tx_id = $1", [txn.txId]), /posted_payment_history_is_immutable/);
+    await runMigrations(pool);
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_receiver", protection)).protection, "verified");
+  });
+});
+
+test("protected risk key rotation preserves verification and missing keys never return unverified summaries", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const old = riskKeys(), next = riskKeys("risk_test_v2");
+    const first = new RiskProtectionStore(new TransactionKeyRing(old.keyId, [old]));
+    const txn = await transaction(); await engine(model, undefined, undefined, first).execute(txn);
+    const retained = new RiskProtectionStore(new TransactionKeyRing(next.keyId, [old, next]));
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_sender", retained)).protection, "verified");
+    const lost = new RiskProtectionStore(new TransactionKeyRing(next.keyId, [next]));
+    assert.deepEqual(await readBehaviourObservation(pool, txn.txId, "risk_sender", lost),
+      { txId: txn.txId, status: "verification_unavailable", reason: "key_unavailable" });
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_sender")).status, "verification_unavailable");
+    await engine(model, undefined, undefined, retained).execute(await transaction());
+    assert.equal((await pool.query("SELECT * FROM rail_risk_key_usage")).rowCount, 2);
+  });
+});
+
+test("protected risk quota and failed writes roll back money, quota and replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key], 1));
+    const txn = await transaction();
+    await pool.query(`CREATE FUNCTION fail_protected_risk() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected_risk_cipher_failure'; END $$;
+      CREATE TRIGGER fail_protected_risk BEFORE INSERT ON rail_protected_risk FOR EACH ROW EXECUTE FUNCTION fail_protected_risk()`);
+    await assert.rejects(engine(model, undefined, undefined, protection).execute(txn), /injected_risk_cipher_failure/);
+    for (const table of ["rail_protected_risk", "rail_risk_key_usage", "ledger_entries", "rail_idempotency", "rail_risk_observations"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0);
+    await pool.query("DROP TRIGGER fail_protected_risk ON rail_protected_risk");
+    await engine(model, undefined, undefined, protection).execute(txn);
+    await assert.rejects(engine(model, undefined, undefined, protection).execute(await transaction()), /risk_key_rotation_required/);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+    assert.equal((await pool.query("SELECT * FROM rail_risk_key_usage")).rows[0].record_count, "1");
+  });
+});
+
+test("protected risk requirement and deferred missing-envelope checks cannot commit an unprotected payment", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const txn = await transaction();
+    await assert.rejects(engine(model, undefined, undefined, undefined, true).execute(txn), /risk_protection_required/);
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    await pool.query("ALTER TABLE rail_protected_risk DISABLE TRIGGER rail_protected_risk_immutable");
+    await assert.rejects(engine(model, async ctx => {
+      assert.equal(ctx.result.status, "accepted");
+      await ctx.dbClient.query("DELETE FROM rail_protected_risk WHERE tx_id = $1", [txn.txId]);
+    }, undefined, protection, true).execute(txn), /payment_risk_protection_missing/);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_risk_key_usage")).rowCount, 0);
+    await pool.query("ALTER TABLE rail_protected_risk ENABLE TRIGGER rail_protected_risk_immutable");
+  });
+});
+
+test("protected risk detects tampered summaries instead of exposing an authenticated-looking reason", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, engine, transaction }) => {
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    const txn = await transaction(); await engine(model, undefined, undefined, protection).execute(txn);
+    await pool.query("ALTER TABLE rail_risk_observations DISABLE TRIGGER rail_risk_immutable");
+    await pool.query(`UPDATE rail_risk_observations SET assessment = jsonb_set(assessment,'{reasons}','["forged"]') WHERE tx_id = $1`, [txn.txId]);
+    assert.deepEqual(await readBehaviourObservation(pool, txn.txId, "risk_sender", protection),
+      { txId: txn.txId, status: "verification_unavailable", reason: "verification_failed" });
+    await pool.query("ALTER TABLE rail_risk_observations ENABLE TRIGGER rail_risk_immutable");
+  });
 });
 
 test("behaviour snapshots use database time and exclude the current or caller-invented history", { skip: !databaseUrl }, async () => {
@@ -237,9 +329,10 @@ test("behaviour deferred checks refuse success if required observation disappear
 test("behaviour status is participant-only, non-cacheable and throttled without exposing raw features", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, engine, transaction }) => {
     const txn = await transaction();
-    await engine(model).execute(txn);
+    const key = riskKeys(), protection = new RiskProtectionStore(new TransactionKeyRing(key.keyId, [key]));
+    await engine(model, undefined, undefined, protection, true).execute(txn);
     assert.equal(await readBehaviourObservation(pool, txn.txId, "risk_other"), undefined);
-    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_receiver")).status, "observed");
+    assert.equal((await readBehaviourObservation(pool, txn.txId, "risk_receiver", protection)).status, "observed");
     const call = async (walletId, txId = txn.txId) => {
       const req = Readable.from([]);
       req.method = "GET";
@@ -248,7 +341,7 @@ test("behaviour status is participant-only, non-cacheable and throttled without 
       const headers = {};
       const res = { setHeader(key, value) { headers[key] = value; }, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
       await handlePaymentRoutes(req, res, new URL(`http://localhost/v1/payments/${txId}/risk`), {
-        pool, config: loadServerConfig(), authResolver: { async resolveAuthenticatedWallet() { return walletId; } }, rateLimiter: new PostgresRateLimiter(pool)
+        pool, riskProtection: protection, config: loadServerConfig(), authResolver: { async resolveAuthenticatedWallet() { return walletId; } }, rateLimiter: new PostgresRateLimiter(pool)
       });
       return { ...res, headers };
     };
@@ -258,6 +351,7 @@ test("behaviour status is participant-only, non-cacheable and throttled without 
     assert.equal(response.status, 200);
     assert.equal(response.headers["Cache-Control"], "no-store");
     assert.equal(response.body.risk.synthetic, true);
+    assert.equal(response.body.risk.protection, "verified");
     for (const field of ["feature_snapshot", "prediction", "model_hash", "senderWalletId"]) assert.ok(!JSON.stringify(response.body).includes(field));
     for (let i = 1; i < 30; i++) await call("risk_sender");
     await assert.rejects(call("risk_sender"), { status: 429 });

@@ -76,3 +76,5 @@ jobs:
         run: node --test test/behaviourModel.test.js
       - name: Verify bounded drift diagnostics, insufficient data and operational exit codes
         run: node --test test/behaviourMonitoring.test.js
+      - name: Verify risk-record encryption, key separation, rotation and rollback
+        run: node --test test/riskProtection.test.js test/behaviourRisk.integration.test.js

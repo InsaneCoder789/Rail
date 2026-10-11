@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### V2.2 Atomic Protected Risk Records: 12 October 2026
+
+Added `src/persistence/riskProtection.ts` and mandatory HTTP configuration `RAIL_RISK_RECORD_KEY_RING`. A purpose-bound AES-256-GCM envelope with independently keyed HMAC-SHA256 retains detailed features, assessment, model provenance and predictions. HTTP startup rejects absent/malformed rings and material shared with any configured payment-evidence version. No existing secrets were silently replaced. This is application-loaded symmetric encryption, not a public signature, KMS or whole-database encryption.
+
+The risk store shares the financial client. New protected observation rows retain no plaintext feature snapshot, model hash or prediction; the older probability-bearing shadow event is suppressed. Clear time, explanation and model availability/version/synthetic summaries remain queryable but participant reads verify them against the protected record before exposing them. Missing keys or tampering returns `verification_unavailable` without an assessment. Historical plaintext observations remain explicitly `legacy_plaintext`, and absent observations remain `legacy_unobserved`; no history was deleted or silently backfilled.
+
+Immutable ciphertext, fingerprint binding, per-encryption-key committed-record quotas, nonce uniqueness and deferred required-record checks prevent partial financial commits. Failure rolls back wallet/token/ledger state, agent budget consumption, replay and key quota. Concurrent replay retains one original record; retained-key rotation preserves verification. The quota counts committed records, not all failed encryption invocations. Secret inventory, attempt monitoring, retention, historical migration, least-privilege roles and isolated key restore remain operational gates. Stop/drain older writers, apply migrations and provision both independent rings before HTTP cutover.
+
+Verification: 192 local tests pass, zero failures/skips, including live PostgreSQL. Twelve new cases cover envelope/binding/GCM/HMAC tampering, key independence, size bounds, rotation/missing keys, immutable storage, plaintext/event-copy suppression, rollback/quota exhaustion, deferred required-envelope checks, summary tampering, startup guards and explicit offline/agent failure-retry paths. Existing participant API coverage now reads verified protected summaries. An intermediate offline fixture used a Web Crypto API where Node's imported `randomBytes` was required; the fixture was corrected and the entire suite rerun. GitHub Actions includes an explicit risk-protection step; this revision has not run remotely or deployed. V2 remains incomplete: anomaly-baseline work, durable audit batches/worker/contract, operator visibility and real-label/provider/recovery acceptance are still open.
+
 ### V2.2 Bounded Behavioural Drift Diagnostics: 12 October 2026
 
 Added a finite `risk:monitor` command and `behaviourMonitoring.ts`. The operator supplies one expanded model and ordered, distinct reference/current cohorts; validation rejects repeated events, mismatched currencies, invalid features, observations at/before training cutoff and overlapping periods. Input uses the existing 20-MiB reader cap and at most 10,000 rows per cohort. Fewer than twenty samples returns `insufficient_data` without fabricating a stability conclusion. Supplied source declarations remain unverified; this tool is not an authenticated PostgreSQL exporter.
@@ -539,6 +549,11 @@ The unused `postgresWalletStore.ts` and `walletStore.ts` implementations were re
   Contains the event listing and SSE stream endpoints.
 
 ### Risk Modules
+
+- `src/persistence/riskProtection.ts`
+  Implements risk-purpose AES/GCM and HMAC envelopes, independent key-ring loading, atomic quotas/ciphertext persistence and authenticated summary verification.
+- `test/riskProtection.test.js`
+  Covers encrypted record round-trip, nonce freshness, tampered envelopes/bindings, GCM/HMAC independence, key separation and input limits.
 
 - `src/risk/behaviourRisk.ts`
   Collects bounded database history, derives statistical/velocity/budget observations and persists immutable shadow assessments inside financial execution. Provides participant-filtered summary reads without raw features.

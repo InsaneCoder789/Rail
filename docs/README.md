@@ -262,6 +262,7 @@ JWT_SECRET=replace_this_with_a_real_secret
 RAIL_SIGNING_SECRET=replace_this_with_a_real_secret
 RAIL_API_KEY=replace_this_with_a_real_secret
 RAIL_EVIDENCE_KEY_RING=<private JSON key ring; see DEPLOYMENT.md>
+RAIL_RISK_RECORD_KEY_RING=<separate private JSON key ring; see DEPLOYMENT.md>
 ```
 
 ### 3. Start PostgreSQL
@@ -316,6 +317,7 @@ The server refuses startup if `DATABASE_URL` is missing or blank. It does not st
 | `JWT_SECRET` | JWT signing and verification secret. |
 | `RAIL_SIGNING_SECRET` | HMAC signing secret for transaction and authorization integrity helpers. |
 | `RAIL_EVIDENCE_KEY_RING` | Required HTTP-runtime JSON key ring for AES-256-GCM evidence and separate HMAC authentication. See the rotation/setup procedure in `DEPLOYMENT.md`. Never send it to clients. |
+| `RAIL_RISK_RECORD_KEY_RING` | Required independent AES-256-GCM/HMAC key ring for detailed risk records. Reusing material from any configured payment-evidence version is rejected. Never send it to clients. |
 | `RAIL_ALLOWED_ORIGINS` | Comma-separated frontend origins allowed by CORS. Localhost development origins are used by default when unset. |
 | `RAIL_REQUIRE_TX_SIGNATURE` | If `true`, execution paths require a valid `paymentSignature`. |
 | `RAIL_RISK_MODEL_PATH` | Optional validated logistic-regression model JSON. Produces shadow observations only. |
@@ -428,7 +430,9 @@ Authenticated sender/receiver access to the payment's retained shadow assessment
 
 New payments using the standard pipeline retain one immutable, fingerprint-bound observation in the financial transaction. Collection occurs after authority/token checks and sorted wallet locks, before posting the current payment. It uses database time and up to 1,000 prior visible payments from the last 30 days in the same wallet/currency. Truncated history is explicit; sampled five-minute velocity is a lower bound and recipient familiarity is sample-local. Cold start and missing device-verification history are not treated as proof of safety. Agent budget exposure comes from persisted held plus spent budget, not agent claims.
 
-The versioned deterministic policy reports amount deviation, velocity and budget pressure for explanation only. `review` is a shadow observation, not a suspended payment; `normal` does not mean fraud-free. Optional `RAIL_BEHAVIOUR_MODEL_PATH` enables expanded logistic inference from trusted features, with named log-odds contributions and explicit missing-history/budget indicators. The legacy amount/channel artifact remains supported. Model hashes and predictions are retained privately; a future training cutoff returns `not_yet_valid` without silently falling back to another model. Observation writes and required-observation commit checks must succeed with payment accounting; retry returns the same snapshot rather than rescoring history. Feature records are relational data, not part of the encrypted transaction envelope. Real-label validation, retention/privacy approval, drift monitoring and production fraud enforcement remain open.
+The versioned deterministic policy reports amount deviation, velocity and budget pressure for explanation only. `review` is a shadow observation, not a suspended payment; `normal` does not mean fraud-free. Optional `RAIL_BEHAVIOUR_MODEL_PATH` enables expanded logistic inference from trusted features, with named log-odds contributions and explicit missing-history/budget indicators. The legacy amount/channel artifact remains supported. A future training cutoff returns `not_yet_valid` without silently falling back to another model. Observation writes and required-observation commit checks must succeed with payment accounting; retry returns the same snapshot rather than rescoring history.
+
+New HTTP-runtime payments encrypt detailed features, model hashes and predictions in a separate AES-256-GCM/HMAC risk envelope, bound to the payment fingerprint. Their plaintext copies are not retained in the observation table, and the old probability-bearing shadow event is suppressed. Observation time, explanation codes and model availability/version/synthetic status remain queryable; the API verifies them against the envelope before returning `protection: verified`. Missing keys or failed verification return `verification_unavailable` without the assessment. Historical plaintext observations remain explicitly `legacy_plaintext`; they are not silently encrypted or removed. Real-label validation, retention/privacy approval, monitored key recovery and production fraud enforcement remain open.
 
 `npm run risk:monitor -- /private/path/cohorts.json` compares chronological reference/current cohorts with the expanded model. It reports aggregate feature/prediction shifts and missingness, not individual transactions or fraud accuracy. Exit codes are 0 for no detected shift, 2 for detected shift, 3 for insufficient samples and 1 for invalid input. This offline diagnostic does not auto-retrain or change payments; threshold validation, independently reviewed inputs, protected risk-record retention and live operational acceptance remain required.
 
