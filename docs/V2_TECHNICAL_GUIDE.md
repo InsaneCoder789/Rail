@@ -2,6 +2,46 @@
 
 Development continues directly on `main`, starting 8 October 2026. Protected evidence and owner-controlled agent execution are implemented, followed by trusted behavioural observations. This document describes existing modules and their limits. The complete platform roadmap remains in the ignored private scope file. [SECURITY_REVIEW.md](./SECURITY_REVIEW.md) tracks the remaining defects.
 
+## Agent Execution Authority Snapshots
+
+`src/persistence/agentEvidence.ts` stores a versioned, bounded policy/intent/payment/credential snapshot using `agent-authority-v1` purpose-separated AES-256-GCM/HMAC envelopes. It reuses the existing authenticated-record primitive without changing old `risk-v1` bytes or accepting risk records as authority. The key ring is independently provisioned through `RAIL_AGENT_AUTHORITY_KEY_RING`; startup rejects overlap with configured/retained payment/risk material. Missing authority configuration disables agent spending, not ordinary human HTTP startup.
+
+New intents require receipt version 1. `AgentAuthorityStore` completes the intent, writes required authority evidence and the execution event using the same outer financial client. Deferred checks require matching payment/fingerprint and an execution-scoped credential bound to that agent and valid at execution time. Receipt/history markers are immutable; nonce uniqueness and committed-record quotas apply. Write/quota/final-commit failure rolls back money, consumed allowance, evidence and replay. JSONB key ordering cannot change commitments because hashing uses fixed field-order encoding. Replay authenticates the original receipt without rewriting it.
+
+Owner reads verify the envelope, commitment, key/nonce metadata and reconstructed immutable policy/payment bindings before disclosing a sanitized explanation. They use owner-only JWT authority and `no-store`. Statuses are `not_executed`, `verified`, `legacy_unavailable` and `verification_unavailable`; missing retained keys and tampering are not clean verification. Old nullable markers are preserved and historical receipts are not fabricated. Unexecuted legacy intents require new requests after releasing old holds and applying required approval.
+
+Original owner records now use separate `agent-mandate-v1`, `agent-approval-v1` and `agent-rejection-v1` domains. `rail_agent_owner_evidence` captures immutable policy/request bindings, database time and authentication context. Owner JWT context is resolved server-side and revalidated against the current user/wallet/credential version under a shared row lock before a new record is signed. No JWT is retained and body-supplied actor fields are ignored. Stale context rejects the mutation with 401 and rollback; internal callers are labelled `trusted_library`.
+
+New `consent_receipt_version` and `owner_evidence_version` markers require original records through deferred commit checks. Effective decisions commit evidence, state, allowance release and event together. Duplicate approvals preserve the first ciphertext; rejection adds its own record without replacing prior approval. Fresh proposals verify mandate consent before holding budget; execution verifies consent plus required approval before financial work and again when creating its receipt. The execution envelope binds original owner-record commitments, and the owner explanation includes authenticated provenance. Budgeted requests do not claim fresh human approval.
+
+The independent authority ring's quota now covers all owner/execution encryptions. `rail_agent_evidence_nonces` records used nonces across domains; a collision aborts rather than reuses the nonce. Quotas/nonces roll back with failed writes. Old execution ciphertext remains unchanged; new nullable owner markers distinguish legacy snapshots lacking original provenance. Older mandates cannot authorize new proposals without fresh consent; readiness hints reflect the markers. Emergency revocation works without decryption keys and releases only unexecuted holds.
+
+Assurance remains server-attested context, not independent non-repudiation or proof of physical presence. Historical JWT versions are evidence, not a requirement that the old login remain live forever; logout invalidates sessions, not all existing delegations. Authority records are not in current v1 audit roots. Stronger owner step-up, merchant-authenticated quotes, fair admission and provider execution remain next dependencies.
+
+## Internal-Wallet Checkout Contract
+
+### Merchant Signature Verification
+
+`src/crypto/merchantQuotes.ts` owns the bounded recipient/key registry, canonical signing bytes, proof parsing and Ed25519 verification using [Node crypto](https://nodejs.org/docs/latest-v22.x/api/crypto.html#cryptoverifyalgorithm-data-key-signature). `merchantQuoteBytes(checkout, keyId)` serializes this UTF-8 JSON tuple:
+
+```text
+["rail:merchant-checkout:v1", keyId, version, merchantWalletId, quoteId,
+ quoteVersion, subtotalMinor, feeMinor, totalMinor, currency, expiresAt,
+ fundingSource.type, fundingSource.walletId]
+```
+
+The merchant signs these exact bytes with `sign(null, bytes, privateKey)` and returns canonical base64 of the 64-byte signature. Rail accepts only `{ keyId, signature }` as `merchantQuoteProof`, never a client public key or verification flag. Public keys are canonical base64 DER SPKI Ed25519 keys enrolled through operator configuration. No arbitrary JSON serialization order or client algorithm selection is used. The signing helper defines bytes but does not generate or retain private keys.
+
+Recipients in the registry require signed checkouts on proposal, approval and fresh execution. `revoked` keys remain in the registry to prevent unsigned downgrade. v3 proposal/intent tuples append attestation version/key ID/key fingerprint/signature; v1 simple transfers and v2 unsigned checkout hashes remain unchanged. The nullable immutable `merchant_attestation` stores signature/public-key/fingerprint snapshots. SQL checks shape and a unique recipient/quote-ID index enforces single-use across versions; a shared advisory lock supplies a stable conflict response to concurrent agents. SQL does not verify cryptography or enroll trust. Protected decisions/receipts bind the snapshot, and reads verify its signature without requiring historical keys to remain active. Committed replay retains historical outcome; new spending still checks current trust.
+
+This is operator-configured signer provenance, not merchant reputation, invoice truth, owner signature or settlement confirmation. Unregistered recipients retain unsigned compatibility. Removing all recipient entries removes mandatory proof policy and needs a reviewed cutover; direct integrations must supply the same registry as HTTP writers. No merchant onboarding/signing API, revocation service or external provider call is implemented.
+
+`AgentCheckout` is optional on an intent. Its exact version-1 shape rejects unknown nested fields, unsupported funding types, noninteger fees and inconsistent totals. Parsing snapshots and freezes all supplied values before awaiting. JSONB storage is nullable for historical/simple transfers; `rail_agent_checkout_binding` enforces shape, receiver/currency/owner/total alignment and quote lifetime. The intent immutability trigger includes checkout.
+
+Proposal and intent fingerprints use v2 domains with a fixed-order checkout tuple. Simple transfers retain their original v1 domains and bytes. Intent lifetime is the minimum of request TTL, mandate expiry and checkout expiry sampled from PostgreSQL time. Throwing for an expired quote rolls back any temporary budget update. Existing post-execution expiry checks protect against deadlines passing during financial work; committed replay precedes fresh-intent expiry checks. Owner decision bodies and execution snapshots append checkout only when present, preserving old encrypted evidence bindings.
+
+Without a trusted proof the derived assurance is `agent_proposed_unverified`; signed quotes use `configured_merchant_signature`. A wallet alone is not merchant attestation. Funding is only the owner's internal wallet; subtotal plus fees is one transfer to the receiver, not provider accounting. No new network call, package or payment provider was added. Stronger owner step-up, merchant onboarding/recovery and fair admission remain separate work.
+
 ## Payment behavior
 
 The existing flow remains: authenticate, reserve funds and persist authorization, optionally issue device-bound offline headroom, execute or sync, consume reservation and write debit/credit ledger rows. Offline features remain part of V2.

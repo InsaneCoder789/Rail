@@ -34,18 +34,26 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
   }
 
   const root = url.pathname === "/v2/agents";
-  const route = /^\/v2\/agents\/([^/]+)\/(revoke|credentials|mandates|intents)(?:\/([^/]+)\/(revoke|decision))?$/.exec(url.pathname);
+  const route = /^\/v2\/agents\/([^/]+)\/(revoke|credentials|mandates|intents)(?:\/([^/]+)\/(revoke|decision|authority))?$/.exec(url.pathname);
   if ((!root && !route) || (req.method !== "GET" && req.method !== "POST")) return false;
-  if (route && ((route[2] === "revoke" && req.method !== "POST") || (route[3] && req.method !== "POST") || (route[2] === "revoke" && route[3]))) return false;
+  if (route && route[4] === "authority" && (route[2] !== "intents" || req.method !== "GET")) return false;
+  if (route && ((route[2] === "revoke" && req.method !== "POST") || (route[3] && route[4] !== "authority" && req.method !== "POST") || (route[2] === "revoke" && route[3]))) return false;
   if (route && ((route[2] === "intents" && (route[4] === "revoke" || (req.method === "POST" && !route[3]))) ||
     (route[2] !== "intents" && route[4] === "decision"))) return false;
 
   await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_control_source", limit: 30,
     windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
-  const owner = await context.authResolver.resolveOwnerWallet(req);
+  const principal = context.authResolver.resolveOwnerPrincipal ? await context.authResolver.resolveOwnerPrincipal(req)
+    : { walletId: await context.authResolver.resolveOwnerWallet(req), method: "trusted_library" as const };
+  const owner = principal.walletId;
   await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_control",
     identity: owner, limit: 20, windowMs: 60_000 });
   if (req.method === "GET") {
+    if (route?.[4] === "authority") {
+      res.setHeader("Cache-Control", "no-store");
+      json(res, 200, { authority: await context.agentStore.readAuthority(owner, route[1], route[3]) });
+      return true;
+    }
     if (root) json(res, 200, { agents: await context.agentStore.listAgents(owner) });
     else if (route![2] === "credentials") json(res, 200, { credentials: await context.agentStore.listCredentials(owner, route![1]) });
     else if (route![2] === "intents") json(res, 200, { intents: await context.agentStore.listIntents(owner, route![1]) });
@@ -59,13 +67,13 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
   else {
     const [, agentId, action, resourceId] = route!;
     if (action === "revoke") json(res, 200, { agent: await context.agentStore.revokeAgent(owner, agentId) });
-    else if (action === "intents") json(res, 200, { intent: await context.agentStore.decideIntent(owner, agentId, resourceId, body) });
+    else if (action === "intents") json(res, 200, { intent: await context.agentStore.decideIntent(owner, agentId, resourceId, body, principal) });
     else if (action === "credentials") {
       if (resourceId) json(res, 200, { credential: await context.agentStore.revokeCredential(owner, agentId, resourceId) });
       else json(res, 201, { credential: await context.agentStore.issueCredential(owner, agentId, body) });
     } else if (action === "mandates") {
       if (resourceId) json(res, 200, { mandate: await context.agentStore.revokeMandate(owner, agentId, resourceId) });
-      else json(res, 201, { mandate: await context.agentStore.createMandate(owner, agentId, body) });
+      else json(res, 201, { mandate: await context.agentStore.createMandate(owner, agentId, body, principal) });
     } else throw new RequestError(404, "not_found", "route not found");
   }
   return true;

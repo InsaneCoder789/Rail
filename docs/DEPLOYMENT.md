@@ -20,6 +20,7 @@ RAIL_SIGNING_SECRET=<long-random-signing-secret>
 JWT_SECRET=<long-random-jwt-secret>
 RAIL_EVIDENCE_KEY_RING=<private JSON key ring described below>
 RAIL_RISK_RECORD_KEY_RING=<independent private JSON key ring described below>
+RAIL_AGENT_AUTHORITY_KEY_RING=<third independent private JSON ring, needed for agent spending>
 RAIL_ALLOWED_ORIGINS=https://your-frontend.example
 RAIL_REQUIRE_JSON_CONTENT_TYPE=true
 RAIL_EXPOSE_INTERNAL_ERRORS=false
@@ -59,6 +60,25 @@ Apply migrations before the new runtime. New required-evidence payments cannot c
 The library engine keeps evidence optional for isolated V1 regression/demo callers; the HTTP runtime always supplies the evidence store. Direct library integrations must opt in explicitly. Ledger fields and existing event payloads remain relational/plaintext; this phase encrypts the canonical audit copy only. Least-privilege database roles, retention, secure secret storage, monitoring and a production key-provider review remain release gates.
 
 ## Database setup
+
+### Merchant Quote Trust Configuration
+
+`RAIL_MERCHANT_QUOTE_KEYS` is optional; absence enables no trusted signed quotes and preserves unsigned transfers. A configured malformed registry fails before the pool opens. The value is a bounded JSON array (1-100 entries):
+
+```json
+[
+  {
+    "keyId": "merchant_2026_10",
+    "merchantWalletId": "merchant_wallet",
+    "status": "active",
+    "publicKey": "<canonical base64 DER SPKI Ed25519 public key>"
+  }
+]
+```
+
+Only public keys belong here. Authenticate merchant/recipient ownership outside the agent channel before enrollment; configuration does not provide KYC. Never put private signing keys in Rail, frontend bundles, agent credentials or this registry. Duplicate IDs/material, private/wrong-algorithm keys and unknown fields/statuses are rejected. There is no new secret generated automatically and no merchant configured in the repository.
+
+Rotate with a new ID and key, retaining old entries as `revoked` when no longer accepted. Every recipient still present requires signed quotes, even if all its keys are revoked. Deleting all its entries removes that requirement; it is an explicit policy removal, not safe revocation. Deploy the same registry to every HTTP/library writer, draining mismatched versions; this application cannot enforce consistent trust across differently configured instances. Previously approved unsigned intents for newly enrolled recipients cannot execute; reject/release them and obtain signed replacements. Completed payments retain protected public-key snapshots and can replay their historical outcome after revocation. No network quote fetching, merchant private-key hosting, provider integration or live deployment is included.
 
 ### Protected risk-record cutover
 
@@ -104,7 +124,15 @@ Proposals and human approvals reserve mandate headroom, not wallet funds. Execut
 
 Intent lifetimes are 60-900 seconds, clipped to the mandate deadline. Expiry cleanup happens during successful intent/mandate reads and intent mutations, not a background interval; failed transactions also roll cleanup back. Revoking an agent or mandate releases unexecuted holds, never consumed budget. Single-credential revocation invalidates subsequent token use but leaves other agent intents intact. Agent execution locks wallets in sorted order and skips unrelated authorization-expiry sweeps inside that lock scope. Schedule the existing authorization sweep separately so elapsed wallet reservations do not unnecessarily restrict available funds.
 
-No extra deployment secret is introduced. Monitor owner-global and agent-global 20/minute quotas, source quotas and retained-record capacities (50 agents/owner, 100 credentials and mandates/agent, 1,000 intents/agent). Lifecycle/retention decisions must not delete audit history automatically. Pending intent fields are not AES-encrypted evidence. Database triggers protect normal data writes, not a database owner capable of disabling them; least-privilege runtime roles remain a production gate. Run the complete PostgreSQL-backed suite and the explicit agent test step before rollout.
+New agent mandates, effective owner decisions and spending require `RAIL_AGENT_AUTHORITY_KEY_RING`, with the same ring JSON shape and independent AES/HMAC material from every configured/retained payment and risk key. If absent, human HTTP startup continues but new protected grants/decisions and spending remain unavailable (503). Revocation remains available without decryption keys. Malformed or reused configured keys fail startup before pool creation. No actual secret is generated or overwritten. The ring's committed-record quota and nonce registry cover consent, decisions and execution together; preserve old keys and verify restore. Do not erase records/counters to bypass rotation.
+
+New intents have immutable `authority_receipt_version = 1`; execution writes a server-authenticated policy/credential/exact-intent snapshot in `rail_agent_authority_evidence` before the outer financial commit. Missing required evidence aborts that commit. Original ciphertext is preserved on replay, which must verify the receipt before returning the committed result. The owner-only, non-cacheable `GET /v2/agents/:agentId/intents/:intentId/authority` distinguishes `not_executed`, `verified`, `legacy_unavailable` and `verification_unavailable` with safe reasons; it never exposes tokens or keys. Assurance is `server_observed_authority`, not a user signature or independently proven human presence.
+
+New mandate consent and effective approve/reject decisions also retain immutable encrypted owner-context records. HTTP principal identity/version is server-derived and rechecked before recording; library calls are lower-assurance `trusted_library`. Execution verifies original consent/required approval and links their commitments. No raw JWT or user signature is stored. Repeated approval does not refresh the original record; historical provenance remains verifiable after session logout. Explicit agent/mandate revocation is needed to withdraw delegated permissions.
+
+Apply migrations before writer cutover. Existing consent/intent owner markers stay NULL, never fabricated evidence. Already committed snapshots remain readable with explicit missing owner provenance. Old unexecuted requests need replacement; old mandates cannot create new proposals without fresh owner consent (`409 new_agent_owner_consent_required`). Release/revoke old unspent holds, create a fresh mandate/request ID and obtain applicable approval; do not overwrite old fingerprints or retroactively prove unknown consent. Do not mix old/new writers: old code cannot satisfy new mandatory records. Current v1 Merkle roots exclude these authority records; chain publication remains unfinished.
+
+Monitor owner-global and agent-global 20/minute quotas, source quotas and retained-record capacities (50 agents/owner, 100 credentials and mandates/agent, 1,000 intents/agent). Lifecycle/retention decisions must not delete audit history automatically. Pending intent fields remain plaintext relational data. Database triggers protect normal writes, not an administrator disabling them; least-privilege runtime roles remain a production gate. Run the full PostgreSQL-backed suite and explicit agent/receipt tests before rollout.
 
 ### Internal transaction composition
 

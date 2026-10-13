@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash, randomUUID, randomBytes } from "node:crypto";
+import { createHash, randomUUID, randomBytes, generateKeyPairSync, sign } from "node:crypto";
 import { Readable } from "node:stream";
 import dotenv from "dotenv";
 import { Pool } from "pg";
-import { AgentAuthorityStore, parseMandateInput } from "../dist/persistence/agentAuthority.js";
+import { AgentAuthorityStore, parseMandateInput, parseAgentCheckout } from "../dist/persistence/agentAuthority.js";
 import { runMigrations, ensureOutboxSchema } from "../dist/persistence/migrate.js";
 import { createAuthResolver } from "../dist/server/authentication.js";
 import { generateToken } from "../dist/auth/jwt.js";
@@ -20,11 +20,262 @@ import { TransactionKeyRing } from "../dist/crypto/transactionProtection.js";
 import { TransactionEvidenceStore } from "../dist/persistence/transactionEvidence.js";
 import { findReconciliationIssues } from "../dist/persistence/reconciliation.js";
 import { RiskProtectionStore, decryptRiskRecord } from "../dist/persistence/riskProtection.js";
+import { AgentEvidenceStore } from "../dist/persistence/agentEvidence.js";
+import { MerchantQuoteRegistry, merchantQuoteBytes } from "../dist/crypto/merchantQuotes.js";
 
 dotenv.config();
 const databaseUrl = process.env.DATABASE_URL;
+const authorityKey = { keyId: "agent_authority_test_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+const authorityEvidence = () => new AgentEvidenceStore(new TransactionKeyRing(authorityKey.keyId, [authorityKey]));
 const policy = { mode: "budgeted", currency: "INR", perPaymentLimitMinor: 100, totalBudgetMinor: 1000,
   allowedReceiverWalletIds: ["agent_receiver"], ttlSeconds: 3600 };
+
+function checkout(expiresAt = new Date(Date.now() + 120000).toISOString()) {
+  return { version: 1, merchantWalletId: "agent_receiver", quoteId: "quote_001", quoteVersion: 1,
+    subtotalMinor: 90, feeMinor: 10, totalMinor: 100, currency: "INR", expiresAt,
+    fundingSource: { type: "internal_wallet", walletId: "agent_owner" } };
+}
+
+function merchantFixture(status = "active") {
+  const pair = generateKeyPairSync("ed25519");
+  const entry = { keyId: "merchant_key_001", merchantWalletId: "agent_receiver", status,
+    publicKey: pair.publicKey.export({ type: "spki", format: "der" }).toString("base64") };
+  return { entry, registry: new MerchantQuoteRegistry(JSON.stringify([entry])),
+    proof: value => ({ keyId: entry.keyId, signature: sign(null, merchantQuoteBytes(value, entry.keyId), pair.privateKey).toString("base64") }) };
+}
+
+test("signed merchant checkout survives authenticated HTTP approval, execution and protected receipt reads", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner, token }) => {
+    const merchant = merchantFixture(), store = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
+    const setup = await intentSetup(store, owner), value = checkout();
+    const execution = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+      authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
+    const call = async (method, path, body, bearer) => {
+      const req = Readable.from(body ? [JSON.stringify(body)] : []);
+      req.method = method; req.headers = { authorization: `Bearer ${bearer}`, "content-type": "application/json" };
+      req.socket = { remoteAddress: "192.0.2.1" };
+      const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
+      assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost${path}`), context), true);
+      return res.body;
+    };
+    const { intent } = await call("POST", "/v2/agent/intents", { ...setup.input, checkout: value, merchantQuoteProof: merchant.proof(value) }, setup.credential.token);
+    assert.equal(intent.quoteAssurance, "configured_merchant_signature");
+    const request = { requestFingerprint: intent.requestFingerprint };
+    await call("POST", `/v2/agents/${setup.agent.agentId}/intents/${intent.intentId}/decision`, { ...request, decision: "approve" }, token);
+    await call("POST", `/v2/agent/intents/${intent.intentId}/execute`, request, execution.token);
+    const { authority } = await call("GET", `/v2/agents/${setup.agent.agentId}/intents/${intent.intentId}/authority`, undefined, token);
+    assert.equal(authority.status, "verified");
+    assert.deepEqual(authority.receipt.checkout, value);
+    assert.deepEqual(authority.receipt.merchantAttestation, intent.merchantAttestation);
+    assert.deepEqual(authority.ownerEvidence.approval.record.merchantAttestation, intent.merchantAttestation);
+    assert.equal(authority.ownerEvidence.approval.record.authentication.method, "owner_jwt");
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+  });
+});
+
+test("registered merchants reject unsigned downgrade, tampered quotes and wrong-owner audience without holds", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const merchant = merchantFixture(), store = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
+    const setup = await intentSetup(store, owner, "budgeted"), value = checkout(), proof = merchant.proof(value);
+    for (const input of [setup.input, { ...setup.input, checkout: value }])
+      await assert.rejects(store.createIntent(setup.credential.token, input), { code: "merchant_quote_required" });
+    await assert.rejects(store.createIntent(setup.credential.token, { ...setup.input, checkout: { ...value, subtotalMinor: 80, feeMinor: 20 }, merchantQuoteProof: proof }), { code: "merchant_quote_denied" });
+    const foreign = { ...value, fundingSource: { type: "internal_wallet", walletId: "other_owner" } };
+    await assert.rejects(store.createIntent(setup.credential.token, { ...setup.input, checkout: foreign, merchantQuoteProof: merchant.proof(foreign) }), { code: "checkout_funding_denied" });
+    await assert.rejects(store.createIntent(setup.credential.token, { ...setup.input, checkout: value, merchantQuoteProof: { ...proof, publicKey: merchant.entry.publicKey } }), { status: 422 });
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 0);
+    assert.equal((await store.listMandates(owner, setup.agent.agentId))[0].reservedBudgetMinor, 0);
+  });
+});
+
+test("merchant quote is single-use across concurrent agents and versions even after rejection", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const merchant = merchantFixture(), store = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
+    const first = await intentSetup(store, owner), second = await intentSetup(store, owner);
+    const value = checkout(), proof = merchant.proof(value);
+    const requests = [first, second].map(setup => ({ ...setup.input, checkout: value, merchantQuoteProof: proof }));
+    const results = await Promise.allSettled([store.createIntent(first.credential.token, requests[0]), store.createIntent(second.credential.token, requests[1])]);
+    const winnerIndex = results.findIndex(result => result.status === "fulfilled"), winner = [first, second][winnerIndex];
+    assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+    assert.equal(results[1 - winnerIndex].reason.code, "merchant_quote_used");
+    const intent = results[winnerIndex].value;
+    assert.deepEqual(await store.createIntent(winner.credential.token, requests[winnerIndex]), intent);
+    const changed = { ...value, quoteVersion: 2 };
+    await assert.rejects(store.createIntent(winner.credential.token, { ...requests[winnerIndex], checkout: changed, merchantQuoteProof: merchant.proof(changed) }), { code: "intent_request_reused" });
+    await store.decideIntent(owner, winner.agent.agentId, intent.intentId, { decision: "reject", requestFingerprint: intent.requestFingerprint });
+    await assert.rejects(store.createIntent(winner.credential.token, { ...winner.input, clientRequestId: "new_version_request", checkout: changed, merchantQuoteProof: merchant.proof(changed) }), { code: "merchant_quote_used" });
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 1);
+  });
+});
+
+test("merchant revocation blocks fresh spending but preserves completed historical receipts and replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const merchant = merchantFixture(), store = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
+    const setup = await intentSetup(store, owner, "budgeted"), execution = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+    const value = checkout(), input = { ...setup.input, checkout: value, merchantQuoteProof: merchant.proof(value) };
+    const first = await store.createIntent(setup.credential.token, input);
+    const result = await store.executeIntent(execution.token, first.intentId, { requestFingerprint: first.requestFingerprint });
+    const next = { ...value, quoteId: "next_signed_quote" };
+    const second = await store.createIntent(setup.credential.token, { ...input, clientRequestId: "next_signed_request", checkout: next, merchantQuoteProof: merchant.proof(next) });
+    const revokedRegistry = new MerchantQuoteRegistry(JSON.stringify([{ ...merchant.entry, status: "revoked" }]));
+    const revoked = executionStore(pool, undefined, false, undefined, authorityEvidence(), revokedRegistry);
+    await assert.rejects(revoked.executeIntent(execution.token, second.intentId, { requestFingerprint: second.requestFingerprint }), { code: "merchant_quote_denied" });
+    await assert.rejects(revoked.createIntent(setup.credential.token, { ...setup.input, clientRequestId: "downgrade_request" }), { code: "merchant_quote_required" });
+    assert.deepEqual(await revoked.executeIntent(execution.token, first.intentId, { requestFingerprint: first.requestFingerprint }), result);
+    assert.equal((await revoked.readAuthority(owner, setup.agent.agentId, first.intentId)).status, "verified");
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+  });
+});
+
+test("enrolling a merchant blocks old unsigned approvals while allowing rejection and preserving old receipts", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const legacy = await executionSetup(pool, owner), merchant = merchantFixture();
+    const enrolled = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
+    await assert.rejects(enrolled.decideIntent(owner, legacy.agent.agentId, legacy.intent.intentId, { ...legacy.request, decision: "approve" }), { code: "merchant_quote_required" });
+    await legacy.store.decideIntent(owner, legacy.agent.agentId, legacy.intent.intentId, { ...legacy.request, decision: "approve" });
+    await assert.rejects(enrolled.executeIntent(legacy.executionCredential.token, legacy.intent.intentId, legacy.request), { code: "merchant_quote_required" });
+    assert.equal((await enrolled.decideIntent(owner, legacy.agent.agentId, legacy.intent.intentId, { ...legacy.request, decision: "reject" })).status, "rejected");
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+  });
+});
+
+test("signed quote SQL mutation guards and migration preserve proof while financial rollback permits retry", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const merchant = merchantFixture(), store = executionStore(pool, undefined, true, undefined, authorityEvidence(), merchant.registry);
+    const setup = await intentSetup(store, owner, "budgeted"), value = checkout();
+    const intent = await store.createIntent(setup.credential.token, { ...setup.input, checkout: value, merchantQuoteProof: merchant.proof(value) });
+    const execution = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+    const request = { requestFingerprint: intent.requestFingerprint };
+    await assert.rejects(pool.query("UPDATE rail_agent_intents SET merchant_attestation=NULL WHERE intent_id=$1", [intent.intentId]), /agent_intent_history_is_immutable/);
+    await assert.rejects(store.executeIntent(execution.token, intent.intentId, request), /injected_agent_evidence_failure/);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    await runMigrations(pool);
+    const healthy = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
+    await healthy.executeIntent(execution.token, intent.intentId, request);
+    assert.deepEqual((await healthy.readAuthority(owner, setup.agent.agentId, intent.intentId)).receipt.merchantAttestation, intent.merchantAttestation);
+  });
+});
+
+test("checkout parsing rejects unverifiable claims, unsafe fees and unsupported funding", () => {
+  const value = checkout();
+  assert.deepEqual(parseAgentCheckout(value), value);
+  for (const change of [null, [], { ...value, verified: true }, { ...value, feeMinor: -1 }, { ...value, feeMinor: 10.5 },
+    { ...value, totalMinor: 99 }, { ...value, subtotalMinor: 1e12 + 1 }, { ...value, quoteVersion: 0 },
+    { ...value, quoteVersion: 1.1 }, { ...value, expiresAt: "2026-02-30T00:00:00.000Z" },
+    { ...value, expiresAt: "2026-01-01" }, { ...value, fundingSource: { type: "card", walletId: "agent_owner" } },
+    { ...value, fundingSource: { ...value.fundingSource, verified: true } }]) {
+    assert.throws(() => parseAgentCheckout(change), { status: 422 });
+  }
+  const parsed = parseAgentCheckout(value);
+  value.fundingSource.walletId = "other_owner";
+  assert.equal(parsed.fundingSource.walletId, "agent_owner");
+  assert.ok(Object.isFrozen(parsed) && Object.isFrozen(parsed.fundingSource));
+});
+
+test("checkout retries bind every quote field and snapshot caller input before awaiting", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner }) => {
+    const { credential, input } = await intentSetup(store, owner);
+    const original = checkout(), mutable = structuredClone(original);
+    const pending = store.createIntent(credential.token, { ...input, checkout: mutable });
+    mutable.quoteId = "changed_quote"; mutable.fundingSource.walletId = "other_owner";
+    const intent = await pending;
+    assert.deepEqual(intent.checkout, original);
+    assert.equal(intent.quoteAssurance, "agent_proposed_unverified");
+    assert.deepEqual(await store.createIntent(credential.token, { ...input, checkout: original }), intent);
+    for (const change of [{ quoteId: "quote_002" }, { quoteVersion: 2 }, { subtotalMinor: 80, feeMinor: 20 },
+      { expiresAt: new Date(Date.parse(original.expiresAt) + 1000).toISOString() }]) {
+      await assert.rejects(store.createIntent(credential.token, { ...input, checkout: { ...original, ...change } }), { code: "intent_request_reused" });
+    }
+    await assert.rejects(store.createIntent(credential.token, input), { code: "intent_request_reused" });
+  });
+});
+
+test("checkout policy checks charge the total including fees and reject foreign funding", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner, pool }) => {
+    const { credential, input, agent } = await intentSetup(store, owner, "budgeted", 100);
+    await assert.rejects(store.createIntent(credential.token, { ...input, checkout: { ...checkout(), fundingSource: { type: "internal_wallet", walletId: "other_owner" } } }), { code: "checkout_funding_denied" });
+    for (const change of [{ merchantWalletId: "other_owner" }, { currency: "USD" }, { totalMinor: 99, subtotalMinor: 89 }]) {
+      await assert.rejects(store.createIntent(credential.token, { ...input, checkout: { ...checkout(), ...change } }), { status: 422 });
+    }
+    await assert.rejects(store.createIntent(credential.token, { ...input, amountMinor: 110, checkout: { ...checkout(), totalMinor: 110, feeMinor: 20 } }), { code: "mandate_policy_denied" });
+    await store.createIntent(credential.token, { ...input, checkout: checkout() });
+    await assert.rejects(store.createIntent(credential.token, { ...input, clientRequestId: "second_checkout_001", checkout: checkout() }), { code: "mandate_budget_exceeded" });
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 100);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 1);
+  });
+});
+
+test("expired quotes create no intent or budget hold and live deadlines are clipped", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner, pool }) => {
+    const { credential, input, agent } = await intentSetup(store, owner);
+    await assert.rejects(store.createIntent(credential.token, { ...input, checkout: checkout("2020-01-01T00:00:00.000Z") }), { code: "quote_expired" });
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 0);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    const value = checkout();
+    const intent = await store.createIntent(credential.token, { ...input, checkout: value });
+    assert.equal(intent.expiresAt, value.expiresAt);
+  });
+});
+
+test("checkout SQL guards reject rewrites and malformed direct inserts", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ store, owner, pool }) => {
+    const { credential, input } = await intentSetup(store, owner);
+    const intent = await store.createIntent(credential.token, { ...input, checkout: checkout() });
+    await assert.rejects(pool.query("UPDATE rail_agent_intents SET checkout=jsonb_set(checkout,'{quoteVersion}','2') WHERE intent_id=$1", [intent.intentId]), /agent_intent_history_is_immutable/);
+    // An INSERT copies a valid intent but supplies invalid checkout data, exercising CHECK independently of the UPDATE guard.
+    for (const value of [null, { ...checkout(), feeMinor: null }, { ...checkout(), verified: true },
+      { ...checkout(), merchantWalletId: "other_owner" }, { ...checkout(), subtotalMinor: 89 },
+      { ...checkout(), fundingSource: { type: "internal_wallet", walletId: "other_owner" } }]) {
+      await assert.rejects(pool.query(`INSERT INTO rail_agent_intents(intent_id,agent_id,mandate_id,owner_wallet_id,client_request_id,
+        proposal_fingerprint,request_fingerprint,receiver_wallet_id,amount_minor,currency,status,created_at,expires_at,checkout)
+        SELECT $2,agent_id,mandate_id,owner_wallet_id,'invalid_checkout_insert',proposal_fingerprint,request_fingerprint,
+          receiver_wallet_id,amount_minor,currency,'pending',created_at,expires_at,$3::jsonb FROM rail_agent_intents WHERE intent_id=$1`,
+        [intent.intentId, randomUUID(), JSON.stringify(value)]), { code: "23514" });
+    }
+  });
+});
+
+test("checkout approval and execution receipts retain the exact quote across migration and expiry replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const store = executionStore(pool), setup = await intentSetup(store, owner);
+    const execution = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+    const value = checkout(new Date(Date.now() + 3000).toISOString());
+    const intent = await store.createIntent(setup.credential.token, { ...setup.input, checkout: value });
+    const request = { requestFingerprint: intent.requestFingerprint };
+    await store.decideIntent(owner, setup.agent.agentId, intent.intentId, { ...request, decision: "approve" });
+    const first = await store.executeIntent(execution.token, intent.intentId, request);
+    const proof = await store.readAuthority(owner, setup.agent.agentId, intent.intentId);
+    assert.equal(proof.status, "verified");
+    assert.deepEqual(proof.receipt.checkout, value);
+    assert.deepEqual(proof.ownerEvidence.approval.record.checkout, value);
+    assert.equal(proof.receipt.quoteAssurance, "agent_proposed_unverified");
+    assert.equal((await pool.query("SELECT balance FROM wallets WHERE wallet_id='agent_receiver'")).rows[0].balance, "100");
+    await runMigrations(pool);
+    await pool.query("SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM expires_at-clock_timestamp())) + 0.05) FROM rail_agent_intents WHERE intent_id=$1", [intent.intentId]);
+    assert.deepEqual(await store.executeIntent(execution.token, intent.intentId, request), first);
+    assert.deepEqual(await store.readAuthority(owner, setup.agent.agentId, intent.intentId), proof);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+  });
+});
+
+test("checkout expiry during execution rolls back ledger, evidence and budget consumption", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const store = executionStore(pool, async ctx => {
+      await ctx.dbClient.query("SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM expires_at-clock_timestamp())) + 0.05) FROM rail_agent_intents WHERE intent_id=$1", [intentId]);
+    });
+    const setup = await intentSetup(store, owner, "budgeted");
+    const execution = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
+    const intent = await store.createIntent(setup.credential.token, { ...setup.input, checkout: checkout(new Date(Date.now() + 1500).toISOString()) });
+    const intentId = intent.intentId;
+    await assert.rejects(store.executeIntent(execution.token, intentId, { requestFingerprint: intent.requestFingerprint }), { code: "intent_expired" });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_authority_evidence")).rowCount, 0);
+    assert.equal((await pool.query("SELECT balance FROM wallets WHERE wallet_id='agent_owner'")).rows[0].balance, "10000");
+    assert.equal((await pool.query("SELECT spent_budget_minor FROM rail_agent_mandates")).rows[0].spent_budget_minor, "0");
+    assert.equal((await store.listMandates(owner, setup.agent.agentId))[0].reservedBudgetMinor, 0);
+  });
+});
 
 async function fixture(work, max = 2, ownerBalance = 10000) {
   const schema = `ci_agents_${randomUUID().replaceAll("-", "")}`;
@@ -40,7 +291,7 @@ async function fixture(work, max = 2, ownerBalance = 10000) {
     await ensureOutboxSchema(pool);
     await pool.query("INSERT INTO wallets(wallet_id, balance) VALUES ('agent_owner', $1), ('other_owner', 10000), ('agent_receiver', 0)", [ownerBalance]);
     await pool.query("INSERT INTO users(user_id, password_hash, wallet_id) VALUES ('agent_user', 'unused_fixture_hash', 'agent_owner')");
-    await work({ pool, store: new AgentAuthorityStore(pool), owner: "agent_owner", other: "other_owner", token: generateToken("agent_user") });
+    await work({ pool, store: new AgentAuthorityStore(pool, undefined, authorityEvidence()), owner: "agent_owner", other: "other_owner", token: generateToken("agent_user") });
   } finally {
     if (secret === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = secret;
     if (signingSecret === undefined) delete process.env.RAIL_SIGNING_SECRET; else process.env.RAIL_SIGNING_SECRET = signingSecret;
@@ -62,10 +313,17 @@ async function datedCredential(pool, agentId, scope = "payments:propose", second
 
 async function datedMandate(pool, owner, agentId, input, seconds = -1) {
   const mandateId = randomUUID();
-  await pool.query(`INSERT INTO rail_agent_mandates(mandate_id, agent_id, owner_wallet_id, mode, currency,
-    per_payment_limit_minor, total_budget_minor, allowed_receiver_wallet_ids, created_at, expires_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp() - interval '1 hour',clock_timestamp() + $9 * interval '1 second')`,
-    [mandateId, agentId, owner, input.mode, input.currency, input.perPaymentLimitMinor, input.totalBudgetMinor, input.allowedReceiverWalletIds, seconds]);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`INSERT INTO rail_agent_mandates(mandate_id, agent_id, owner_wallet_id, mode, currency,
+      per_payment_limit_minor, total_budget_minor, allowed_receiver_wallet_ids, created_at, expires_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp() - interval '1 hour',clock_timestamp() + $9 * interval '1 second')`,
+      [mandateId, agentId, owner, input.mode, input.currency, input.perPaymentLimitMinor, input.totalBudgetMinor, input.allowedReceiverWalletIds, seconds]);
+    await authorityEvidence().persistOwner(client, mandateId, { walletId: owner, method: "trusted_library" });
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
   return { mandateId };
 }
 
@@ -297,8 +555,8 @@ test("credential and mandate capacities bound retained control-plane records", {
       SELECT gen_random_uuid(), $1, md5(i::text) || md5(i::text), 'payments:propose', now(), now() + interval '1 day' FROM generate_series(1,100) i`, [agent.agentId]);
     await assert.rejects(store.issueCredential(owner, agent.agentId, {}), { status: 409, code: "credential_capacity" });
     await pool.query(`INSERT INTO rail_agent_mandates(mandate_id, agent_id, owner_wallet_id, mode, currency, per_payment_limit_minor,
-      total_budget_minor, allowed_receiver_wallet_ids, created_at, expires_at)
-      SELECT gen_random_uuid(), $1, $2, 'budgeted', 'INR', 100, 1000, ARRAY['agent_receiver'], now(), now() + interval '1 day'
+      total_budget_minor, allowed_receiver_wallet_ids, created_at, expires_at, consent_receipt_version)
+      SELECT gen_random_uuid(), $1, $2, 'budgeted', 'INR', 100, 1000, ARRAY['agent_receiver'], now(), now() + interval '1 day', NULL
       FROM generate_series(1,100)`, [agent.agentId, owner]);
     await assert.rejects(store.createMandate(owner, agent.agentId, policy), { status: 409, code: "mandate_capacity" });
   });
@@ -589,7 +847,7 @@ test("agent intent quotas remain shared when request source addresses change", {
   });
 });
 
-function executionStore(pool, afterPayment, failEvidence = false, riskProtection) {
+function executionStore(pool, afterPayment, failEvidence = false, riskProtection, agentEvidence = authorityEvidence(), merchantQuotes) {
   const key = { keyId: "agent_execution_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
   const evidence = new TransactionEvidenceStore(new TransactionKeyRing(key.keyId, [key]));
   const pipeline = buildHardenedPaymentPipeline(noopTracer, undefined, undefined, undefined, riskProtection);
@@ -597,7 +855,7 @@ function executionStore(pool, afterPayment, failEvidence = false, riskProtection
     dlq: new MemoryDeadLetterQueue(), riskProtectionRequired: Boolean(riskProtection),
     pipeline: async ctx => { await pipeline(ctx); await afterPayment?.(ctx); },
     evidence: failEvidence ? { async persist(client, txn) { await evidence.persist(client, txn); throw new Error("injected_agent_evidence_failure"); } } : evidence });
-  return new AgentAuthorityStore(pool, engine);
+  return new AgentAuthorityStore(pool, engine, agentEvidence, merchantQuotes);
 }
 
 async function executionSetup(pool, owner, mode = "approval_required", budget = 1000, store = executionStore(pool), deadlineTarget) {
@@ -610,6 +868,299 @@ async function executionSetup(pool, owner, mode = "approval_required", budget = 
   const request = { requestFingerprint: intent.requestFingerprint };
   return { ...setup, store, executionCredential, intent, request };
 }
+
+test("owner JWT provenance is captured from authenticated context rather than request fields", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner, token }) => {
+    const store = executionStore(pool);
+    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+      authResolver: createAuthResolver({ getPool: () => pool, apiKey: "unused", apiKeyScopes: [] }) };
+    const agent = await store.createAgent(owner, { name: "JWT consent" });
+    const call = async (path, body) => {
+      const req = Readable.from([JSON.stringify(body)]); req.method = "POST";
+      req.headers = { authorization: `Bearer ${token}`, "content-type": "application/json" }; req.socket = { remoteAddress: "192.0.2.91" };
+      const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
+      assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost${path}`), context), true);
+      return res.body;
+    };
+    const { mandate } = await call(`/v2/agents/${agent.agentId}/mandates`, { ...policy, mode: "approval_required",
+      authentication: { method: "owner_jwt", userId: "forged_user", authVersion: 999 } });
+    const credential = await store.issueCredential(owner, agent.agentId, { scope: "payments:execute" });
+    const intent = await store.createIntent(credential.token, { mandateId: mandate.mandateId, clientRequestId: "jwt_provenance_001",
+      receiverWalletId: "agent_receiver", amountMinor: 100, currency: "INR" });
+    const request = { requestFingerprint: intent.requestFingerprint };
+    await call(`/v2/agents/${agent.agentId}/intents/${intent.intentId}/decision`, { decision: "approve", ...request, userId: "forged_user" });
+    const rows = (await pool.query("SELECT * FROM rail_agent_owner_evidence ORDER BY purpose")).rows;
+    assert.equal(rows.length, 2);
+    assert.ok(!JSON.stringify(rows).includes(token));
+    assert.ok(!JSON.stringify(rows).includes("agent_user"));
+    await store.executeIntent(credential.token, intent.intentId, request);
+    const proof = await store.readAuthority(owner, agent.agentId, intent.intentId);
+    assert.equal(proof.status, "verified");
+    for (const evidence of [proof.ownerEvidence.mandate, proof.ownerEvidence.approval]) {
+      assert.deepEqual(evidence.record.authentication, { walletId: owner, method: "owner_jwt", userId: "agent_user", authVersion: 0 });
+    }
+    assert.equal(proof.receipt.mandateConsentCommitment, proof.ownerEvidence.mandate.commitment);
+    assert.equal(proof.receipt.approvalCommitment, proof.ownerEvidence.approval.commitment);
+    await pool.query("UPDATE users SET auth_version=auth_version+1 WHERE user_id='agent_user'");
+    assert.equal((await store.readAuthority(owner, agent.agentId, intent.intentId)).status, "verified");
+  });
+});
+
+test("approval retries preserve original owner evidence and rejection keeps the previous approval history", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    const intent = await store.createIntent(credential.token, input), request = { requestFingerprint: intent.requestFingerprint };
+    await Promise.all(Array.from({ length: 5 }, () => store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", ...request })));
+    const original = (await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE subject_id=$1", [intent.intentId])).rows;
+    assert.equal(original.length, 1);
+    await store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", ...request });
+    assert.deepEqual((await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE subject_id=$1", [intent.intentId])).rows, original);
+    await store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "reject", ...request });
+    const after = (await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE subject_id=$1 ORDER BY purpose", [intent.intentId])).rows;
+    assert.equal(after.length, 2); assert.deepEqual(after[0], original[0]);
+    for (const sql of ["UPDATE rail_agent_owner_evidence SET commitment=repeat('a',64)", "DELETE FROM rail_agent_owner_evidence"])
+      await assert.rejects(pool.query(`${sql} WHERE subject_id=$1`, [intent.intentId]), { code: "23514" });
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+  });
+});
+
+test("budgeted payments bind advance consent without fabricating a per-payment owner decision", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted");
+    await store.executeIntent(executionCredential.token, intent.intentId, request);
+    const proof = await store.readAuthority(owner, agent.agentId, intent.intentId);
+    assert.equal(proof.status, "verified"); assert.equal(proof.ownerEvidence.mandate.record.decision, "mandate_consent");
+    assert.equal(proof.ownerEvidence.mandate.record.authentication.method, "trusted_library");
+    assert.ok(!proof.ownerEvidence.approval && !proof.receipt.approvalCommitment);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE intent_id=$1", [intent.intentId])).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_evidence_nonces")).rowCount, 2);
+  });
+});
+
+test("missing consent and decision writers cannot commit authority or move funds", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const real = executionStore(pool);
+    const agent = await real.createAgent(owner, { name: "Missing consent" });
+    const missing = Object.create(authorityEvidence()); missing.persistOwner = async () => {};
+    const store = executionStore(pool, undefined, false, undefined, missing);
+    await assert.rejects(store.createMandate(owner, agent.agentId, policy), { code: "23514", message: "agent_mandate_consent_required" });
+    assert.equal((await pool.query("SELECT * FROM rail_agent_mandates")).rowCount, 0);
+    const setup = await executionSetup(pool, owner, "approval_required", 1000, real);
+    await assert.rejects(store.decideIntent(owner, setup.agent.agentId, setup.intent.intentId, { decision: "approve", ...setup.request }),
+      { code: "23514", message: "agent_owner_decision_required" });
+    assert.equal((await real.listIntents(owner, setup.agent.agentId))[0].status, "pending");
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+  });
+});
+
+test("stale or mismatched owner principal rolls back decisions instead of recording false authentication", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, store, owner }) => {
+    const { agent, credential, input } = await intentSetup(store, owner);
+    const intent = await store.createIntent(credential.token, input);
+    const request = { decision: "approve", requestFingerprint: intent.requestFingerprint };
+    await assert.rejects(store.decideIntent(owner, agent.agentId, intent.intentId, request, { walletId: "other_owner", method: "trusted_library" }), /agent_owner_context_invalid/);
+    await pool.query("UPDATE users SET auth_version=1 WHERE user_id='agent_user'");
+    await assert.rejects(store.decideIntent(owner, agent.agentId, intent.intentId, request,
+      { walletId: owner, method: "owner_jwt", userId: "agent_user", authVersion: 0 }), { status: 401 });
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "pending");
+    assert.equal((await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE intent_id=$1", [intent.intentId])).rowCount, 0);
+  });
+});
+
+test("corrupted original approval blocks execution and does not create an execution receipt", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, intent, executionCredential, request } = await executionSetup(pool, owner);
+    await store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", ...request });
+    await pool.query("ALTER TABLE rail_agent_owner_evidence DISABLE TRIGGER rail_agent_owner_evidence_immutable");
+    await pool.query("UPDATE rail_agent_owner_evidence SET envelope=jsonb_set(envelope,'{ciphertext}','\"YWJj\"'::jsonb) WHERE subject_id=$1", [intent.intentId]);
+    await pool.query("ALTER TABLE rail_agent_owner_evidence ENABLE TRIGGER rail_agent_owner_evidence_immutable");
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { status: 503, code: "agent_owner_evidence_unavailable" });
+    await assert.rejects(store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", ...request }), { status: 503 });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_authority_evidence")).rowCount, 0);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 0);
+  });
+});
+
+test("legacy mandate cannot authorize new proposals and is not advertised as executable", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const store = executionStore(pool), agent = await store.createAgent(owner, { name: "Legacy consent" });
+    const credential = await store.issueCredential(owner, agent.agentId, {}), mandateId = randomUUID();
+    await pool.query(`INSERT INTO rail_agent_mandates(mandate_id,agent_id,owner_wallet_id,mode,currency,per_payment_limit_minor,
+      total_budget_minor,allowed_receiver_wallet_ids,created_at,expires_at,consent_receipt_version)
+      VALUES ($1,$2,$3,'budgeted','INR',100,1000,ARRAY['agent_receiver'],clock_timestamp(),clock_timestamp()+interval '1 hour',NULL)`, [mandateId, agent.agentId, owner]);
+    await runMigrations(pool);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].executionEnabled, false);
+    await assert.rejects(store.createIntent(credential.token, { mandateId, clientRequestId: "legacy_consent_001",
+      receiverWalletId: "agent_receiver", amountMinor: 100, currency: "INR" }), { status: 409, code: "new_agent_owner_consent_required" });
+    assert.equal((await pool.query("SELECT * FROM rail_agent_intents")).rowCount, 0);
+  });
+});
+
+test("emergency mandate revocation remains available without authority keys and preserves original consent", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { agent, mandate, store } = await executionSetup(pool, owner, "budgeted");
+    const original = (await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE mandate_id=$1", [mandate.mandateId])).rows;
+    const unavailable = new AgentAuthorityStore(pool);
+    await unavailable.revokeMandate(owner, agent.agentId, mandate.mandateId);
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "rejected");
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 0);
+    assert.deepEqual((await pool.query("SELECT * FROM rail_agent_owner_evidence WHERE mandate_id=$1", [mandate.mandateId])).rows, original);
+  });
+});
+
+test("agent authority receipts explain both consent modes and preserve original ciphertext on concurrent replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner, other }) => {
+    for (const mode of ["approval_required", "budgeted"]) {
+      const { store, agent, mandate, intent, executionCredential, request } = await executionSetup(pool, owner, mode);
+      assert.equal((await store.readAuthority(owner, agent.agentId, intent.intentId)).status, "not_executed");
+      if (mode === "approval_required") await store.decideIntent(owner, agent.agentId, intent.intentId, { decision: "approve", ...request });
+      await store.executeIntent(executionCredential.token, intent.intentId, request);
+      const before = (await pool.query("SELECT * FROM rail_agent_authority_evidence WHERE intent_id=$1", [intent.intentId])).rows[0];
+      assert.equal(before.envelope.purpose, "agent-authority-v1");
+      assert.ok(!JSON.stringify(before.envelope).includes("agent_receiver"));
+      await Promise.all(Array.from({ length: 5 }, () => store.executeIntent(executionCredential.token, intent.intentId, request)));
+      const proof = await store.readAuthority(owner, agent.agentId, intent.intentId);
+      assert.equal(proof.status, "verified");
+      assert.equal(proof.receipt.assurance, "server_observed_authority");
+      assert.equal(proof.receipt.consentSource, mode === "budgeted" ? "advance_budget_mandate" : "exact_approved_intent");
+      assert.equal(proof.receipt.intentFingerprint, intent.requestFingerprint);
+      assert.equal(proof.receipt.credentialId, executionCredential.credentialId);
+      assert.equal(proof.receipt.policy.totalBudgetMinor, mandate.totalBudgetMinor);
+      assert.deepEqual(proof.receipt.policy.allowedReceiverWalletIds, ["agent_receiver"]);
+      assert.deepEqual((await pool.query("SELECT * FROM rail_agent_authority_evidence WHERE intent_id=$1", [intent.intentId])).rows[0], before);
+      await assert.rejects(store.readAuthority(other, agent.agentId, intent.intentId), { status: 404 });
+      const otherAgent = await store.createAgent(owner, { name: "Receipt isolation" });
+      await assert.rejects(store.readAuthority(owner, otherAgent.agentId, intent.intentId), { status: 404 });
+      for (const operation of ["UPDATE rail_agent_authority_evidence SET commitment=repeat('a',64)", "DELETE FROM rail_agent_authority_evidence"]) {
+        await assert.rejects(pool.query(`${operation} WHERE intent_id=$1`, [intent.intentId]), { code: "23514" });
+      }
+      await assert.rejects(pool.query("UPDATE rail_agent_intents SET authority_receipt_version=NULL WHERE intent_id=$1", [intent.intentId]), { code: "23514" });
+    }
+    assert.equal((await pool.query("SELECT record_count FROM rail_agent_evidence_key_usage")).rows[0].record_count, "5");
+    await runMigrations(pool);
+    assert.equal((await pool.query("SELECT count(*) FROM rail_agent_authority_evidence")).rows[0].count, "2");
+  });
+});
+
+test("required agent authority write failure rolls back financial state, evidence, replay and key quota", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted");
+    await pool.query(`CREATE FUNCTION fail_authority_write() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'injected_authority_write_failure'; END $$;
+      CREATE TRIGGER fail_authority_write BEFORE INSERT ON rail_agent_authority_evidence FOR EACH ROW EXECUTE FUNCTION fail_authority_write()`);
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), /injected_authority_write_failure/);
+    for (const table of ["ledger_entries", "authorizations", "rail_transaction_evidence", "rail_agent_authority_evidence", "rail_idempotency"])
+      assert.equal((await pool.query(`SELECT * FROM ${table}`)).rowCount, 0, table);
+    assert.equal((await pool.query("SELECT record_count FROM rail_agent_evidence_key_usage")).rows[0].record_count, "1");
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "approved");
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].reservedBudgetMinor, 100);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 0);
+    await pool.query("DROP TRIGGER fail_authority_write ON rail_agent_authority_evidence");
+    await store.executeIntent(executionCredential.token, intent.intentId, request);
+    assert.equal((await store.readAuthority(owner, agent.agentId, intent.intentId)).status, "verified");
+  });
+});
+
+test("database rejects committing a new agent execution without its required authority receipt", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const missing = Object.create(authorityEvidence()); missing.persist = async () => {};
+    const store = executionStore(pool, undefined, false, undefined, missing);
+    const { agent, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted", 1000, store);
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { code: "23514", message: "agent_authority_evidence_missing_or_mismatched" });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 0);
+    assert.equal((await store.listIntents(owner, agent.agentId))[0].status, "approved");
+  });
+});
+
+test("authority key rotation retains old verification and missing keys never yield verified replay", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted");
+    await store.executeIntent(executionCredential.token, intent.intentId, request);
+    const next = { keyId: "agent_authority_rotated", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
+    const retained = executionStore(pool, undefined, false, undefined, new AgentEvidenceStore(new TransactionKeyRing(next.keyId, [authorityKey, next])));
+    assert.equal((await retained.readAuthority(owner, agent.agentId, intent.intentId)).status, "verified");
+    await retained.executeIntent(executionCredential.token, intent.intentId, request);
+    const lost = executionStore(pool, undefined, false, undefined, new AgentEvidenceStore(new TransactionKeyRing(next.keyId, [next])));
+    assert.deepEqual(await lost.readAuthority(owner, agent.agentId, intent.intentId), { status: "verification_unavailable", reason: "key_unavailable" });
+    await assert.rejects(lost.executeIntent(executionCredential.token, intent.intentId, request), { status: 503 });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_authority_evidence")).rowCount, 1);
+  });
+});
+
+test("agent authority key quota rolls back rejected spending and never evicts committed receipts", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const store = executionStore(pool, undefined, false, undefined, new AgentEvidenceStore(new TransactionKeyRing(authorityKey.keyId, [authorityKey], 3)));
+    const first = await executionSetup(pool, owner, "budgeted", 1000, store);
+    const second = await executionSetup(pool, owner, "budgeted", 1000, store);
+    await store.executeIntent(first.executionCredential.token, first.intent.intentId, first.request);
+    await assert.rejects(store.executeIntent(second.executionCredential.token, second.intent.intentId, second.request), /agent_authority_key_rotation_required/);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_authority_evidence")).rowCount, 1);
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+    assert.equal((await store.listMandates(owner, second.agent.agentId))[0].spentBudgetMinor, 0);
+    assert.equal((await store.readAuthority(owner, first.agent.agentId, first.intent.intentId)).status, "verified");
+  });
+});
+
+test("authority explanation endpoint is owner JWT only, scoped and non-cacheable", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner, token }) => {
+    const { store, agent, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted");
+    await store.executeIntent(executionCredential.token, intent.intentId, request);
+    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+      authResolver: createAuthResolver({ getPool: () => pool, apiKey: "unused", apiKeyScopes: [] }) };
+    const url = new URL(`http://localhost/v2/agents/${agent.agentId}/intents/${intent.intentId}/authority`);
+    for (const bearer of [executionCredential.token, token]) {
+      const req = Readable.from([]); req.method = "GET"; req.headers = { authorization: `Bearer ${bearer}` }; req.socket = { remoteAddress: "192.0.2.90" };
+      const res = { headers: {}, setHeader(k, v) { this.headers[k] = v; }, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
+      if (bearer === token) {
+        assert.equal(await handleAgentRoutes(req, res, url, context), true);
+        assert.equal(res.status, 200); assert.equal(res.headers["Cache-Control"], "no-store");
+        assert.equal(res.body.authority.status, "verified");
+        assert.ok(!JSON.stringify(res.body).includes(executionCredential.token));
+      } else await assert.rejects(handleAgentRoutes(req, res, url, context), { status: 401 });
+    }
+  });
+});
+
+test("agent spending fails closed when authority protection is not configured", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const store = executionStore(pool, undefined, false, undefined, null);
+    const agent = await store.createAgent(owner, { name: "Unconfigured authority" });
+    assert.equal(agent.executionEnabled, false);
+    await assert.rejects(store.issueCredential(owner, agent.agentId, { scope: "payments:execute" }), { status: 503 });
+    assert.equal((await pool.query("SELECT * FROM rail_agent_credentials")).rowCount, 0);
+  });
+});
+
+test("corrupted authority storage is unavailable and cannot turn replay into another transfer", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    const { store, agent, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted");
+    await store.executeIntent(executionCredential.token, intent.intentId, request);
+    // Administrator-only corruption fixture; ordinary runtime UPDATE remains blocked.
+    await pool.query("ALTER TABLE rail_agent_authority_evidence DISABLE TRIGGER rail_agent_evidence_immutable");
+    await pool.query("UPDATE rail_agent_authority_evidence SET envelope=jsonb_set(envelope,'{ciphertext}','\"YWJj\"'::jsonb) WHERE intent_id=$1", [intent.intentId]);
+    await pool.query("ALTER TABLE rail_agent_authority_evidence ENABLE TRIGGER rail_agent_evidence_immutable");
+    assert.deepEqual(await store.readAuthority(owner, agent.agentId, intent.intentId), { status: "verification_unavailable", reason: "verification_failed" });
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { status: 503 });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 2);
+    assert.equal((await store.listMandates(owner, agent.agentId))[0].spentBudgetMinor, 100);
+  });
+});
+
+test("legacy unexecuted intents require a new request rather than invented historical authority evidence", { skip: !databaseUrl }, async () => {
+  await fixture(async ({ pool, owner }) => {
+    // Seed the pre-upgrade nullable marker at creation; immutable history is not rewritten.
+    await pool.query("ALTER TABLE rail_agent_intents ALTER COLUMN authority_receipt_version DROP DEFAULT");
+    const { store, intent, executionCredential, request } = await executionSetup(pool, owner, "budgeted");
+    await runMigrations(pool);
+    assert.equal((await pool.query("SELECT authority_receipt_version FROM rail_agent_intents WHERE intent_id=$1", [intent.intentId])).rows[0].authority_receipt_version, null);
+    await assert.rejects(store.executeIntent(executionCredential.token, intent.intentId, request), { status: 409, code: "new_agent_intent_required" });
+    assert.equal((await pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
+    assert.equal((await pool.query("SELECT * FROM rail_agent_authority_evidence")).rowCount, 0);
+  });
+});
 
 test("protected agent risk failure preserves held budget and retry commits one encrypted observation", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, owner }) => {

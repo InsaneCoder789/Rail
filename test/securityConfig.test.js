@@ -106,6 +106,36 @@ test("HTTP startup requires a separately provisioned risk key ring without chang
   });
 });
 
+test("authority protection is optional for human startup but malformed or reused configured keys fail closed", () => {
+  const raw = keyId => JSON.stringify({ activeKeyId: keyId, keys: [{ keyId,
+    encryptionKey: randomBytes(32).toString("base64"), authenticationKey: randomBytes(32).toString("base64") }] });
+  return withEnvironment({ NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_RISK_MODEL_PATH: undefined,
+    RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: undefined, RAIL_AGENT_AUTHORITY_KEY_RING: undefined,
+    RAIL_EVIDENCE_KEY_RING: raw("startup_payment"), RAIL_RISK_RECORD_KEY_RING: raw("startup_risk") }, async () => {
+    const context = await createServerContext({ initializeDatabase: false, startBackgroundJobs: false });
+    try {
+      await assert.rejects(context.agentStore.issueCredential("unused_owner", "unused_agent", { scope: "payments:execute" }), { status: 503 });
+    } finally { await context.pool.end(); }
+    process.env.RAIL_AGENT_AUTHORITY_KEY_RING = "private_invalid_configuration";
+    await assert.rejects(createServerContext(), { message: "INVALID_AGENT_AUTHORITY_KEY_RING" });
+    for (const existing of [process.env.RAIL_EVIDENCE_KEY_RING, process.env.RAIL_RISK_RECORD_KEY_RING]) {
+      process.env.RAIL_AGENT_AUTHORITY_KEY_RING = existing;
+      await assert.rejects(createServerContext(), { message: "AGENT_AUTHORITY_KEYS_MUST_BE_INDEPENDENT" });
+    }
+  });
+});
+
+test("malformed merchant public-key configuration fails startup before opening a pool", () => {
+  const raw = keyId => JSON.stringify({ activeKeyId: keyId, keys: [{ keyId,
+    encryptionKey: randomBytes(32).toString("base64"), authenticationKey: randomBytes(32).toString("base64") }] });
+  return withEnvironment({ NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_RISK_MODEL_PATH: undefined,
+    RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: undefined, RAIL_AGENT_AUTHORITY_KEY_RING: undefined,
+    RAIL_EVIDENCE_KEY_RING: raw("merchant_startup_payment"), RAIL_RISK_RECORD_KEY_RING: raw("merchant_startup_risk"),
+    RAIL_MERCHANT_QUOTE_KEYS: "invalid_public_key_configuration" }, async () => {
+    await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }), { message: "INVALID_MERCHANT_QUOTE_KEYS" });
+  });
+});
+
 test("production startup rejects short service keys", () => withEnvironment({
   NODE_ENV: "production", DATABASE_URL: "postgresql://example.invalid/rail",
   JWT_SECRET: "x".repeat(40), RAIL_SIGNING_SECRET: "y".repeat(40),

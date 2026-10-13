@@ -13,6 +13,12 @@ import type { AuditBatchStore } from "../persistence/auditBatches.js";
 export interface AuthenticatedViewer {
   readonly walletId: string;
 }
+export interface OwnerPrincipal {
+  readonly walletId: string;
+  readonly method: "owner_jwt" | "trusted_library";
+  readonly userId?: string;
+  readonly authVersion?: number;
+}
 
 export interface SseClient {
   readonly res: http.ServerResponse;
@@ -28,6 +34,7 @@ export interface ServerEvent {
 
 
 export interface AuthResolver {
+  resolveOwnerPrincipal?(req: http.IncomingMessage): Promise<OwnerPrincipal>;
   resolveOwnerWallet(req: http.IncomingMessage): Promise<string>;
   resolveAuthenticatedWallet(
     req: http.IncomingMessage,

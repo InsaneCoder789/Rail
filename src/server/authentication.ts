@@ -3,7 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { Pool } from "pg";
 import { verifyToken, InvalidTokenError } from "../auth/jwt.js";
 import { RequestError, json, normalizeHeaderValue } from "./http.js";
-import type { AuthResolver } from "./types.js";
+import type { AuthResolver, OwnerPrincipal } from "./types.js";
 
 function secureEquals(a: string, b: string): boolean {
   const aBuf = Buffer.from(a, "utf8");
@@ -66,20 +66,23 @@ export function createAuthResolver(args: {
   apiKey: string;
   apiKeyScopes: readonly string[];
 }): AuthResolver {
-  const resolveOwnerWallet = async (req: http.IncomingMessage): Promise<string> => {
+  const resolveOwnerPrincipal = async (req: http.IncomingMessage): Promise<OwnerPrincipal> => {
     const bearer = resolveBearerToken(req);
     if (!bearer) throw new RequestError(401, "owner_authentication_required", "owner bearer token required");
     const pool = args.getPool();
     if (!pool) throw new Error("DB_NOT_INITIALIZED");
     try {
       const decoded = verifyToken(bearer);
-      return await getWalletFromUser(pool, decoded.userId, decoded.authVersion);
+      const walletId = await getWalletFromUser(pool, decoded.userId, decoded.authVersion);
+      return { walletId, userId: decoded.userId, authVersion: decoded.authVersion, method: "owner_jwt" };
     } catch (err) {
       if (err instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
       throw err;
     }
   };
+  const resolveOwnerWallet = async (req: http.IncomingMessage): Promise<string> => (await resolveOwnerPrincipal(req)).walletId;
   return {
+    resolveOwnerPrincipal,
     resolveOwnerWallet,
     async resolveAuthenticatedWallet(req) {
       const pool = args.getPool();

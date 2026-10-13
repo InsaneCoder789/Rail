@@ -397,6 +397,167 @@ ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS spent_budget_minor BIGI
 ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS payment_tx_id TEXT UNIQUE
   REFERENCES rail_payment_executions(tx_id) DEFERRABLE INITIALLY DEFERRED;
 ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ;
+ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS consent_receipt_version SMALLINT CHECK (consent_receipt_version IS NULL OR consent_receipt_version = 1);
+ALTER TABLE rail_agent_mandates ALTER COLUMN consent_receipt_version SET DEFAULT 1;
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS owner_evidence_version SMALLINT CHECK (owner_evidence_version IS NULL OR owner_evidence_version = 1);
+ALTER TABLE rail_agent_intents ALTER COLUMN owner_evidence_version SET DEFAULT 1;
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS checkout JSONB;
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS merchant_attestation JSONB;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='rail_agent_intents'::regclass AND conname='rail_agent_merchant_attestation_shape') THEN
+    ALTER TABLE rail_agent_intents ADD CONSTRAINT rail_agent_merchant_attestation_shape CHECK (merchant_attestation IS NULL OR COALESCE(
+      checkout IS NOT NULL AND jsonb_typeof(merchant_attestation) = 'object' AND
+      merchant_attestation ?& ARRAY['version','keyId','signature','publicKey','keyFingerprint'] AND
+      merchant_attestation - ARRAY['version','keyId','signature','publicKey','keyFingerprint'] = '{}'::jsonb AND
+      merchant_attestation->'version' = '1'::jsonb AND jsonb_typeof(merchant_attestation->'keyId') = 'string' AND
+      length(merchant_attestation->>'keyId') BETWEEN 3 AND 80 AND jsonb_typeof(merchant_attestation->'signature') = 'string' AND
+      length(merchant_attestation->>'signature') = 88 AND jsonb_typeof(merchant_attestation->'publicKey') = 'string' AND
+      length(merchant_attestation->>'publicKey') = 60 AND jsonb_typeof(merchant_attestation->'keyFingerprint') = 'string' AND
+      merchant_attestation->>'keyFingerprint' ~ '^[a-f0-9]{64}$', FALSE));
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_signed_quote_single_use
+  ON rail_agent_intents(receiver_wallet_id, (checkout->>'quoteId')) WHERE merchant_attestation IS NOT NULL;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='rail_agent_intents'::regclass AND conname='rail_agent_checkout_binding') THEN
+    ALTER TABLE rail_agent_intents ADD CONSTRAINT rail_agent_checkout_binding CHECK (checkout IS NULL OR COALESCE(
+      jsonb_typeof(checkout) = 'object' AND
+      checkout ?& ARRAY['version','merchantWalletId','quoteId','quoteVersion','subtotalMinor','feeMinor','totalMinor','currency','expiresAt','fundingSource'] AND
+      checkout - ARRAY['version','merchantWalletId','quoteId','quoteVersion','subtotalMinor','feeMinor','totalMinor','currency','expiresAt','fundingSource'] = '{}'::jsonb AND
+      checkout->'version' = '1'::jsonb AND jsonb_typeof(checkout->'merchantWalletId') = 'string' AND checkout->>'merchantWalletId' = receiver_wallet_id AND
+      jsonb_typeof(checkout->'quoteId') = 'string' AND length(checkout->>'quoteId') BETWEEN 3 AND 128 AND
+      jsonb_typeof(checkout->'quoteVersion') = 'number' AND (checkout->>'quoteVersion')::numeric BETWEEN 1 AND 1000000 AND
+      (checkout->>'quoteVersion')::numeric = trunc((checkout->>'quoteVersion')::numeric) AND
+      jsonb_typeof(checkout->'subtotalMinor') = 'number' AND (checkout->>'subtotalMinor')::numeric BETWEEN 1 AND 1000000000000 AND
+      (checkout->>'subtotalMinor')::numeric = trunc((checkout->>'subtotalMinor')::numeric) AND
+      jsonb_typeof(checkout->'feeMinor') = 'number' AND (checkout->>'feeMinor')::numeric BETWEEN 0 AND 1000000000000 AND
+      (checkout->>'feeMinor')::numeric = trunc((checkout->>'feeMinor')::numeric) AND
+      jsonb_typeof(checkout->'totalMinor') = 'number' AND (checkout->>'totalMinor')::numeric = amount_minor AND
+      (checkout->>'subtotalMinor')::numeric + (checkout->>'feeMinor')::numeric = amount_minor AND
+      jsonb_typeof(checkout->'currency') = 'string' AND checkout->>'currency' = currency AND
+      jsonb_typeof(checkout->'expiresAt') = 'string' AND checkout->>'expiresAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$' AND
+      (checkout->>'expiresAt')::timestamptz >= expires_at AND
+      jsonb_typeof(checkout->'fundingSource') = 'object' AND (checkout->'fundingSource') ?& ARRAY['type','walletId'] AND
+      (checkout->'fundingSource') - ARRAY['type','walletId'] = '{}'::jsonb AND
+      checkout->'fundingSource'->>'type' = 'internal_wallet' AND jsonb_typeof(checkout->'fundingSource'->'walletId') = 'string' AND
+      checkout->'fundingSource'->>'walletId' = owner_wallet_id, FALSE));
+  END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS rail_agent_evidence_nonces (
+  key_fingerprint TEXT NOT NULL CHECK (key_fingerprint ~ '^[a-f0-9]{64}$'), nonce TEXT NOT NULL,
+  PRIMARY KEY (key_fingerprint, nonce)
+);
+CREATE TABLE IF NOT EXISTS rail_agent_owner_evidence (
+  subject_id UUID NOT NULL,
+  purpose TEXT NOT NULL CHECK (purpose IN ('agent-mandate-v1','agent-approval-v1','agent-rejection-v1')),
+  mandate_id UUID NOT NULL REFERENCES rail_agent_mandates(mandate_id),
+  intent_id UUID REFERENCES rail_agent_intents(intent_id),
+  recorded_at TIMESTAMPTZ NOT NULL,
+  key_fingerprint TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  envelope JSONB NOT NULL,
+  commitment TEXT NOT NULL CHECK (commitment ~ '^[a-f0-9]{64}$'),
+  PRIMARY KEY (subject_id, purpose),
+  UNIQUE (key_fingerprint, nonce),
+  FOREIGN KEY (key_fingerprint, nonce) REFERENCES rail_agent_evidence_nonces(key_fingerprint, nonce),
+  CHECK ((purpose = 'agent-mandate-v1' AND intent_id IS NULL AND subject_id = mandate_id) OR
+    (purpose IN ('agent-approval-v1','agent-rejection-v1') AND intent_id IS NOT NULL AND subject_id = intent_id)),
+  CHECK (COALESCE(jsonb_typeof(envelope) = 'object' AND envelope->>'purpose' = purpose AND envelope->>'txId' = subject_id::text
+    AND envelope->>'nonce' = nonce AND envelope->>'version' = '1', FALSE))
+);
+-- Existing intents remain legacy records; newly created intents require authority receipts.
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS authority_receipt_version SMALLINT
+  CHECK (authority_receipt_version IS NULL OR authority_receipt_version = 1);
+ALTER TABLE rail_agent_intents ALTER COLUMN authority_receipt_version SET DEFAULT 1;
+CREATE TABLE IF NOT EXISTS rail_agent_evidence_key_usage (
+  key_fingerprint TEXT PRIMARY KEY CHECK (key_fingerprint ~ '^[a-f0-9]{64}$'),
+  record_count BIGINT NOT NULL CHECK (record_count BETWEEN 1 AND 1000000)
+);
+CREATE TABLE IF NOT EXISTS rail_agent_authority_evidence (
+  intent_id UUID PRIMARY KEY REFERENCES rail_agent_intents(intent_id),
+  tx_id TEXT NOT NULL UNIQUE REFERENCES rail_payment_executions(tx_id) DEFERRABLE INITIALLY DEFERRED,
+  credential_id UUID NOT NULL REFERENCES rail_agent_credentials(credential_id),
+  payment_fingerprint TEXT NOT NULL CHECK (payment_fingerprint ~ '^[a-f0-9]{64}$'),
+  key_fingerprint TEXT NOT NULL CHECK (key_fingerprint ~ '^[a-f0-9]{64}$'),
+  nonce TEXT NOT NULL,
+  envelope JSONB NOT NULL,
+  commitment TEXT NOT NULL CHECK (commitment ~ '^[a-f0-9]{64}$'),
+  UNIQUE (key_fingerprint, nonce),
+  CHECK (COALESCE(jsonb_typeof(envelope) = 'object' AND envelope ?& ARRAY['version','purpose','keyId','txId','requestFingerprint','payloadHash','nonce','ciphertext','tag','mac']
+    AND envelope->>'version' = '1' AND envelope->>'purpose' = 'agent-authority-v1'
+    AND envelope->>'txId' = tx_id AND envelope->>'nonce' = nonce, FALSE))
+);
+INSERT INTO rail_agent_evidence_nonces(key_fingerprint, nonce)
+  SELECT key_fingerprint, nonce FROM rail_agent_authority_evidence ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION rail_check_agent_owner_evidence() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'rail_agent_mandates' THEN
+    IF EXISTS (SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id=NEW.mandate_id
+      AND mandate.consent_receipt_version=1 AND NOT EXISTS (SELECT 1 FROM rail_agent_owner_evidence evidence
+        WHERE evidence.mandate_id=mandate.mandate_id AND evidence.purpose='agent-mandate-v1')) THEN
+      RAISE EXCEPTION 'agent_mandate_consent_required' USING ERRCODE='23514';
+    END IF;
+  ELSE
+    IF EXISTS (SELECT 1 FROM rail_agent_intents intent JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id
+      WHERE intent.intent_id=NEW.intent_id AND intent.owner_evidence_version=1 AND
+        ((intent.status IN ('approved','executed') AND (mandate.consent_receipt_version IS DISTINCT FROM 1 OR NOT EXISTS
+          (SELECT 1 FROM rail_agent_owner_evidence consent WHERE consent.mandate_id=mandate.mandate_id AND consent.purpose='agent-mandate-v1')))
+        OR (intent.status IN ('approved','executed') AND mandate.mode='approval_required' AND NOT EXISTS
+          (SELECT 1 FROM rail_agent_owner_evidence approval WHERE approval.intent_id=intent.intent_id AND approval.mandate_id=intent.mandate_id AND approval.purpose='agent-approval-v1'))
+        OR (intent.status='rejected' AND intent.terminal_reason='owner_rejected' AND NOT EXISTS
+          (SELECT 1 FROM rail_agent_owner_evidence rejection WHERE rejection.intent_id=intent.intent_id AND rejection.mandate_id=intent.mandate_id AND rejection.purpose='agent-rejection-v1')))) THEN
+      RAISE EXCEPTION 'agent_owner_decision_required' USING ERRCODE='23514';
+    END IF;
+    IF TG_TABLE_NAME='rail_agent_owner_evidence' THEN
+      IF NEW.intent_id IS NOT NULL AND NOT EXISTS
+        (SELECT 1 FROM rail_agent_intents intent WHERE intent.intent_id=NEW.intent_id AND intent.mandate_id=NEW.mandate_id
+          AND NEW.recorded_at >= intent.created_at AND NEW.recorded_at < intent.expires_at) THEN
+        RAISE EXCEPTION 'agent_owner_evidence_binding_invalid' USING ERRCODE='23514';
+      END IF;
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_mandate_consent_check ON rail_agent_mandates;
+CREATE CONSTRAINT TRIGGER rail_agent_mandate_consent_check AFTER INSERT OR UPDATE ON rail_agent_mandates
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_owner_evidence();
+DROP TRIGGER IF EXISTS rail_agent_intent_owner_check ON rail_agent_intents;
+CREATE CONSTRAINT TRIGGER rail_agent_intent_owner_check AFTER INSERT OR UPDATE ON rail_agent_intents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_owner_evidence();
+DROP TRIGGER IF EXISTS rail_agent_owner_evidence_binding_commit ON rail_agent_owner_evidence;
+CREATE CONSTRAINT TRIGGER rail_agent_owner_evidence_binding_commit AFTER INSERT ON rail_agent_owner_evidence
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_owner_evidence();
+CREATE OR REPLACE FUNCTION rail_check_agent_authority() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM rail_agent_intents intent WHERE intent.intent_id = NEW.intent_id
+      AND intent.status = 'executed' AND intent.authority_receipt_version = 1 AND NOT EXISTS (
+        SELECT 1 FROM rail_agent_authority_evidence evidence
+        JOIN rail_payment_executions execution ON execution.tx_id = evidence.tx_id
+        JOIN rail_agent_credentials credential ON credential.credential_id = evidence.credential_id
+        WHERE evidence.intent_id = intent.intent_id AND evidence.tx_id = intent.payment_tx_id
+          AND evidence.payment_fingerprint = execution.request_fingerprint
+          AND credential.agent_id = intent.agent_id AND credential.scope = 'payments:execute'
+          AND intent.executed_at >= credential.created_at AND intent.executed_at < credential.expires_at))
+    OR EXISTS (SELECT 1 FROM rail_agent_authority_evidence evidence
+      JOIN rail_agent_intents intent ON intent.intent_id = evidence.intent_id
+      JOIN rail_payment_executions execution ON execution.tx_id = evidence.tx_id
+      JOIN rail_agent_credentials credential ON credential.credential_id = evidence.credential_id
+      WHERE evidence.intent_id = NEW.intent_id AND (intent.status <> 'executed' OR intent.authority_receipt_version IS DISTINCT FROM 1
+        OR intent.payment_tx_id IS DISTINCT FROM evidence.tx_id OR evidence.payment_fingerprint IS DISTINCT FROM execution.request_fingerprint
+        OR credential.agent_id IS DISTINCT FROM intent.agent_id OR credential.scope <> 'payments:execute'
+        OR intent.executed_at < credential.created_at OR intent.executed_at >= credential.expires_at)) THEN
+    RAISE EXCEPTION 'agent_authority_evidence_missing_or_mismatched' USING ERRCODE = '23514';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_z_authority_check ON rail_agent_intents;
+CREATE CONSTRAINT TRIGGER rail_agent_z_authority_check AFTER INSERT OR UPDATE ON rail_agent_intents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_authority();
+DROP TRIGGER IF EXISTS rail_agent_evidence_commit_check ON rail_agent_authority_evidence;
+CREATE CONSTRAINT TRIGGER rail_agent_evidence_commit_check AFTER INSERT ON rail_agent_authority_evidence
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_agent_authority();
 DO $$
 DECLARE constraint_name TEXT;
 BEGIN
@@ -442,9 +603,9 @@ BEGIN
     END IF;
   ELSIF TG_TABLE_NAME = 'rail_agent_mandates' THEN
     IF ROW(NEW.mandate_id, NEW.agent_id, NEW.owner_wallet_id, NEW.mode, NEW.currency,
-        NEW.per_payment_limit_minor, NEW.total_budget_minor, NEW.allowed_receiver_wallet_ids, NEW.created_at, NEW.expires_at)
+        NEW.per_payment_limit_minor, NEW.total_budget_minor, NEW.allowed_receiver_wallet_ids, NEW.created_at, NEW.expires_at, NEW.consent_receipt_version)
       IS DISTINCT FROM ROW(OLD.mandate_id, OLD.agent_id, OLD.owner_wallet_id, OLD.mode, OLD.currency,
-        OLD.per_payment_limit_minor, OLD.total_budget_minor, OLD.allowed_receiver_wallet_ids, OLD.created_at, OLD.expires_at) THEN
+        OLD.per_payment_limit_minor, OLD.total_budget_minor, OLD.allowed_receiver_wallet_ids, OLD.created_at, OLD.expires_at, OLD.consent_receipt_version) THEN
       RAISE EXCEPTION 'agent_mandate_policy_is_immutable' USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -480,9 +641,9 @@ LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'agent_intent_history_is_immutable' USING ERRCODE = '23514'; END IF;
   IF ROW(NEW.intent_id, NEW.agent_id, NEW.mandate_id, NEW.owner_wallet_id, NEW.client_request_id,
-      NEW.proposal_fingerprint, NEW.request_fingerprint, NEW.receiver_wallet_id, NEW.amount_minor, NEW.currency, NEW.created_at, NEW.expires_at)
+      NEW.proposal_fingerprint, NEW.request_fingerprint, NEW.receiver_wallet_id, NEW.amount_minor, NEW.currency, NEW.created_at, NEW.expires_at, NEW.authority_receipt_version, NEW.owner_evidence_version, NEW.checkout, NEW.merchant_attestation)
     IS DISTINCT FROM ROW(OLD.intent_id, OLD.agent_id, OLD.mandate_id, OLD.owner_wallet_id, OLD.client_request_id,
-      OLD.proposal_fingerprint, OLD.request_fingerprint, OLD.receiver_wallet_id, OLD.amount_minor, OLD.currency, OLD.created_at, OLD.expires_at)
+      OLD.proposal_fingerprint, OLD.request_fingerprint, OLD.receiver_wallet_id, OLD.amount_minor, OLD.currency, OLD.created_at, OLD.expires_at, OLD.authority_receipt_version, OLD.owner_evidence_version, OLD.checkout, OLD.merchant_attestation)
     OR (OLD.status IN ('rejected','expired','executed') AND ROW(NEW.status, NEW.terminal_reason, NEW.payment_tx_id, NEW.executed_at)
       IS DISTINCT FROM ROW(OLD.status, OLD.terminal_reason, OLD.payment_tx_id, OLD.executed_at))
     OR (OLD.status = 'approved' AND NEW.status = 'pending') OR (OLD.status = 'pending' AND NEW.status = 'executed') THEN
@@ -741,6 +902,15 @@ CREATE TRIGGER rail_risk_immutable BEFORE UPDATE OR DELETE ON rail_risk_observat
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 DROP TRIGGER IF EXISTS rail_protected_risk_immutable ON rail_protected_risk;
 CREATE TRIGGER rail_protected_risk_immutable BEFORE UPDATE OR DELETE ON rail_protected_risk
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_agent_evidence_immutable ON rail_agent_authority_evidence;
+CREATE TRIGGER rail_agent_evidence_immutable BEFORE UPDATE OR DELETE ON rail_agent_authority_evidence
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_agent_owner_evidence_immutable ON rail_agent_owner_evidence;
+CREATE TRIGGER rail_agent_owner_evidence_immutable BEFORE UPDATE OR DELETE ON rail_agent_owner_evidence
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_agent_nonce_immutable ON rail_agent_evidence_nonces;
+CREATE TRIGGER rail_agent_nonce_immutable BEFORE UPDATE OR DELETE ON rail_agent_evidence_nonces
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 DROP TRIGGER IF EXISTS rail_audit_batch_immutable ON rail_audit_batches;
 CREATE TRIGGER rail_audit_batch_immutable BEFORE UPDATE OR DELETE ON rail_audit_batches

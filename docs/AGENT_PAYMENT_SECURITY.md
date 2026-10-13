@@ -28,6 +28,45 @@ Agent deployment must exclude owner sessions, operator credentials, database cre
 
 Neither mode permits approvals to override policy or insufficient funds. Pending/approved intents hold policy budget. Only a committed execution converts that allowance to spent budget and posts money; rejected/expired/revoked requests release unspent holds.
 
+## Checkout Binding
+
+### Merchant-Signed Quotes
+
+An intent may additionally supply `merchantQuoteProof: { keyId, signature }`. The merchant signs the canonical bytes defined by `merchantQuoteBytes` with its Ed25519 private key, which stays outside Rail and agent clients. Operators enroll the corresponding recipient-bound public key in `RAIL_MERCHANT_QUOTE_KEYS`; agents cannot submit their own trust keys. A valid quote has `quoteAssurance: configured_merchant_signature`, not a claim of KYC, price fairness, delivery or external settlement.
+
+For recipients present in the registry, every new agent proposal requires a signed checkout, even if the supplied proof or entire checkout is omitted. Approval and fresh execution repeat current trust checks, including for older unsigned intents after enrollment. A `revoked` entry keeps that recipient blocked from unsigned downgrade while denying the revoked key. Retain these entries when revoking; removing every recipient entry intentionally removes the quote requirement and must not be treated as revocation. Human transfer APIs are unchanged and are not merchant-quote-enforced by this slice.
+
+All quote fields, including funding owner audience, fees, expiry and signing key ID, are signed. Proof/key fingerprints are included in v3 intent/retry fingerprints and immutable protected decision/execution records. Signed quote IDs can belong to only one retained intent per recipient, across agents, owners and quote versions. Identical proposal retries reuse that intent; rejected/expired intents still consume the quote ID and need a fresh merchant quote. Financial failure can retry the same original intent without claiming a new quote. This is not global economic-invoice deduplication across different quote IDs.
+
+Receipts retain the public key snapshot and signature. Historical verification checks the signature and protected authority record; it does not imply that the key is still active. Current revocation blocks new approval/execution, not a completed replay or refund. Consistent configuration on every writer, secure operator enrollment/key rotation and least-privilege SQL roles remain deployment gates. There is no merchant onboarding UI, remote quote fetcher or Rail-hosted merchant signing service.
+
+### Unsigned Checkout Compatibility
+
+The optional `checkout` object on `POST /v2/agent/intents` binds a quote reference/version, merchant wallet, subtotal, fees, total, currency, expiry and internal funding wallet. Recipient and currency must match the transfer; funding must be the authenticated owner's wallet. The transfer amount is the total including fees, all paid to the receiver. No separate fee payout or provider instrument exists here.
+
+Every descriptor field is fingerprint-bound and immutable. Changing it requires a new client request and applicable consent. Expiry is enforced using database time, including after financial work; failed execution rolls back money and budget consumption. Completed replay returns the original result rather than treating an expired quote as a new payment. Original decision and execution evidence retain the descriptor. Without a merchant proof, `quoteAssurance: agent_proposed_unverified` is derived by the backend: this is not merchant authentication, pricing validation or user-signature evidence. No caller verification flag is accepted inside checkout. Omitting checkout retains the simple-transfer contract only for recipients not configured in the merchant registry.
+
+Example optional descriptor (the enclosing intent has `receiverWalletId: merchant_wallet`, `amountMinor: 1000`, `currency: INR`; replace the deadline with a future UTC time):
+
+```json
+{
+  "checkout": {
+    "version": 1,
+    "merchantWalletId": "merchant_wallet",
+    "quoteId": "quote_001",
+    "quoteVersion": 1,
+    "subtotalMinor": 950,
+    "feeMinor": 50,
+    "totalMinor": 1000,
+    "currency": "INR",
+    "expiresAt": "2026-10-12T12:00:00.000Z",
+    "fundingSource": { "type": "internal_wallet", "walletId": "owner_wallet" }
+  }
+}
+```
+
+`quoteId` is an opaque nonsecret reference, not a credential or a place for customer details. Checkout metadata remains relational plaintext even though decision/execution evidence is encrypted. Existing authenticated owner/agent listing boundaries apply; there is no new public quote endpoint.
+
 ## Restriction-Bypass Defenses
 
 | Attempt | Implemented defense | Remaining boundary |
@@ -45,6 +84,10 @@ The new database guards do not replace authentication. Mutable reserved/spent co
 
 ## Owner Transparency Today
 
+New executions additionally write protected `server_observed_authority` snapshots atomically with money and replay. They bind immutable mandate policy, exact intent/payment fingerprints, executing credential, amount/receiver and execution time. Owner-JWT-only `GET /v2/agents/:agentId/intents/:intentId/authority` returns a verified explanation or explicit pending/legacy/unavailable state; no tokens or keys are disclosed. A separate independent authority ring enables agent spending. Receipt failure rolls back execution; replay verifies the original record and encrypts nothing new. Existing unexecuted legacy intents need replacement rather than invented receipts.
+
+Original protected mandate-consent and effective approve/reject records are now captured with their owner authentication context. HTTP context is verified user-JWT identity/credential version; internal callers are explicitly `trusted_library`. Execution verifies these original records and binds their commitments, without inventing a per-payment decision for budgeted grants. Repeated approvals preserve the first record; later rejection retains approval history while preventing execution. These are backend attestations, not user signatures. Stronger owner authentication, full terminal bindings and authority-inclusive Merkle leaves remain open. No hosted sandbox, distributed fair queue or blockchain publication is claimed.
+
 Owner APIs expose agent status, credential metadata without tokens, mandate recipients/limits/expiry, reserved/spent allowance and intent state/fingerprint. Transaction participants can inspect authenticated payment evidence, protected risk summaries and locally verified Merkle inclusion proofs. Wallet events are scoped to the authenticated wallet; delivery is durable through the outbox, but client notifications need an application/worker integration.
 
 An inclusion proof is not proof of consent. Current leaves bind protected payment and risk records, not the entire mandate policy or independently authenticated approval provenance. Do not describe current roots as blockchain-verified control of a user's transactions.
@@ -59,7 +102,7 @@ An inclusion proof is not proof of consent. Current leaves bind protected paymen
 | 4: Owner control panel and SDK | Explicit preapproval consent, intent review, revoke controls, budget/history and understandable evidence statuses | Human/agent end-to-end tests demonstrate both approval modes; pending/unanchored must never appear settled/final |
 | 5: Production trust and integration | Stronger owner step-up, least-privilege database roles, managed key custody, backup recovery and payment-provider sandbox | Independent deployment/security review and settlement reconciliation; never infer production readiness from fixtures |
 
-Stages 2-5 are plans, not implemented capabilities. Choose the anchor network and signer custody before deployment; do not add on-chain fund movement to this stage. Blockchain can make published evidence independently checkable; it cannot determine truthful original inputs, fix stolen owner credentials or stop a compromised backend before a transfer.
+Stage 2's backend-attested consent/decision/execution records are locally implemented; independent user verification and complete terminal contracts remain open. Stages 3-5 remain planned. Choose the anchor network and signer custody before deployment; do not add on-chain fund movement to this stage. Blockchain can make published evidence independently checkable; it cannot determine truthful original inputs, fix stolen owner credentials or stop a compromised backend before a transfer.
 
 ## Verification
 

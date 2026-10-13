@@ -30,7 +30,7 @@ For example, an invoice assistant may be allowed to pay specified suppliers with
 | Concurrent requests or retries spend more than intended | Locked budget accounting and fingerprint-bound replay inside atomic payment execution. |
 | The owner cannot see what the agent did | Owner-scoped mandate/intent APIs, wallet events and participant-only payment/risk evidence and audit proofs. |
 
-ML adds behavioural risk observations alongside these controls; it does not grant payment authority. The planned blockchain role is independently verifiable audit evidence, not a replacement for owner consent or server-side enforcement. **Current Merkle proofs are local and unanchored; protected policy/approval receipts and chain publication are still upcoming work.**
+ML adds behavioural risk observations alongside these controls; it does not grant payment authority. The planned blockchain role is independently verifiable audit evidence, not a replacement for owner consent or server-side enforcement. **Current Merkle proofs are local and unanchored. Protected original owner-context consent/decisions and execution receipts are implemented; user-signed approval and authority-inclusive published batches remain future work.**
 
 Rail began with offline-aware payment orchestration. That work supplies the reliability foundation for this approach: signed authorizations, device-bound tokens, durable accounting, reconnect synchronization and recovery from repeated or interrupted requests. It is not being discarded to make agent payments the primary focus.
 
@@ -40,7 +40,8 @@ Rail began with offline-aware payment orchestration. That work supplies the reli
 
 | Area | Current behavior |
 | --- | --- |
-| Agent control | Owner-managed identities, hashed expiring credentials, immutable authority policies and intents, permanent revocation and atomic budget consumption. |
+| Agent control | Owner-managed identities, scoped credentials, immutable policies/intents, permanent revocation, atomic budget consumption and protected execution-authority receipts. |
+| Checkout binding | Immutable fee-inclusive totals and expiry, retained in decisions/receipts. Configured merchant recipients require signed quotes; unsigned compatibility remains explicitly unverified elsewhere. |
 | Payment authority | Persisted, signed authorizations bind the transaction, wallets, amount, currency and expiry; issuance reserves available funds. |
 | Transaction safety | Execution coordinates authorization use, token accounting, wallets, ledger, risk, evidence, events and replay through one PostgreSQL transaction. |
 | Retry protection | Durable idempotency binds a key to a canonical request fingerprint and committed result; changed payloads cannot reuse that key. |
@@ -51,7 +52,7 @@ Rail began with offline-aware payment orchestration. That work supplies the reli
 | Event delivery | Transactional outbox with leases, retries, acknowledgement and dead letters; wallet-scoped REST history and advisory SSE on persistent servers. |
 | Operational checks | Accounting reconciliation, authorization expiry cleanup, bounded request parsing and shared source/identity quotas. |
 
-The latest backend verification passed **249 tests with zero failures or skips**, including real PostgreSQL integration tests, on 12 October 2026. The badge links to live CI results; that local count is not a statement that every future revision or deployment has passed. The suite includes concurrent requests, response-loss recovery, backend termination, policy tampering, revocation races and failed final commits.
+The latest backend verification passed **290 tests with zero failures or skips**, including real PostgreSQL integration tests, on 13 October 2026. The badge links to live CI results; that local count is not a statement that every future revision or deployment has passed. The suite includes concurrent requests, response-loss recovery, backend termination, merchant signature/downgrade checks, checkout expiry, original consent/decision binding, receipt rollback/key rotation, policy tampering, revocation races and failed final commits.
 
 ## Runtime Flow
 
@@ -118,7 +119,8 @@ An agent receives its own scoped credential, not the owner's login or a server e
 flowchart LR
     Owner["Owner"] --> Mandate["Recipient, currency, payment limit, total budget and expiry"]
     Mandate --> Proposal["Agent proposes an immutable intent"]
-    Proposal --> Mode{"Mandate mode"}
+    Proposal --> Quote["Verify signed checkout for configured merchant recipients"]
+    Quote --> Mode{"Mandate mode"}
     Mode -->|approval_required| Review["Owner decision bound to exact fingerprint"]
     Mode -->|budgeted| Preapproval["Preapproval within existing policy"]
     Review --> Authority["Recheck live credential, agent, mandate, expiry and funds"]
@@ -131,6 +133,10 @@ Pending/approved intents hold mandate budget, not wallet funds. Execution consum
 Stored owner/agent bindings, credential scopes and deadlines, and mandate policies reject ordinary SQL updates and deletes. Revocation is one-way; changing permissions requires a new owner-created credential or mandate. Budget counters remain constrained by the associated intents and committed executions. These guards are defense in depth, not protection against a database administrator disabling them.
 
 `approval_required` means an owner decision for the exact request. `budgeted` means advance owner permission within fixed limits, not a new human acknowledgement for every transfer. Never give an agent an owner JWT, privileged service key, database access or server signing keys. Rail authorizes software callers; it does not prove a human was physically present or prevent a compromised operator from changing application code. See the [agent security boundaries and implementation roadmap](AGENT_PAYMENT_SECURITY.md).
+
+New agent execution commits an independently keyed AES-GCM/HMAC authority receipt: fixed mandate policy, exact intent/payment fingerprints, execution credential and consent mode. Owners can verify its sanitized contents through the authority endpoint. Receipt write failure rolls back spending; replay verifies and retains the original record. `server_observed_authority` is a backend-authenticated execution snapshot, not independent proof of original owner approval. Historical requests remain explicit legacy records; see [deployment/cutover details](DEPLOYMENT.md).
+
+New mandates and effective approve/reject decisions also write immutable encrypted evidence at the time of the owner action. HTTP records capture the verified owner JWT user/credential version, not actor fields supplied in JSON or the JWT itself; internal calls are labelled `trusted_library`. Execution links to and verifies original consent and, where required, exact approval. Budgeted execution does not fabricate a per-payment owner acknowledgement. Session logout does not rewrite historical evidence or automatically revoke existing delegated permissions; use agent/mandate revocation to stop those permissions. These records attest backend-verified authentication context, not physical human presence or a user signature.
 
 ## Risk and Protected Evidence
 
@@ -164,7 +170,7 @@ The finite `audit:batch` worker handles 1-256 pending records per run, default 1
 
 **Current proof status is local-only and unanchored.** No contract, signer, publisher, finality/reorg tracker or independent checkpoint has been implemented. Inclusion does not establish complete historical coverage, truthful original inputs or external settlement.
 
-The planned blockchain role is independently checkable evidence after execution, not permission to spend. Current audit leaves bind protected payment and risk commitments; they do not yet cryptographically bind the full mandate policy or owner-decision provenance. Those authority receipts must be implemented before claiming blockchain-verifiable owner controls.
+The planned blockchain role is independently checkable evidence after execution, not permission to spend. Current audit leaves bind protected payment and risk commitments; the new agent authority snapshots are not yet included. Original owner-decision provenance and versioned authority-inclusive batches remain prerequisites for blockchain-verifiable owner controls.
 
 ## Run Locally
 
@@ -196,9 +202,10 @@ RAIL_ALLOWED_ORIGINS=http://localhost:3000
 RAIL_TRUST_PROXY_HEADERS=false
 RAIL_EVIDENCE_KEY_RING=<private payment key-ring JSON>
 RAIL_RISK_RECORD_KEY_RING=<independent private risk key-ring JSON>
+RAIL_AGENT_AUTHORITY_KEY_RING=<third independent private ring to enable agent spending>
 ```
 
-Angle-bracket values are placeholders, not runnable configuration. Generate independent random secrets, for example with `openssl rand -base64 32`. Each key ring needs its own 32-byte AES key and different 32-byte HMAC key encoded as base64; use the JSON shape and rotation procedure in [DEPLOYMENT.md](DEPLOYMENT.md). Agent execution requires a signing secret with at least 32 non-padding characters. Never commit secrets, print them in CI or distribute server keys to clients. No model artifact is required to start the server.
+Angle-bracket values are placeholders, not runnable configuration. Generate independent random secrets, for example with `openssl rand -base64 32`. Each ring needs its own 32-byte AES key and different 32-byte HMAC key encoded as base64; see [DEPLOYMENT.md](DEPLOYMENT.md). The payment/risk rings are required for HTTP startup; the authority ring additionally enables new agent consent/decisions and spending. Without it, human startup continues, but new protected agent permissions/spending are unavailable; revocation remains possible. Agent execution also needs a signing secret with at least 32 non-padding characters. Never commit secrets, print them in CI or distribute server keys to clients. No model artifact is required.
 
 ### 3. Migrate, Start and Check Liveness
 
@@ -255,6 +262,7 @@ JSON writes require `Content-Type: application/json` by default. Use credentials
 | `POST`, `GET /v2/agent/intents` | Agent proposes/lists its intents. |
 | `GET /v2/agents/:agentId/intents` | Owner JWT reads the approval queue/history. |
 | `POST /v2/agents/:agentId/intents/:intentId/decision` | Owner JWT approves/rejects the exact fingerprint. |
+| `GET /v2/agents/:agentId/intents/:intentId/authority` | Owner JWT reads verified execution-authority explanation or explicit unavailable state. |
 | `POST /v2/agent/intents/:intentId/execute` | Execution-scoped agent submits the approved fingerprint. |
 
 An authorization request contains `txId`, `senderWalletId`, `receiverWalletId`, `amountMinor` and `currency`. Execute adds `idempotencyKey`, the returned `authorizationId`, `channel` and `createdAt`; offline execution also requires `offlineTokenId` and `deviceId`. `paymentSignature` is required when incoming HMAC enforcement is enabled. Preserve the original canonical request when retrying.
@@ -312,7 +320,7 @@ Rail is a modular monolith. Keeping financial state in one transactional databas
 
 ## Remaining Work
 
-The next agent-transparency milestone is a protected authority receipt binding the mandate policy and exact approval/execution provenance to the payment. Current payment/risk commitments do not prove full policy consent. Those receipts must be incorporated into audit batches before claiming blockchain-verifiable owner controls.
+Protected execution receipts link to original encrypted mandate/decision records and backend-verified owner context. Checkout descriptors bind quote references, fees, expiry and the owner's internal funding wallet. For configured recipients, merchant signatures authenticate those quoted terms; they do not establish reputation, fair pricing or settlement. Next work includes stronger owner step-up, merchant onboarding/recovery and versioned authority-inclusive audit batches. Current payment/risk roots do not prove full policy consent, and server HMAC records are not user signatures.
 
 After that, the chain milestone is a minimal contract and an isolated durable publisher with duplicate, ambiguous-response, crash, confirmation and reorganization handling. Neither is deployed today. An owner control panel/SDK, stronger owner authentication, operator visibility/alerts, legitimate labelled datasets, reviewed risk-policy enforcement, secure mobile offline transport, external funding/refund/reversal lifecycles, provider settlement and hosted recovery acceptance remain unfinished.
 

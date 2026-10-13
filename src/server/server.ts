@@ -32,6 +32,8 @@ import { handleAgentRoutes } from "./routes/agentRoutes.js";
 import { handleEventRoutes } from "./routes/eventRoutes.js";
 import { handlePaymentRoutes } from "./routes/paymentRoutes.js";
 import type { ServerContext } from "./types.js";
+import { AgentEvidenceStore, loadAgentAuthorityKeyRing } from "../persistence/agentEvidence.js";
+import { MerchantQuoteRegistry } from "../crypto/merchantQuotes.js";
 
 const tracer = consoleTracer("[rail]");
 
@@ -51,7 +53,11 @@ export async function createServerContext(options: {
     ? validateBehaviourModel(await readRiskJson(process.env.RAIL_BEHAVIOUR_MODEL_PATH)) : undefined;
   const anomalyModel = process.env.RAIL_ANOMALY_MODEL_PATH
     ? validateAnomalyModel(await readRiskJson(process.env.RAIL_ANOMALY_MODEL_PATH)) : undefined;
-  const riskProtection = new RiskProtectionStore(loadRiskKeyRing(process.env.RAIL_RISK_RECORD_KEY_RING, paymentKeys));
+  const riskKeys = loadRiskKeyRing(process.env.RAIL_RISK_RECORD_KEY_RING, paymentKeys);
+  const riskProtection = new RiskProtectionStore(riskKeys);
+  const authorityEvidence = process.env.RAIL_AGENT_AUTHORITY_KEY_RING
+    ? new AgentEvidenceStore(loadAgentAuthorityKeyRing(process.env.RAIL_AGENT_AUTHORITY_KEY_RING, [paymentKeys, riskKeys])) : undefined;
+  const merchantQuotes = new MerchantQuoteRegistry(process.env.RAIL_MERCHANT_QUOTE_KEYS);
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
   const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
@@ -108,7 +114,7 @@ export async function createServerContext(options: {
     evidenceStore,
     riskProtection,
     auditStore: new AuditBatchStore(pool, evidenceStore, riskProtection),
-    agentStore: new AgentAuthorityStore(pool, engine),
+    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,

@@ -61,7 +61,7 @@ jobs:
       - name: Verify atomic evidence, replay, rotation and access controls
         run: node --test --test-name-pattern='evidence|legacy replay remains unprotected' test/postgres.integration.test.js
       - name: Verify agent authority, atomic execution, replay, quotas and revocation races
-        run: node --test test/agentAuthority.test.js
+        run: node --test test/agentAuthority.test.js test/agentEvidence.test.js test/merchantQuotes.test.js
       - name: Verify single-transaction authorization, evidence, rollback and replay composition
         run: node --test --test-name-pattern='transaction composition:' test/postgres.integration.test.js
       - name: Verify event delivery and stream lifecycle

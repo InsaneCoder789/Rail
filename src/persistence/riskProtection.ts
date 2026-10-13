@@ -17,7 +17,7 @@ export interface RiskRecord {
 interface Binding { readonly txId: string; readonly requestFingerprint: string; }
 export interface RiskEnvelope extends Binding {
   readonly version: 1;
-  readonly purpose: "risk-v1";
+  readonly purpose: "risk-v1" | "agent-authority-v1" | "agent-mandate-v1" | "agent-approval-v1" | "agent-rejection-v1";
   readonly keyId: string;
   readonly payloadHash: string;
   readonly nonce: string;
@@ -35,8 +35,11 @@ interface ProtectedRiskSummary {
   readonly synthetic: boolean | null;
   readonly anomaly_summary?: unknown;
 }
-function aad(record: RiskEnvelope | (Binding & { keyId: string; payloadHash: string })): string {
-  return JSON.stringify(["rail:protected-risk:v1", record.keyId, record.txId, record.requestFingerprint, record.payloadHash]);
+function aad(record: RiskEnvelope | (Binding & { keyId: string; payloadHash: string; purpose: RiskEnvelope["purpose"] })): string {
+  const domain = record.purpose === "risk-v1" ? "rail:protected-risk:v1" : record.purpose === "agent-authority-v1"
+    ? "rail:protected-agent-authority:v1" : `rail:protected:${record.purpose}`;
+  return JSON.stringify([domain,
+    record.keyId, record.txId, record.requestFingerprint, record.payloadHash]);
 }
 function bytes(record: Omit<RiskEnvelope, "mac">): string {
   return JSON.stringify([record.version, record.purpose, record.keyId, record.txId, record.requestFingerprint,
@@ -57,22 +60,26 @@ export function loadRiskKeyRing(raw: string | undefined, paymentKeys: Transactio
   if (ring.materialFingerprints().some(value => paymentMaterial.has(value))) throw new Error("RISK_KEYS_MUST_BE_INDEPENDENT");
   return ring;
 }
-export function protectRiskRecord(value: RiskRecord, expected: Binding, keys: TransactionProtectionKeys): RiskEnvelope {
+export function protectRecord(value: object, expected: Binding, keys: TransactionProtectionKeys,
+  purpose: RiskEnvelope["purpose"] = "risk-v1"): RiskEnvelope {
   new TransactionKeyRing(keys.keyId, [keys]);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_record_payload");
   if (!expected.txId || expected.txId.length > 128 || !/^[a-f0-9]{64}$/.test(expected.requestFingerprint)) throw new Error("invalid_risk_binding");
   const payload = JSON.stringify(value);
   if (!payload || Buffer.byteLength(payload) > 65536) throw new Error("risk_record_size_limit");
-  const base = { version: 1 as const, purpose: "risk-v1" as const, keyId: keys.keyId, ...expected, payloadHash: hash(payload) };
+  if (!["risk-v1", "agent-authority-v1", "agent-mandate-v1", "agent-approval-v1", "agent-rejection-v1"].includes(purpose)) throw new Error("invalid_record_purpose");
+  const base = { version: 1 as const, purpose, keyId: keys.keyId, ...expected, payloadHash: hash(payload) };
   const nonce = randomBytes(12), cipher = createCipheriv("aes-256-gcm", keys.encryptionKey, nonce, { authTagLength: 16 });
   cipher.setAAD(Buffer.from(aad(base)));
   const encrypted = { ...base, nonce: nonce.toString("base64"), ciphertext: Buffer.concat([cipher.update(payload), cipher.final()]).toString("base64"),
     tag: cipher.getAuthTag().toString("base64") };
   return { ...encrypted, mac: createHmac("sha256", keys.authenticationKey).update(bytes(encrypted)).digest("base64") };
 }
-export function decryptRiskRecord(envelope: RiskEnvelope, expected: Binding, keys: TransactionProtectionKeys): RiskRecord {
+export function decryptRecord(envelope: RiskEnvelope, expected: Binding, keys: TransactionProtectionKeys,
+  purpose: RiskEnvelope["purpose"] = "risk-v1"): Record<string, unknown> {
   try {
     new TransactionKeyRing(keys.keyId, [keys]);
-    if (!envelope || envelope.version !== 1 || envelope.purpose !== "risk-v1" || envelope.keyId !== keys.keyId ||
+    if (!["risk-v1", "agent-authority-v1", "agent-mandate-v1", "agent-approval-v1", "agent-rejection-v1"].includes(purpose) || !envelope || envelope.version !== 1 || envelope.purpose !== purpose || envelope.keyId !== keys.keyId ||
         envelope.txId !== expected.txId || envelope.requestFingerprint !== expected.requestFingerprint ||
         !/^[a-f0-9]{64}$/.test(envelope.payloadHash) || !/^[a-f0-9]{64}$/.test(expected.requestFingerprint)) throw new Error();
     const mac = decode(envelope.mac, 32), expectedMac = createHmac("sha256", keys.authenticationKey).update(bytes(envelope)).digest();
@@ -85,6 +92,12 @@ export function decryptRiskRecord(envelope: RiskEnvelope, expected: Binding, key
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     return value;
   } catch { throw new Error("protected_risk_verification_failed"); }
+}
+export function protectRiskRecord(value: RiskRecord, expected: Binding, keys: TransactionProtectionKeys): RiskEnvelope {
+  return protectRecord(value, expected, keys, "risk-v1");
+}
+export function decryptRiskRecord(envelope: RiskEnvelope, expected: Binding, keys: TransactionProtectionKeys): RiskRecord {
+  return decryptRecord(envelope, expected, keys, "risk-v1") as unknown as RiskRecord;
 }
 export class RiskProtectionStore {
   constructor(private readonly ring: TransactionKeyRing) {}

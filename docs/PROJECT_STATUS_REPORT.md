@@ -38,6 +38,83 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Authority And Checkout Milestone: 13 October 2026
+
+This release groups protected original consent/decisions and execution receipts, exact internal-wallet checkout binding, configured merchant signature verification, SQL invariants, deployment guidance and regression/CI coverage into one milestone. Earlier entries saying uncommitted/unpushed describe the state when each slice was completed; Git history records publication of the grouped release. Unrelated local manuals/deliverables and ignored private planning documents are outside this release. The verified local baseline is 290 passing tests with no failures/skips; remote CI, hosted deployment and real merchant/provider acceptance are separate gates, not implied by a repository push.
+
+Remaining work, in delivery order:
+
+1. Stronger owner step-up for sensitive grants/approvals, with safe passkey enrollment, one-use operation-bound challenges and recovery.
+2. Agent proof-of-possession authentication and reviewed key enrollment/rotation, without giving agents owner or operator credentials.
+3. Merchant onboarding, ownership checks, trust-key lifecycle/recovery and explicit mandatory-quote policy beyond currently configured recipients.
+4. Durable fair admission before financial locks, with per-owner/agent bounds, leased claims/fencing and measured starvation/isolation tests.
+5. Versioned audit leaves that include owner/agent authority and merchant evidence while preserving old proofs.
+6. An isolated testnet audit publisher, independent checkpoints/proof verification, signing limits and finality/reorganization recovery. No on-chain funds.
+7. Owner control panel and narrow agent SDK: exact approvals, consent modes, held/spent allowance, revocation, truthful receipt/publication states and safe timeout retries.
+8. Paginated histories and explicit archival/retention, capacity and privacy policies that preserve required financial/replay evidence.
+9. One authorized provider sandbox with opaque owner-enrolled instruments, durable unknown outcomes, verified callbacks and settlement reconciliation.
+10. Refund/reversal/cancellation and dispute lifecycles backed by guarded accounting; never retry an unknown external payment as a new transfer.
+11. Trusted risk labels, calibration/drift/latency acceptance and bounded agent-abuse telemetry before any reviewed risk enforcement. Current models remain shadow-only; larger models need measured benefit.
+12. Hosted fault/load acceptance, least-privilege runtime/migration/worker roles, key custody/restore testing, monitoring/runbooks and standards interoperability/conformance. Independent security and compliance review is required before real-money release.
+
+### Configured Merchant Quote Signatures: 13 October 2026
+
+Added `src/crypto/merchantQuotes.ts` for bounded operator-enrolled recipient-bound Ed25519 public keys, canonical quote bytes, strict signature proof parsing and snapshot verification. Merchant private keys stay outside Rail and agent clients; no key, merchant or network integration was provisioned. Malformed trust configuration fails before connecting. Quotes bind every checkout field, fee-inclusive total, expiry, owner funding audience and signing key ID. Agents supply only a key ID/signature, not their own trusted public key or verification flag.
+
+Configured recipients require signed checkouts at proposal, approval and fresh execution, including older unsigned intents after enrollment. Revoked keys deny fresh work while retaining mandatory-proof policy for their recipient. Deleting all recipient entries removes that policy and is explicitly not safe revocation. v3 fingerprints bind attestation metadata/signature; absent proofs preserve v1/v2 fingerprints and old evidence. Immutable nullable storage and a unique recipient/quote-ID index prevent multiple retained signed intents across agents and versions. Advisory locking makes concurrent conflicts explicit; same-request retries retain the original intent. Rejection/expiry requires a new quote ID; financial failure retries the existing intent.
+
+Protected owner decisions and execution receipts retain public-key/signature/fingerprint snapshots. Historical reads verify signature consistency and protected authority, not current trust; completed replay remains stable after key revocation. New execution checks current trust first. Human/offline paths remain unchanged. Twelve added cases cover field/audience/key tampering, malformed/private/wrong-algorithm registry keys, revoked/replaced keys, bounded proof parsing, HTTP provenance, unsigned downgrade, concurrent single-use, stale unsigned authority, migration/immutability, rollback/retry and fail-closed startup. Full local suite: 290 passes, zero failures/skips, including PostgreSQL. CI explicitly runs the merchant test file; remote results and hosted acceptance remain unverified. Reports/scopes were updated; no commit/push occurred.
+
+This is `configured_merchant_signature` assurance, not merchant KYC/reputation, fair pricing, original invoice truth, delivery or settlement. Operator enrollment/recovery, consistent multi-instance trust configuration, mandatory quote policy for unregistered recipients, stronger owner step-up and authority-inclusive audit roots remain open. Operational metadata is relational plaintext, and SQL checks do not verify signatures or stop a database owner bypassing controls.
+
+### Internal-Wallet Checkout Binding: 12 October 2026
+
+Agent proposals now accept an optional bounded `checkout` descriptor: merchant wallet, quote ID/version, subtotal, fees, total, currency, canonical UTC expiry and internal funding wallet. The merchant must equal the receiver, the funding wallet must equal the credential's owner, and the total must equal the transfer amount. Policy and balance checks therefore cover fees too. The whole total goes to the receiver; there is no separate provider-fee distribution.
+
+Descriptors are copied/frozen before asynchronous work. Versioned canonical tuples bind all checkout fields into proposal/intent fingerprints; absent checkout preserves existing v1 fingerprints and receipt bodies. Quote changes require a new request/approval. Additive nullable JSONB storage preserves historical data; database checks reject malformed/mismatched bindings and immutable-history guards reject checkout edits. Database time clips the intent to the earliest quote, mandate or request deadline. An expired proposal leaves no reservation, and expiry during execution rolls back the financial transaction. A completed replay remains the original outcome after quote expiry, subject to existing live authority checks.
+
+Exact-mode owner decisions and execution receipts include the checkout and `agent_proposed_unverified` assurance. This binds what was requested, not a merchant signature, verified invoice, fair price or enrolled provider instrument. No card/PAN, arbitrary prompt or caller-supplied verification claim is accepted in the descriptor. Merchant-authenticated quotes, owner step-up, fair admission and provider integration remain separate work. Seven regression cases exercise parsing, caller mutation, retry binding, fee/funding policy, expiry, SQL guards, protected receipts, repeated migration and rollback. Full local suite: 278 passes, zero failures/skips, including PostgreSQL. This increment remains uncommitted and unpushed; remote CI and deployment were not run.
+
+### Original Owner Consent And Decisions: 12 October 2026
+
+Extended the uncommitted authority milestone with immutable encrypted records captured when a new mandate is created or an effective approve/reject decision occurs. Separate mandate/approval/rejection domains bind policy, exact request, database time and owner authentication context. HTTP context comes from the verified owner JWT, not request JSON; user/wallet/credential version is rechecked under a shared lock before recording. No JWT is retained. Internal callers are labelled `trusted_library`, not silently presented as authenticated humans. Stale JWT context returns 401 with rollback.
+
+Execution and approval retry verify original consent and required approval; the execution receipt commits their hashes and owner explanations disclose authenticated provenance. Duplicate approvals preserve first ciphertext/time/context. Rejection keeps previous approval history while preventing execution. Budgeted payments use original advance consent without inventing per-payment acknowledgement. Fresh proposals verify consent before holding allowance. Session logout invalidates sessions but does not rewrite evidence or automatically revoke persistent grants; explicit agent/mandate revocation withdraws them.
+
+New marker/constraint checks require mandate consent and exact-mode decisions, with immutable history. A common authority nonce registry and committed-record quota now cover consent/decisions/execution; failed writes roll back their increments. Old markers and ciphertext are preserved without fake backfills. Older mandates need fresh consent for new proposals; readiness flags reflect legacy markers. Emergency revocation remains possible without keys and releases unexecuted holds.
+
+Added nine cases covering authenticated HTTP provenance versus body forgery, stable concurrent decisions/rejection history, truthful budget consent, missing writers, stale/mismatched actor context, corrupted approval, cross-purpose substitution, legacy mandate denial and keyless emergency revocation. Full local suite: 271 passes, zero failures/skips, including PostgreSQL. Clean-install testing exposed and fixed a constraint-name collision and a trigger row-shape evaluation defect. Existing human/offline, accounting, replay, key rotation and authenticated read tests remain passing. Docs/CI/private reports stay current. No user-signature/passkey assertion, authority-inclusive audit root, fair scheduler, sandbox or provider connector is claimed. No commit, push or hosted/remote acceptance occurred.
+
+### First Terminal Build Slice: Protected Execution Authority, 12 October 2026
+
+Implemented a narrow first receipt slice in `src/persistence/agentEvidence.ts`: independently keyed, purpose-bound AES-256-GCM/HMAC snapshots of immutable mandate policy, consent mode, exact intent/payment fingerprints, executing credential, receiver/amount and execution time. Assurance is explicitly `server_observed_authority`, not an independently signed owner decision or proof of human presence. Separate original consent/approval provenance and complete terminal merchant/quote contracts remain next dependencies.
+
+Agent execution writes required evidence through the same outer client as authorization, wallets, ledger, risk/payment evidence, allowance consumption, replay and events. Deferred guards reject missing/mismatched records; ordinary receipt/history mutation is blocked. Quota/write/final-commit failure rolls back execution. Replay verifies and retains original ciphertext without another encryption/debit. Fixed field-order commitment encoding addresses JSONB key reordering. Shared bounded envelope primitives retain risk-v1 compatibility while rejecting authority/risk purpose substitution.
+
+Owner-JWT-only `GET /v2/agents/:agentId/intents/:intentId/authority` returns sanitized verified policy details or `not_executed`, `legacy_unavailable`/`verification_unavailable`; no tokens/keys are disclosed and responses use `no-store`. Reads reject cross-owner/agent bindings. Owners can inspect history after revocation while agent execution still requires live authority.
+
+`RAIL_AGENT_AUTHORITY_KEY_RING` enables agent spending with material independent of configured/retained payment/risk keys. Missing configuration disables agent spending/execution-credential issuance, not human HTTP startup. Bad/reused configured material fails before pool creation. Actual secrets were not changed. Migration preserves historical nullable markers; new intents require receipt version 1. Old unexecuted requests need hold release, a new request ID and applicable approval, not fabricated evidence. Mixed old/new writers cannot safely execute new protected intents.
+
+Added 13 cases for both modes, concurrent original replay, purpose/tamper rejection, keys/startup, owner-only HTTP reads, missing/write-failed receipts, rotation/loss, quota rollback, administrator-corrupted storage and legacy cutover. Full local verification: 262 tests pass, zero failures/skips, including PostgreSQL. CI explicitly includes receipt tests. Authority snapshots are not in v1 Merkle leaves; no chain publisher, fair distributed queue, runtime sandbox, passkey integration or provider connector was added. Human/offline regressions remain passing. Changes stay uncommitted; no push or remote CI/deployment acceptance occurred.
+
+### Transaction Isolation And Fair Admission Planning: 12 October 2026
+
+Extended the private terminal scheme to retain human-payment safeguards and require transaction-scoped agent access, immutable authorized request bindings and server-owned scheduling. Source review confirms fresh payment contexts/outboxes and atomic database composition; existing stage semaphores are process-local, not a distributed fair admission system. Planned work includes owner/agent admission bounds before financial locks, coordinated claims and stale-worker fencing, revocation/expiry rechecks, alternate-route parity and cross-agent/flood/crash regression tests.
+
+Explicit limits: Rail accepts agent requests as data rather than running agent code; logical request isolation is not an OS sandbox. Agents must have no terminal messaging or other-agent control capability, but external collusion and shared wallet/database contention cannot be declared impossible. ACID covers internal PostgreSQL effects, not provider/chain side effects. No new runtime queue, sandbox, RLS, isolation level, dependency, test run, commit or push was added in this planning increment.
+
+### Agent Transaction Terminal Direction: 12 October 2026
+
+Extended the private implementation scheme from delegated wallet transfers toward a complete agent-facing payment authorization workflow. The proposed terminal authenticates the caller, resolves trusted merchant/quote/funding-source bindings, enforces owner consent, executes through the existing internal engine or a future separate provider adapter, and exposes distinct authority/execution/evidence statuses. Preserve human and offline contracts. External calls cannot share PostgreSQL atomicity; sandbox adapters require durable uncertain-outcome handling and reconciliation before any real-payment claims.
+
+Reviewed official AP2, Visa Intelligent Commerce and Mastercard Agent Pay material: agent payments are an existing category, so Rail's positioning must emphasize its implementation and standards-aware integration rather than claim to invent the category. No interoperability certification or provider connector is implemented. Planning now prioritizes a controlled internal-wallet terminal with versioned authority receipts, then owner/agent trust, independent transparency and separately verified provider expansion. No runtime code/dependencies, commit or push changed in this planning revision.
+
+### Agent-First Implementation Planning: 12 October 2026
+
+Reviewed current agent authority, owner authentication, financial execution, protected evidence, audit batching and runtime composition contracts for the new direction. Prepared a private implementation scheme distinguishing existing features from planned authority receipts, stronger owner authentication, versioned independent anchoring, owner-facing integration, validated risk assistance and operational acceptance. Human and offline payment foundations remain in scope. Current audit leaves still bind payment/risk only; no new consent-proof capability is claimed.
+
+The next implementation slice is versioned protected mandate/decision/execution provenance with owner-only explanations and explicit legacy/cutover tests. No runtime code, dependencies, API behavior, commit or push changed in this planning increment. The latest implemented-backend baseline remains the previously verified 249 tests, not a new planning test run. Detailed forward scope remains private under the existing ignore rule; implementation waits for the owner's next instruction.
+
 ### Approach-First README and Milestone Commits: 12 October 2026
 
 Reordered the README narrative around the owner's approach: delegate payment tasks to AI agents without delegating unrestricted financial authority. The opening now explains owner-defined boundaries, both consent modes, a concrete invoice-assistant example, restriction/retry defenses and owner visibility before implementation details. Human payments and offline orchestration remain explicit. Agent controls lead the implementation table; package metadata and the agent security guide use the same positioning.
@@ -501,7 +578,10 @@ This section describes the current TypeScript source layout and the responsibili
   Defines how payment authorizations are signed and verified. This supports the signed authorization model used between authorization issuance and payment execution.
 
 - `src/crypto/transactionSigning.ts`
-  Handles transaction signature helpers used during payment verification and integrity checks.
+  Handles transaction signature helpers used during payment verification and integrity checks. Merchant signatures do not replace Rail's HMAC payment binding.
+
+- `src/crypto/merchantQuotes.ts`
+  Defines canonical checkout signing bytes, strict proof parsing, bounded operator recipient/public-key trust and historical Ed25519 attestation checks. It does not hold private merchant keys or move money.
 
 ### Domain Models
 
