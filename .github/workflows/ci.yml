@@ -64,12 +64,12 @@ jobs:
         run: node --test test/agentAuthority.test.js test/agentEvidence.test.js test/merchantQuotes.test.js
       - name: Verify agent proof signatures and token, target and payload binding
         run: node --test test/agentProof.test.js
-      - name: Verify owner recovery, agent proofs, atomic rotation and preserved authority history
+      - name: Verify owner recovery, agent proofs, atomic rotation and exact external payment consent
         run: node --test test/ownerPasskeys.test.js
       - name: Verify shared agent budgets, concurrency, lifecycle, rollback and immutable bindings
         run: node --test test/sharedBudgets.test.js
-      - name: Verify provider lifecycle rules and narrow agent client protocol safety
-        run: node --test test/providerPayment.test.js test/agentClient.test.js test/agentSimulator.test.js
+      - name: Verify provider lifecycle, durable journal and narrow agent client protocol safety
+        run: node --test test/providerPayment.test.js test/providerPayments.integration.test.js test/agentClient.test.js test/agentSimulator.test.js
       - name: Verify owner console gating, document safety and nonce-based CSP
         run: node --test test/ownerConsole.test.js
       - name: Install Chromium for native passkey acceptance

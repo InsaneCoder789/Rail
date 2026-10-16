@@ -36,6 +36,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { runAgentSimulation } from "../dist/demo/runAgentSimulator.js";
+import { providerPaymentConsentFingerprint } from "../dist/domain/providerPayment.js";
+import { authorizeProviderPaymentInTransaction, advanceProviderPaymentInTransaction, createProviderPaymentInTransaction,
+  readProviderPaymentInTransaction } from "../dist/persistence/providerPayments.js";
 
 dotenv.config();
 const databaseUrl = process.env.DATABASE_URL;
@@ -175,6 +178,233 @@ async function grant(store, key, owner = principal, operation = "agent_approval"
   const request = await store.authenticationOptions(owner, { operation, operationFingerprint });
   return store.authenticate(owner, { challengeId: request.challengeId, response: key.assertion(request.options.challenge, count) });
 }
+
+async function providerTransaction(pool, work) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN"); await client.query("SET LOCAL lock_timeout='5s'");
+    await client.query("SET LOCAL statement_timeout='15s'");
+    const result = await work(client); await client.query("COMMIT"); return result;
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
+}
+
+async function externalConsentFixture(work) {
+  await fixture(async ({ pool, store }) => {
+    const key = await enroll(store), { strict, authority } = agentStores(pool, store);
+    const agent = await strict.createAgent(principal.walletId, { name: "External consent fixture" });
+    let counter = 0;
+    const permission = (operation, digest) => grant(store, key, principal, operation, digest, ++counter);
+    const terms = { name: "Combined allowance", currency: "INR", totalBudgetMinor: 1000, ttlSeconds: 3600, agentIds: [agent.agentId] };
+    const budgetGrant = await permission("shared_budget", sharedBudgetOperationFingerprint("create", null, terms));
+    const budget = await strict.createSharedBudget(principal.walletId, { ...terms, grantToken: budgetGrant.grantToken }, principal);
+    const policy = { ...mandatePolicy, mode: "budgeted", perPaymentLimitMinor: 1000, sharedBudgetId: budget.budgetId };
+    const mandateGrant = await permission("agent_mandate", mandateOperationFingerprint(agent.agentId, policy));
+    const mandate = await strict.createMandate(principal.walletId, agent.agentId, { ...policy, grantToken: mandateGrant.grantToken }, principal);
+    const binding = () => ({ version: 1, operationId: randomUUID(), ownerWalletId: principal.walletId, agentId: agent.agentId,
+      mandateId: mandate.mandateId, sharedBudgetId: budget.budgetId, intentId: randomUUID(), provider: "simulator",
+      providerAccountRef: "account_fixture", merchantRef: "merchant_fixture", instrumentRef: "instrument_fixture",
+      amountMinor: 100, currency: "INR", requestFingerprint: "a".repeat(64), authorizationExpiresAt: new Date(Date.now() + 60000).toISOString() });
+    const approve = (value, merchant = "other_wallet") => permission("provider_payment", providerPaymentConsentFingerprint(value, merchant));
+    const authorize = (value, consent, merchant = "other_wallet", owner = principal) => providerTransaction(pool, client =>
+      authorizeProviderPaymentInTransaction(client, { binding: value, trustedMerchantWalletId: merchant, principal: owner, grantToken: consent?.grantToken }, store, authority));
+    const change = (value, event) => providerTransaction(pool, client => advanceProviderPaymentInTransaction(client,
+      { ownerWalletId: value.binding.ownerWalletId, operationId: value.binding.operationId, fingerprint: value.fingerprint }, event));
+    const observe = (value, status) => ({ type: "provider_observed", observation: { operationId: value.binding.operationId,
+      fingerprint: value.fingerprint, provider: value.binding.provider, providerAccountRef: value.binding.providerAccountRef,
+      providerRef: `payment_${value.binding.operationId}`, amountMinor: value.binding.amountMinor, currency: value.binding.currency,
+      status, final: ["succeeded", "failed", "cancelled"].includes(status) } });
+    const totals = async () => (await pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets WHERE budget_id=$1", [budget.budgetId])).rows[0];
+    await work({ pool, store, strict, authority, key, agent, budget, mandate, binding, permission, approve, authorize, change, observe, totals });
+    assert.equal((await pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
+    assert.deepEqual((await pool.query("SELECT balance FROM wallets ORDER BY wallet_id")).rows, [{ balance: "0" }, { balance: "0" }]);
+  });
+}
+
+test("external admission requires fresh exact-payment passkey consent and replays one budget hold", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, binding, approve, authorize, permission, totals }) => {
+    const input = binding();
+    await assert.rejects(authorize(input), { code: "owner_step_up_required" });
+    const internal = await permission("agent_approval", approvalOperationFingerprint(input.agentId, input.intentId, input.requestFingerprint));
+    await assert.rejects(authorize(input, internal), { code: "owner_step_up_required" });
+    const consent = await approve(input);
+    await assert.rejects(authorize({ ...input, amountMinor: 101 }, consent), { code: "owner_step_up_required" });
+    const admitted = await authorize(input, consent);
+    assert.equal(admitted.authorizationRequired, true);
+    await runMigrations(pool);
+    assert.deepEqual(await authorize(input, consent), admitted);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await assert.rejects(pool.query("UPDATE rail_shared_budgets SET reserved_budget_minor=99"), { code: "23514" });
+    await assert.rejects(pool.query("UPDATE rail_agent_mandates SET reserved_budget_minor=99"), { code: "23514" });
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payment_consents")).rows[0].count, "1");
+    await assert.rejects(pool.query("UPDATE rail_provider_payment_consents SET merchant_wallet_id='owner_wallet'"), { code: "23514" });
+    await assert.rejects(pool.query("DELETE FROM rail_provider_payment_consents"), { code: "23514" });
+  });
+});
+
+test("external admission shares the same mandate and shared envelope as internal holds", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ strict, agent, mandate, binding, approve, authorize, permission, totals }) => {
+    const credential = { scope: "payments:propose" };
+    const consent = await permission("agent_credential", credentialOperationFingerprint(agent.agentId, credential));
+    const token = await strict.issueCredential(principal.walletId, agent.agentId, { ...credential, grantToken: consent.grantToken }, principal);
+    const internal = await strict.createIntent(token.token, { mandateId: mandate.mandateId, clientRequestId: "internal_allowance_fixture", receiverWalletId: "other_wallet", amountMinor: 650, currency: "INR" });
+    const large = { ...binding(), amountMinor: 400 }, grantLarge = await approve(large);
+    await assert.rejects(authorize(large, grantLarge), /provider_mandate_budget_unavailable/);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "650", spent_budget_minor: "0" });
+    const fitting = { ...binding(), amountMinor: 350 };
+    await authorize(fitting, await approve(fitting));
+    assert.deepEqual(await totals(), { reserved_budget_minor: "1000", spent_budget_minor: "0" });
+    await strict.decideIntent(principal.walletId, agent.agentId, internal.intentId,
+      { decision: "reject", requestFingerprint: internal.requestFingerprint }, principal);
+    await authorize(large, grantLarge);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "750", spent_budget_minor: "0" });
+  });
+});
+
+test("parallel exact external approvals cannot oversubscribe an allowance", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ binding, approve, authorize, totals }) => {
+    const first = { ...binding(), amountMinor: 650 }, second = { ...binding(), amountMinor: 650 };
+    const firstGrant = await approve(first), secondGrant = await approve(second);
+    const results = await Promise.allSettled([authorize(first, firstGrant), authorize(second, secondGrant)]);
+    assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "650", spent_budget_minor: "0" });
+  });
+});
+
+test("agent revocation cancels unsubmitted external work but preserves unknown liabilities for reconciliation", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, strict, agent, binding, approve, authorize, change, observe, totals }) => {
+    const a = binding(), b = binding();
+    const unsubmitted = await authorize(a, await approve(a));
+    const held = await authorize(b, await approve(b));
+    const submitted = await change(held, { type: "begin_submission", idempotencyWindowMs: 60000 });
+    const unknown = await change(submitted, { type: "submission_uncertain" });
+    await strict.revokeAgent(principal.walletId, agent.agentId);
+    const cancelled = await providerTransaction(pool, client => readProviderPaymentInTransaction(client, principal.walletId, unsubmitted.binding.operationId));
+    assert.equal(cancelled.status, "cancelled");
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await assert.rejects(change(unknown, { type: "retry_submission" }), /PROVIDER_AUTHORITY_WITHDRAWN/);
+    const final = await change(unknown, observe(unknown, "succeeded"));
+    assert.equal(final.status, "succeeded");
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "100" });
+    assert.deepEqual(await change(final, observe(final, "succeeded")), final);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "100" });
+  });
+});
+
+test("external confirmation after owner recovery preserves liabilities without retaining spending authority", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, store, key, binding, approve, authorize, change, observe, totals }) => {
+    const terms = binding(), admitted = await authorize(terms, await approve(terms));
+    const submitted = await change(admitted, { type: "begin_submission", idempotencyWindowMs: 60000 });
+    await recovery(store, key);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await assert.rejects(change(submitted, { type: "retry_submission" }), /PROVIDER_AUTHORITY_WITHDRAWN/);
+    await change(submitted, observe(submitted, "failed"));
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payment_consents")).rows[0].count, "1");
+  });
+});
+
+test("external admission failure rolls back grant consumption, journal and both budget counters", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, store, authority, binding, approve, authorize, totals }) => {
+    const input = binding(), consent = await approve(input);
+    await assert.rejects(providerTransaction(pool, async client => {
+      await authorizeProviderPaymentInTransaction(client, { binding: input, trustedMerchantWalletId: "other_wallet", principal, grantToken: consent.grantToken }, store, authority);
+      throw new Error("external_commit_failure_fixture");
+    }), /external_commit_failure_fixture/);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payments")).rows[0].count, "0");
+    await authorize(input, consent);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+  });
+});
+
+test("external deferred commit failure restores exact consent and allows the same payment to retry", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, binding, approve, authorize, totals }) => {
+    const input = binding(), consent = await approve(input);
+    await pool.query(`CREATE FUNCTION reject_external_commit_fixture() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'external_deferred_failure_fixture'; END $$;
+      CREATE CONSTRAINT TRIGGER reject_external_commit_fixture AFTER INSERT ON rail_provider_payment_consents
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_external_commit_fixture()`);
+    await assert.rejects(authorize(input, consent), /external_deferred_failure_fixture/);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payments")).rows[0].count, "0");
+    await pool.query("DROP TRIGGER reject_external_commit_fixture ON rail_provider_payment_consents");
+    await authorize(input, consent);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+  });
+});
+
+test("external expiry releases only unsubmitted holds and keeps an expired unknown payment reconcilable", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ strict, agent, binding, approve, authorize, change, observe, totals }) => {
+    const expiresAt = new Date(Date.now() + 2000).toISOString();
+    const first = { ...binding(), authorizationExpiresAt: expiresAt }, second = { ...binding(), authorizationExpiresAt: expiresAt };
+    await authorize(first, await approve(first));
+    const held = await authorize(second, await approve(second));
+    const submitted = await change(held, { type: "begin_submission", idempotencyWindowMs: 60000 });
+    const unknown = await change(submitted, { type: "submission_uncertain" });
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    await strict.listMandates(principal.walletId, agent.agentId);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await assert.rejects(change(unknown, { type: "retry_submission" }), /PROVIDER_AUTHORIZATION_EXPIRED/);
+    await change(unknown, observe(unknown, "failed"));
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+  });
+});
+
+test("external required-operation markers cannot commit without their exact consent record", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, binding, totals }) => {
+    await assert.rejects(providerTransaction(pool, client =>
+      createProviderPaymentInTransaction(client, binding(), { authorizationRequired: true })), /provider_owner_consent_binding_invalid/);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payments")).rows[0].count, "0");
+  });
+});
+
+test("external policy errors restore consent when the outer transaction catches them and continues", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, store, authority, binding, approve, totals }) => {
+    const input = binding(), consent = await approve(input, "unapproved_merchant");
+    await providerTransaction(pool, async client => {
+      await client.query("INSERT INTO outbox(type,payload) VALUES('caller.before_external','{}')");
+      await assert.rejects(authorizeProviderPaymentInTransaction(client, { binding: input,
+        trustedMerchantWalletId: "unapproved_merchant", principal, grantToken: consent.grantToken }, store, authority), /PROVIDER_POLICY_DENIED/);
+      assert.equal((await client.query("SELECT consumed_at FROM rail_owner_step_up_grants WHERE token_hash=$1",
+        [createHash("sha256").update(consent.grantToken).digest("hex")])).rows[0].consumed_at, null);
+    });
+    assert.equal((await pool.query("SELECT count(*) FROM outbox WHERE type='caller.before_external'")).rows[0].count, "1");
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+  });
+});
+
+test("external unknown holds survive membership withdrawal and confirmed cancellation releases them once", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ strict, agent, budget, binding, approve, authorize, change, observe, totals }) => {
+    const terms = binding(), admitted = await authorize(terms, await approve(terms));
+    const started = await change(admitted, { type: "begin_submission", idempotencyWindowMs: 60000 });
+    const unknown = await change(started, { type: "submission_uncertain" });
+    await strict.changeSharedBudget(principal.walletId, budget.budgetId, "member_remove", { agentId: agent.agentId }, principal);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await assert.rejects(change(unknown, { type: "retry_submission" }), { code: "shared_budget_inactive" });
+    const cancelled = await change(unknown, observe(unknown, "cancelled"));
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.deepEqual(await change(cancelled, observe(cancelled, "cancelled")), cancelled);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "0" });
+  });
+});
+
+test("external budget revocation releases only unsubmitted holds and preserves committed spending", { skip: !databaseUrl }, async () => {
+  await externalConsentFixture(async ({ pool, strict, budget, binding, approve, authorize, change, observe, totals }) => {
+    const first = binding(), second = binding();
+    const a = await authorize(first, await approve(first)), b = await authorize(second, await approve(second));
+    const started = await change(a, { type: "begin_submission", idempotencyWindowMs: 60000 });
+    await change(started, observe(started, "succeeded"));
+    await strict.changeSharedBudget(principal.walletId, budget.budgetId, "revoke", {}, principal);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "100" });
+    const cancelled = await providerTransaction(pool, client => readProviderPaymentInTransaction(client, principal.walletId, b.binding.operationId));
+    assert.equal(cancelled.status, "cancelled");
+    await strict.changeSharedBudget(principal.walletId, budget.budgetId, "revoke", {}, principal);
+    assert.deepEqual(await totals(), { reserved_budget_minor: "0", spent_budget_minor: "100" });
+  });
+});
 
 test("shared budget HTTP controls require exact owner passkey consent and preserve unused grants after substitution", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, store }) => {

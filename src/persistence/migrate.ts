@@ -837,9 +837,13 @@ LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id = id AND
       (mandate.reserved_budget_minor <> COALESCE((SELECT SUM(intent.amount_minor) FROM rail_agent_intents intent
-        WHERE intent.mandate_id = id AND intent.status IN ('pending','approved')), 0) OR
+        WHERE intent.mandate_id = id AND intent.status IN ('pending','approved')), 0)
+        + COALESCE((SELECT sum((payment.binding->>'amountMinor')::bigint) FROM rail_provider_payments payment
+          WHERE payment.mandate_id=id AND payment.authorization_required AND payment.status NOT IN ('succeeded','failed','cancelled')),0) OR
        mandate.spent_budget_minor <> COALESCE((SELECT SUM(intent.amount_minor) FROM rail_agent_intents intent
-        WHERE intent.mandate_id = id AND intent.status = 'executed'), 0))) THEN
+        WHERE intent.mandate_id = id AND intent.status = 'executed'), 0)
+        + COALESCE((SELECT sum((payment.binding->>'amountMinor')::bigint) FROM rail_provider_payments payment
+          WHERE payment.mandate_id=id AND payment.authorization_required AND payment.status='succeeded'),0))) THEN
     RAISE EXCEPTION 'agent_budget_reservation_mismatch' USING ERRCODE = '23514';
   END IF;
 END $$;
@@ -1252,10 +1256,10 @@ CREATE TRIGGER rail_used_authorization_immutable BEFORE UPDATE ON authorizations
 
 ALTER TABLE rail_owner_challenges DROP CONSTRAINT IF EXISTS rail_owner_challenges_operation_check;
 ALTER TABLE rail_owner_challenges ADD CONSTRAINT rail_owner_challenges_operation_check
-  CHECK(operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes','shared_budget'));
+  CHECK(operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes','shared_budget','provider_payment'));
 ALTER TABLE rail_owner_step_up_grants DROP CONSTRAINT IF EXISTS rail_owner_step_up_grants_operation_check;
 ALTER TABLE rail_owner_step_up_grants ADD CONSTRAINT rail_owner_step_up_grants_operation_check
-  CHECK(operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes','shared_budget'));
+  CHECK(operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes','shared_budget','provider_payment'));
 
 CREATE TABLE IF NOT EXISTS rail_shared_budgets (
   budget_id UUID PRIMARY KEY, owner_wallet_id TEXT NOT NULL REFERENCES wallets(wallet_id),
@@ -1451,8 +1455,12 @@ BEGIN
   IF id IS NOT NULL AND EXISTS(SELECT 1 FROM rail_shared_budgets budget WHERE budget.budget_id=id AND
     (budget.reserved_budget_minor<>COALESCE((SELECT sum(intent.amount_minor) FROM rail_agent_intents intent
       JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id WHERE mandate.shared_budget_id=id AND intent.status IN ('pending','approved')),0)
+      + COALESCE((SELECT sum((payment.binding->>'amountMinor')::bigint) FROM rail_provider_payments payment
+        WHERE payment.shared_budget_id=id AND payment.authorization_required AND payment.status NOT IN ('succeeded','failed','cancelled')),0)
     OR budget.spent_budget_minor<>COALESCE((SELECT sum(intent.amount_minor) FROM rail_agent_intents intent
-      JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id WHERE mandate.shared_budget_id=id AND intent.status='executed'),0))) THEN
+      JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id WHERE mandate.shared_budget_id=id AND intent.status='executed'),0)
+      + COALESCE((SELECT sum((payment.binding->>'amountMinor')::bigint) FROM rail_provider_payments payment
+        WHERE payment.shared_budget_id=id AND payment.authorization_required AND payment.status='succeeded'),0))) THEN
     RAISE EXCEPTION 'shared_budget_accounting_mismatch' USING ERRCODE='23514';
   END IF;
   RETURN NULL;
@@ -1461,6 +1469,185 @@ DROP TRIGGER IF EXISTS rail_shared_totals_check ON rail_shared_budgets;
 CREATE CONSTRAINT TRIGGER rail_shared_totals_check AFTER INSERT OR UPDATE ON rail_shared_budgets DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_totals();
 DROP TRIGGER IF EXISTS rail_shared_intent_totals_check ON rail_agent_intents;
 CREATE CONSTRAINT TRIGGER rail_shared_intent_totals_check AFTER INSERT OR UPDATE ON rail_agent_intents DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_totals();
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_mandate_provider_binding
+  ON rail_agent_mandates(mandate_id,agent_id,owner_wallet_id,shared_budget_id);
+CREATE TABLE IF NOT EXISTS rail_provider_payments (
+  operation_id UUID PRIMARY KEY,
+  owner_wallet_id TEXT NOT NULL,
+  agent_id UUID NOT NULL,
+  mandate_id UUID NOT NULL,
+  shared_budget_id UUID NOT NULL,
+  intent_id UUID NOT NULL UNIQUE,
+  binding JSONB NOT NULL,
+  fingerprint TEXT NOT NULL CHECK(fingerprint ~ '^[a-f0-9]{64}$'),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(idempotency_key='rail_provider_v1_' || operation_id::text),
+  status TEXT NOT NULL CHECK(status IN ('reserved','submitting','unknown','processing','requires_owner_action','succeeded','failed','cancelled')),
+  provider_ref TEXT CHECK(provider_ref ~ '^[A-Za-z0-9_.:-]{3,128}$'),
+  first_submission_at_ms BIGINT,
+  retry_window_ends_at_ms BIGINT,
+  updated_at_ms BIGINT NOT NULL CHECK(updated_at_ms BETWEEN 0 AND 8640000000000000),
+  revision INTEGER NOT NULL CHECK(revision>0),
+  attempt_number INTEGER NOT NULL CHECK(attempt_number>=0 AND attempt_number<=revision),
+  last_event TEXT NOT NULL CHECK(last_event IN ('created','begin_submission','retry_submission','submission_uncertain','cancel_before_submission','provider_observed')),
+  authorization_required BOOLEAN NOT NULL DEFAULT FALSE,
+  FOREIGN KEY(mandate_id,agent_id,owner_wallet_id,shared_budget_id)
+    REFERENCES rail_agent_mandates(mandate_id,agent_id,owner_wallet_id,shared_budget_id),
+  CHECK(COALESCE(jsonb_typeof(binding)='object' AND binding->'version'='1'::jsonb
+    AND binding->>'operationId'=operation_id::text AND binding->>'ownerWalletId'=owner_wallet_id
+    AND binding->>'agentId'=agent_id::text AND binding->>'mandateId'=mandate_id::text
+    AND binding->>'sharedBudgetId'=shared_budget_id::text AND binding->>'intentId'=intent_id::text,FALSE)),
+  CHECK(COALESCE((first_submission_at_ms IS NULL AND retry_window_ends_at_ms IS NULL AND attempt_number=0
+      AND status IN ('reserved','cancelled') AND provider_ref IS NULL)
+    OR (first_submission_at_ms BETWEEN 0 AND updated_at_ms AND attempt_number>0
+      AND retry_window_ends_at_ms>first_submission_at_ms
+      AND retry_window_ends_at_ms<=first_submission_at_ms+2592000000
+      AND status<>'reserved'),FALSE))
+);
+ALTER TABLE rail_provider_payments ADD COLUMN IF NOT EXISTS authorization_required BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_provider_payments_owner ON rail_provider_payments(owner_wallet_id,operation_id);
+CREATE INDEX IF NOT EXISTS idx_provider_payments_mandate_totals
+  ON rail_provider_payments(mandate_id,status) WHERE authorization_required;
+CREATE INDEX IF NOT EXISTS idx_provider_payments_shared_totals
+  ON rail_provider_payments(shared_budget_id,status) WHERE authorization_required;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_object_single_operation
+  ON rail_provider_payments((binding->>'provider'),(binding->>'providerAccountRef'),provider_ref) WHERE provider_ref IS NOT NULL;
+CREATE TABLE IF NOT EXISTS rail_provider_payment_history (
+  operation_id UUID NOT NULL REFERENCES rail_provider_payments(operation_id),
+  revision INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  provider_ref TEXT,
+  recorded_at_ms BIGINT NOT NULL,
+  PRIMARY KEY(operation_id,revision)
+);
+CREATE OR REPLACE FUNCTION rail_protect_provider_payment() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
+  IF TG_OP='DELETE' OR TG_TABLE_NAME='rail_provider_payment_history' THEN
+    RAISE EXCEPTION 'provider_payment_history_is_immutable' USING ERRCODE='23514';
+  END IF;
+  IF TG_OP='INSERT' THEN
+    IF NEW.revision<>1 OR NEW.attempt_number<>0 OR NEW.last_event<>'created' OR NEW.status<>'reserved' THEN
+      RAISE EXCEPTION 'provider_payment_initial_state_invalid' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF ROW(NEW.operation_id,NEW.owner_wallet_id,NEW.agent_id,NEW.mandate_id,NEW.shared_budget_id,NEW.intent_id,
+      NEW.binding,NEW.fingerprint,NEW.idempotency_key,NEW.authorization_required)
+    IS DISTINCT FROM ROW(OLD.operation_id,OLD.owner_wallet_id,OLD.agent_id,OLD.mandate_id,OLD.shared_budget_id,OLD.intent_id,
+      OLD.binding,OLD.fingerprint,OLD.idempotency_key,OLD.authorization_required)
+    OR NEW.revision<>OLD.revision+1 OR NEW.updated_at_ms<OLD.updated_at_ms
+    OR (OLD.first_submission_at_ms IS NOT NULL AND ROW(NEW.first_submission_at_ms,NEW.retry_window_ends_at_ms)
+      IS DISTINCT FROM ROW(OLD.first_submission_at_ms,OLD.retry_window_ends_at_ms))
+    OR (OLD.provider_ref IS NOT NULL AND NEW.provider_ref IS DISTINCT FROM OLD.provider_ref)
+    OR (OLD.status IN ('succeeded','failed','cancelled') AND NEW.status IS DISTINCT FROM OLD.status)
+    OR NEW.attempt_number<>OLD.attempt_number+(CASE WHEN NEW.last_event IN ('begin_submission','retry_submission') THEN 1 ELSE 0 END) THEN
+    RAISE EXCEPTION 'provider_payment_binding_or_history_invalid' USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_payment_immutable ON rail_provider_payments;
+CREATE TRIGGER rail_provider_payment_immutable BEFORE INSERT OR UPDATE OR DELETE ON rail_provider_payments
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_payment();
+DROP TRIGGER IF EXISTS rail_provider_history_immutable ON rail_provider_payment_history;
+CREATE TRIGGER rail_provider_history_immutable BEFORE UPDATE OR DELETE ON rail_provider_payment_history
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_payment();
+CREATE OR REPLACE FUNCTION rail_journal_provider_payment() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
+  INSERT INTO rail_provider_payment_history(operation_id,revision,status,event_type,attempt_number,provider_ref,recorded_at_ms)
+    VALUES(NEW.operation_id,NEW.revision,NEW.status,NEW.last_event,NEW.attempt_number,NEW.provider_ref,NEW.updated_at_ms);
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_payment_journal ON rail_provider_payments;
+CREATE TRIGGER rail_provider_payment_journal AFTER INSERT OR UPDATE ON rail_provider_payments
+  FOR EACH ROW EXECUTE FUNCTION rail_journal_provider_payment();
+
+CREATE TABLE IF NOT EXISTS rail_provider_payment_consents (
+  operation_id UUID PRIMARY KEY REFERENCES rail_provider_payments(operation_id),
+  merchant_wallet_id TEXT NOT NULL REFERENCES wallets(wallet_id),
+  challenge_id UUID NOT NULL UNIQUE REFERENCES rail_owner_step_up_grants(challenge_id),
+  canonical_payload TEXT NOT NULL,
+  operation_fingerprint TEXT NOT NULL CHECK(operation_fingerprint=encode(sha256(convert_to(canonical_payload,'UTF8')),'hex'))
+);
+CREATE OR REPLACE FUNCTION rail_protect_provider_consent() RETURNS TRIGGER
+LANGUAGE plpgsql AS $$ BEGIN
+  RAISE EXCEPTION 'provider_consent_is_immutable' USING ERRCODE='23514';
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_consent_immutable ON rail_provider_payment_consents;
+CREATE TRIGGER rail_provider_consent_immutable BEFORE UPDATE OR DELETE ON rail_provider_payment_consents
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_consent();
+CREATE OR REPLACE FUNCTION rail_check_provider_consent() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE id UUID; payment rail_provider_payments; consent rail_provider_payment_consents;
+BEGIN
+  IF TG_TABLE_NAME='rail_agent_intents' THEN
+    IF EXISTS(SELECT 1 FROM rail_provider_payments WHERE intent_id=NEW.intent_id AND authorization_required) THEN
+      RAISE EXCEPTION 'provider_intent_namespace_conflict' USING ERRCODE='23514';
+    END IF;
+    RETURN NULL;
+  END IF;
+  id:=NEW.operation_id;
+  SELECT * INTO payment FROM rail_provider_payments WHERE operation_id=id;
+  SELECT * INTO consent FROM rail_provider_payment_consents WHERE operation_id=id;
+  IF NOT payment.authorization_required THEN
+    IF consent.operation_id IS NOT NULL THEN RAISE EXCEPTION 'provider_consent_requires_new_operation' USING ERRCODE='23514'; END IF;
+    RETURN NULL;
+  END IF;
+  IF consent.operation_id IS NULL OR consent.canonical_payload::jsonb IS DISTINCT FROM
+      jsonb_build_array('rail:owner-operation:v1','provider_payment',payment.fingerprint,consent.merchant_wallet_id)
+    OR EXISTS(SELECT 1 FROM rail_agent_intents WHERE intent_id=payment.intent_id)
+    OR NOT EXISTS(SELECT 1 FROM rail_owner_step_up_grants grant_record JOIN users owner ON owner.user_id=grant_record.user_id
+      WHERE grant_record.challenge_id=consent.challenge_id AND owner.wallet_id=payment.owner_wallet_id
+        AND grant_record.operation='provider_payment' AND grant_record.operation_fingerprint=consent.operation_fingerprint
+        AND grant_record.consumed_at>=grant_record.created_at AND grant_record.consumed_at<grant_record.expires_at)
+    OR NOT EXISTS(SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id=payment.mandate_id
+      AND mandate.currency=payment.binding->>'currency' AND (payment.binding->>'amountMinor')::bigint<=mandate.per_payment_limit_minor
+      AND consent.merchant_wallet_id=ANY(mandate.allowed_receiver_wallet_ids)) THEN
+    RAISE EXCEPTION 'provider_owner_consent_binding_invalid' USING ERRCODE='23514';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_consent_check ON rail_provider_payments;
+CREATE CONSTRAINT TRIGGER rail_provider_consent_check AFTER INSERT OR UPDATE ON rail_provider_payments
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_provider_consent();
+DROP TRIGGER IF EXISTS rail_provider_consent_record_check ON rail_provider_payment_consents;
+CREATE CONSTRAINT TRIGGER rail_provider_consent_record_check AFTER INSERT ON rail_provider_payment_consents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_provider_consent();
+DROP TRIGGER IF EXISTS rail_provider_internal_namespace ON rail_agent_intents;
+CREATE CONSTRAINT TRIGGER rail_provider_internal_namespace AFTER INSERT ON rail_agent_intents
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_provider_consent();
+
+CREATE OR REPLACE FUNCTION rail_account_provider_budget() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE amount BIGINT; old_held BIGINT:=0; old_spent BIGINT:=0; new_held BIGINT:=0; new_spent BIGINT:=0;
+BEGIN
+  IF NOT NEW.authorization_required THEN RETURN NULL; END IF;
+  amount:=(NEW.binding->>'amountMinor')::bigint;
+  IF TG_OP='UPDATE' THEN
+    IF OLD.status='succeeded' THEN old_spent:=amount;
+    ELSIF OLD.status NOT IN ('failed','cancelled') THEN old_held:=amount; END IF;
+  END IF;
+  IF NEW.status='succeeded' THEN new_spent:=amount;
+  ELSIF NEW.status NOT IN ('failed','cancelled') THEN new_held:=amount; END IF;
+  IF new_held=old_held AND new_spent=old_spent THEN RETURN NULL; END IF;
+  UPDATE rail_agent_mandates SET reserved_budget_minor=reserved_budget_minor+new_held-old_held,
+    spent_budget_minor=spent_budget_minor+new_spent-old_spent
+    WHERE mandate_id=NEW.mandate_id AND currency=NEW.binding->>'currency'
+      AND reserved_budget_minor+new_held-old_held>=0 AND spent_budget_minor+new_spent-old_spent>=0
+      AND reserved_budget_minor+new_held-old_held+spent_budget_minor+new_spent-old_spent<=total_budget_minor;
+  IF NOT FOUND THEN RAISE EXCEPTION 'provider_mandate_budget_unavailable' USING ERRCODE='23514'; END IF;
+  UPDATE rail_shared_budgets SET reserved_budget_minor=reserved_budget_minor+new_held-old_held,
+    spent_budget_minor=spent_budget_minor+new_spent-old_spent
+    WHERE budget_id=NEW.shared_budget_id AND currency=NEW.binding->>'currency'
+      AND reserved_budget_minor+new_held-old_held>=0 AND spent_budget_minor+new_spent-old_spent>=0
+      AND reserved_budget_minor+new_held-old_held+spent_budget_minor+new_spent-old_spent<=total_budget_minor;
+  IF NOT FOUND THEN RAISE EXCEPTION 'provider_shared_budget_unavailable' USING ERRCODE='23514'; END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_budget_accounting ON rail_provider_payments;
+CREATE TRIGGER rail_provider_budget_accounting AFTER INSERT OR UPDATE ON rail_provider_payments
+  FOR EACH ROW EXECUTE FUNCTION rail_account_provider_budget();
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {
@@ -1505,6 +1692,8 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
   `);
     await client.query(`
     ALTER TABLE outbox
+      ADD COLUMN IF NOT EXISTS work_kind TEXT NOT NULL DEFAULT 'event'
+        CHECK (work_kind IN ('event', 'provider_payment')),
       ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (delivery_status IN ('pending', 'processing', 'delivered', 'dead_letter')),
       ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
@@ -1513,6 +1702,19 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
       ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS last_delivery_error TEXT;
+    CREATE OR REPLACE FUNCTION rail_protect_outbox_work_kind() RETURNS TRIGGER
+    LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.work_kind IS DISTINCT FROM OLD.work_kind THEN
+        RAISE EXCEPTION 'outbox_work_kind_is_immutable' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$;
+    DROP TRIGGER IF EXISTS rail_outbox_work_kind_immutable ON outbox;
+    CREATE TRIGGER rail_outbox_work_kind_immutable BEFORE UPDATE ON outbox
+      FOR EACH ROW EXECUTE FUNCTION rail_protect_outbox_work_kind();
+    CREATE INDEX IF NOT EXISTS idx_outbox_event_delivery
+      ON outbox (next_attempt_at, id)
+      WHERE work_kind = 'event' AND delivery_status IN ('pending', 'processing');
     CREATE INDEX IF NOT EXISTS idx_outbox_delivery
       ON outbox (next_attempt_at, id) WHERE delivery_status IN ('pending', 'processing');
     CREATE INDEX IF NOT EXISTS idx_outbox_sender_history

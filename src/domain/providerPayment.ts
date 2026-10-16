@@ -79,6 +79,16 @@ export function providerPaymentFingerprint(value: ProviderPaymentBinding): strin
   return createHash("sha256").update(JSON.stringify(["rail:provider-payment:v1", ...FIELDS.map(field => binding[field])])).digest("hex");
 }
 
+/** Additional external-payment consent; an internal-intent approval is never interchangeable. */
+export function providerPaymentConsentPayload(value: ProviderPaymentBinding, merchantWalletId: string): string {
+  if (!reference(merchantWalletId) || merchantWalletId === value.ownerWalletId) invalid();
+  return JSON.stringify(["rail:owner-operation:v1", "provider_payment", providerPaymentFingerprint(value), merchantWalletId]);
+}
+
+export function providerPaymentConsentFingerprint(value: ProviderPaymentBinding, merchantWalletId: string): string {
+  return createHash("sha256").update(providerPaymentConsentPayload(value, merchantWalletId)).digest("hex");
+}
+
 export function createProviderPayment(value: ProviderPaymentBinding, nowMs: number): ProviderPayment {
   const binding = parseProviderPaymentBinding(value);
   if (!time(nowMs) || Date.parse(binding.authorizationExpiresAt) <= nowMs) throw new Error("PROVIDER_AUTHORIZATION_EXPIRED");

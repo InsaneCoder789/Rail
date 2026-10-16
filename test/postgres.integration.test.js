@@ -942,6 +942,58 @@ test("terminating the transaction connection before commit leaves no partial pay
   });
 });
 
+test("outbox work-kind migration preserves legacy events and rejects lane reassignment", { skip: !databaseUrl }, async () => {
+  const schema = `ci_outbox_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 2, options: `-c search_path=${schema}` });
+  try {
+    await pool.query(`CREATE TABLE outbox (id BIGSERIAL PRIMARY KEY, type TEXT NOT NULL,
+      payload JSONB NOT NULL, occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`INSERT INTO outbox(type,payload) VALUES('legacy.event','{"walletId":"legacy_owner"}')`);
+    await ensureOutboxSchema(pool);
+    await pool.query("UPDATE outbox SET delivery_status='delivered', delivery_attempts=2, delivered_at=NOW()");
+    const before = (await pool.query("SELECT * FROM outbox")).rows;
+    await ensureOutboxSchema(pool);
+    assert.deepEqual((await pool.query("SELECT * FROM outbox")).rows, before);
+    assert.equal(before[0].work_kind, "event");
+    await assert.rejects(pool.query("UPDATE outbox SET work_kind='provider_payment'"), { code: "23514" });
+    await assert.rejects(pool.query("INSERT INTO outbox(type,payload,work_kind) VALUES('invalid','{}','other')"), { code: "23514" });
+    await assert.rejects(pool.query("INSERT INTO outbox(type,payload,work_kind) VALUES('invalid','{}',NULL)"), { code: "23502" });
+  } finally {
+    await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end();
+  }
+});
+
+test("event relays never claim, dead-letter, publish or expose provider payment jobs", { skip: !databaseUrl }, async () => {
+  const schema = `ci_outbox_${crypto.randomUUID().replaceAll("-", "")}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: databaseUrl, max: 4, options: `-c search_path=${schema}` });
+  try {
+    await ensureOutboxSchema(pool);
+    const payload = { walletId: "owner_fixture", operationId: crypto.randomUUID() };
+    await pool.query(`INSERT INTO outbox(type,payload,work_kind,delivery_status,delivery_attempts,lease_id,lease_expires_at)
+      VALUES ('provider.pending',$1,'provider_payment','pending',0,NULL,NULL),
+             ('provider.recoverable',$1,'provider_payment','processing',1,$2,NOW()-INTERVAL '1 second'),
+             ('provider.exhausted',$1,'provider_payment','processing',3,$3,NOW()-INTERVAL '1 second')`,
+      [JSON.stringify(payload), crypto.randomUUID(), crypto.randomUUID()]);
+    const snapshot = (await pool.query("SELECT * FROM outbox WHERE work_kind='provider_payment' ORDER BY id")).rows;
+    const store = createEventStore(() => pool);
+    await store.insertOutboxEvent({ type: "public.event", payload: { walletId: "owner_fixture" } });
+    const ids = [];
+    const workers = await Promise.all([1, 2].map(() => dispatchOutboxBatch(pool, async event => { ids.push(event.type); },
+      { batchSize: 10, maxAttempts: 3, leaseMs: 1000, deliveryTimeoutMs: 500 })));
+    assert.deepEqual(ids, ["public.event"]);
+    assert.equal(workers.reduce((sum, result) => sum + result.delivered, 0), 1);
+    assert.deepEqual((await pool.query("SELECT * FROM outbox WHERE work_kind='provider_payment' ORDER BY id")).rows, snapshot);
+    assert.deepEqual((await store.listVisibleEvents({ walletId: "owner_fixture" })).map(event => event.type), ["public.event"]);
+    await assert.rejects(pool.query("UPDATE outbox SET work_kind='event' WHERE work_kind='provider_payment'"), { code: "23514" });
+  } finally {
+    await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end();
+  }
+});
+
 test("outbox leases exclude parallel workers and failed deliveries retry with a stable ID", { skip: !databaseUrl }, async () => {
   const schema = `ci_outbox_${crypto.randomUUID().replaceAll("-", "")}`;
   const admin = new Pool({ connectionString: databaseUrl, max: 1 });

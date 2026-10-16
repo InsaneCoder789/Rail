@@ -13,7 +13,7 @@ import { generateToken } from "../auth/jwt.js";
 import { withdrawOwnerAgentAuthority } from "./agentAuthority.js";
 import { withdrawWalletSpendingAuthority } from "../stages/authorizationStage.js";
 
-const OPERATIONS = ["agent_credential", "agent_mandate", "agent_approval", "passkey_enroll", "passkey_revoke", "recovery_codes", "shared_budget"] as const;
+const OPERATIONS = ["agent_credential", "agent_mandate", "agent_approval", "passkey_enroll", "passkey_revoke", "recovery_codes", "shared_budget", "provider_payment"] as const;
 function assertPasskeyPublicKey(bytes: Uint8Array): void {
   const decoded: unknown = decodeCredentialPublicKey(new Uint8Array(bytes));
   if (!(decoded instanceof Map)) throw new Error("invalid_passkey_public_key");

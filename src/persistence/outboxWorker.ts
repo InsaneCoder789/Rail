@@ -16,7 +16,7 @@ export interface DeliveryPolicy {
 
 const defaults: DeliveryPolicy = { batchSize: 50, leaseMs: 30_000, maxAttempts: 5, retryDelayMs: 1000, deliveryTimeoutMs: 10_000 };
 
-/** At-least-once delivery. Receivers must deduplicate deliveryId, including after a worker crash. */
+/** Event delivery only, never payment submission. Receivers must deduplicate deliveryId after a crash. */
 export async function dispatchOutboxBatch(
   pool: Pool,
   deliver: (event: DurableOutboxEvent, signal: AbortSignal) => Promise<void>,
@@ -31,13 +31,13 @@ export async function dispatchOutboxBatch(
     await pool.query(
       `UPDATE outbox SET delivery_status = 'dead_letter', lease_id = NULL, lease_expires_at = NULL,
          last_delivery_error = 'lease_expired_at_attempt_limit'
-       WHERE delivery_status = 'processing' AND lease_expires_at <= NOW() AND delivery_attempts >= $1`,
+       WHERE work_kind = 'event' AND delivery_status = 'processing' AND lease_expires_at <= NOW() AND delivery_attempts >= $1`,
       [policy.maxAttempts]);
     const leaseId = randomUUID();
     const claimed = await pool.query(
       `WITH candidate AS (
          SELECT id FROM outbox
-         WHERE delivery_attempts < $1 AND
+         WHERE work_kind = 'event' AND delivery_attempts < $1 AND
            ((delivery_status = 'pending' AND next_attempt_at <= NOW()) OR
             (delivery_status = 'processing' AND lease_expires_at <= NOW()))
          ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1
@@ -61,7 +61,7 @@ export async function dispatchOutboxBatch(
       const acknowledged = await pool.query(
         `UPDATE outbox SET delivery_status = 'delivered', delivered_at = NOW(),
            lease_id = NULL, lease_expires_at = NULL, last_delivery_error = NULL
-         WHERE id = $1 AND lease_id = $2::uuid AND delivery_status = 'processing'`, [row.id, leaseId]);
+         WHERE id = $1 AND work_kind = 'event' AND lease_id = $2::uuid AND delivery_status = 'processing'`, [row.id, leaseId]);
       if (acknowledged.rowCount === 1) stats.delivered++;
       else stats.lostLease++;
     } catch {
@@ -69,7 +69,7 @@ export async function dispatchOutboxBatch(
         `UPDATE outbox SET delivery_status = CASE WHEN delivery_attempts >= $3 THEN 'dead_letter' ELSE 'pending' END,
            next_attempt_at = NOW() + ($4 * INTERVAL '1 millisecond'), lease_id = NULL,
            lease_expires_at = NULL, last_delivery_error = 'delivery_failed'
-         WHERE id = $1 AND lease_id = $2::uuid AND delivery_status = 'processing'`,
+         WHERE id = $1 AND work_kind = 'event' AND lease_id = $2::uuid AND delivery_status = 'processing'`,
         [row.id, leaseId, policy.maxAttempts, Math.min(60_000, policy.retryDelayMs * 2 ** Math.min(row.delivery_attempts - 1, 16))]);
       if (failed.rowCount === 1) stats.failed++;
       else stats.lostLease++;

@@ -38,6 +38,89 @@ Use it in the following ways:
 
 ## Latest Status
 
+### C2 Exact External Consent And Allowance Holds, 17 October 2026
+
+Added a trusted-coordinator transaction that requires a fresh `provider_payment`
+passkey grant for the exact provider terms and merchant identity. Existing internal
+approval grants cannot be reused. The new immutable consent row, journal and real
+mandate/shared-budget allowance hold commit together. Internal and external work
+share the same caps; retries cannot consume a second hold.
+
+Submission rechecks live authority. Recovery, revocation and expiry release only
+definitely unsubmitted work; unknown external liabilities remain held and can be
+reconciled even after authority withdrawal. Confirmed outcomes update allowance
+once, without fabricating an internal wallet transfer or settlement ledger entry.
+New tests cover exact consent, shared contention, withdrawal, recovery, rollback,
+deferred commit failure and expiry. Savepoints also reject autocommit and restore
+consent if a surrounding transaction catches a policy error and continues. Full
+local acceptance passed **436 backend tests and three Chromium journeys, zero
+failures/skips**, plus dependency audit zero known vulnerabilities. A subsequent
+selected regression verified repeat migration with admitted holds and direct
+counter-tampering rejection. Node 20.19.6/PostgreSQL 18.3; all disposable databases
+were removed. The new consent assertions use generated
+authenticators against real WebAuthn verification, not a new external-payment UI.
+This C2 batch includes the GitHub workflow coverage. Local acceptance is not a
+remote CI pass; check the Actions result for the published commit. Local log:
+`deliverables/portfolio-maintenance/rail-c2-consent-1792181097993.log`.
+
+This remains server-only: trusted provider/instrument/merchant mapping, agent-proof
+admission, durable job creation/leases, callback verification, actual worker-crash
+recovery, protected external execution receipts and real provider sandbox acceptance
+remain open. Every external operation
+currently requires explicit per-payment owner approval, even under a budgeted
+mandate. No real-money or autonomous external execution endpoint is enabled.
+Earlier local/remote test counts below describe their respective checkpoints.
+
+### C2 Durable Operation Journal In Progress
+
+Added server-only PostgreSQL journal primitives for immutable provider-payment
+bindings, stable idempotency identities, serialized state changes and append-only
+transition/attempt history. Operation and history changes commit or roll back
+together. A duplicate provider object cannot resolve two operations in the same
+provider account. Post-lock database-time checks prevent expired admission.
+
+All 22 focused lifecycle/journal tests pass, including twelve new PostgreSQL
+regressions. Full local acceptance passed **422 backend tests and all three
+Chromium journeys, zero failures/skips**, on Node 20.19.6/PostgreSQL 18.3.
+Dependency audit found zero known vulnerabilities; the disposable database was
+removed. The GitHub workflow now includes this coverage in its existing
+provider/client step; these changes remain uncommitted and are not a remote CI pass.
+
+The focused server-only component is
+[`src/persistence/providerPayments.ts`](../src/persistence/providerPayments.ts);
+[`test/providerPayments.integration.test.js`](../test/providerPayments.integration.test.js)
+covers durable replay, concurrency, rollback, ownership, immutable history,
+provider-object uniqueness and post-lock expiry. No new queue service or SDK is added.
+
+This is not yet external payment execution: consented external intents, actual
+budget-hold composition, durable workers/leases, verified provider observations,
+process crash recovery and real sandbox acceptance remain required. No agent HTTP
+route, live provider call or automatic account creation is introduced. The journal
+does not reinterpret internal wallet authorizations as external spending consent.
+
+### C2 Queue Isolation In Progress, 16 October 2026
+
+Rail-only C0-C3 delivery has resumed. The published baseline `22497bd` passed
+GitHub Actions on both Node 22 and Node 24:
+[verified run](https://github.com/InsaneCoder789/Rail/actions/runs/38921777435).
+This verifies the published authentication, shared-budget and internal demo work,
+not external settlement or production certification.
+
+The next C2 increment separates notification events from future provider-payment
+jobs in the existing outbox. Job categories are database-constrained and immutable;
+notification workers cannot claim, acknowledge or dead-letter payment jobs, and
+customer event history cannot expose them. Existing notification rows retain their
+delivery state through migration. Two new PostgreSQL regressions cover these
+boundaries. `npm test` and all three native Chromium journeys passed locally on
+Node 20.19.6/PostgreSQL 18.3, with no failures/skips; dependency audit found zero
+known vulnerabilities and the disposable database was removed. These new changes
+remain uncommitted/unpublished, so the remote pass above applies only to the
+published baseline. No real provider adapter, payment producer or sandbox account is added.
+See [provider lifecycle and queue boundaries](PROVIDER_PAYMENTS.md).
+
+The earlier checkpoints below describe evidence available at their recorded stage;
+their pre-publication statements do not override this verified publication record.
+
 ### Portfolio Review And Simulator TTL Correction, 16 October 2026
 
 KYLR compatibility increment: authenticated `/auth/login` now also returns the

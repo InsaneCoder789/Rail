@@ -14,6 +14,7 @@ import { agentKeyThumbprint, parseAgentPublicKey, type AgentPublicKey } from "..
 import { dispatchAgentAdmission, type AgentAdmission } from "./agentProofs.js";
 import { isBudgetId, mapSharedBudget, parseSharedBudgetInput, requireSharedBudget, sharedBudgetOperationFingerprint,
   sharedBudgetOperationPayload, type SharedBudgetAction } from "./sharedBudgets.js";
+import { cancelUnsubmittedProviderPayments } from "./providerPayments.js";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -151,6 +152,7 @@ export async function withdrawOwnerAgentAuthority(client: PoolClient, owner: str
   const agents = await client.query("SELECT agent_id FROM rail_agents WHERE owner_wallet_id=$1 ORDER BY agent_id FOR UPDATE", [owner]);
   const ids = agents.rows.map(row => String(row.agent_id));
   if (!ids.length) return 0;
+  await cancelUnsubmittedProviderPayments(client, { agentIds: ids });
   const released = await client.query(`UPDATE rail_agent_intents SET status='rejected',terminal_reason='agent_revoked'
     WHERE agent_id=ANY($1::uuid[]) AND status IN ('pending','approved') RETURNING mandate_id,amount_minor`, [ids]);
   const totals = new Map<string, bigint>();
@@ -540,6 +542,7 @@ export class AgentAuthorityStore {
   }
 
   private async releaseIntents(client: PoolClient, agentId: string, status: "expired" | "rejected", reason: string, mandateId?: string, budgetId?: string) {
+    await cancelUnsubmittedProviderPayments(client, { agentIds: [agentId], mandateId, budgetId, onlyExpired: status === "expired" });
     const released = await client.query(`UPDATE rail_agent_intents intent SET status = $2, terminal_reason = $3
       WHERE agent_id = $1 AND status IN ('pending','approved') AND ($4::uuid IS NULL OR mandate_id = $4)
         AND ($5::uuid IS NULL OR EXISTS(SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id=intent.mandate_id AND mandate.shared_budget_id=$5))

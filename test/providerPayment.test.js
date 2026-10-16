@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { advanceProviderPayment, createProviderPayment, parseProviderPaymentBinding,
-  providerBudgetDisposition, providerPaymentFingerprint } from "../dist/domain/providerPayment.js";
+  providerBudgetDisposition, providerPaymentFingerprint, providerPaymentConsentFingerprint,
+  providerPaymentConsentPayload } from "../dist/domain/providerPayment.js";
 
 const now = Date.parse("2026-10-15T12:00:00.000Z");
 function binding() {
@@ -19,6 +20,15 @@ function observation(payment, status, changes = {}) {
     providerAccountRef: payment.binding.providerAccountRef, providerRef: "payment_fixture", amountMinor: payment.binding.amountMinor,
     currency: payment.binding.currency, status, final: ["succeeded", "failed", "cancelled"].includes(status), ...changes };
 }
+
+test("external consent binds all provider terms and a distinct recipient without reusing internal approval", () => {
+  const terms = binding(), digest = providerPaymentConsentFingerprint(terms, "merchant_wallet");
+  assert.deepEqual(JSON.parse(providerPaymentConsentPayload(terms, "merchant_wallet")),
+    ["rail:owner-operation:v1", "provider_payment", providerPaymentFingerprint(terms), "merchant_wallet"]);
+  assert.notEqual(digest, providerPaymentConsentFingerprint({ ...terms, instrumentRef: "other_instrument" }, "merchant_wallet"));
+  assert.notEqual(digest, providerPaymentConsentFingerprint(terms, "other_merchant_wallet"));
+  assert.throws(() => providerPaymentConsentFingerprint(terms, terms.ownerWalletId), /INVALID_PROVIDER_PAYMENT_BINDING/);
+});
 
 test("provider payment binding snapshots exact owner, instrument, merchant and financial terms", () => {
   const input = binding(), value = parseProviderPaymentBinding(input), fingerprint = providerPaymentFingerprint(value);

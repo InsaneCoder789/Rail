@@ -36,7 +36,7 @@ export function createEventStore(getPool: () => Pool | null): EventStore {
       }
       const result = await requirePool().query(`
         SELECT id::text, type, payload, occurred_at FROM outbox
-        WHERE type <> 'system.error'
+        WHERE work_kind = 'event' AND type <> 'system.error'
           AND (payload->>'senderWalletId' = $1 OR payload->>'receiverWalletId' = $1 OR payload->>'walletId' = $1)
           AND ($3::bigint IS NULL OR id < $3::bigint)
         ORDER BY id DESC LIMIT $2`, [viewer.walletId, limit, before ?? null]);
