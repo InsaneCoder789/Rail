@@ -3,7 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { Pool } from "pg";
 import { verifyToken, InvalidTokenError } from "../auth/jwt.js";
 import { RequestError, json, normalizeHeaderValue } from "./http.js";
-import type { AuthResolver, OwnerPrincipal } from "./types.js";
+import type { AuthResolver, OwnerPrincipal, WalletAuthentication } from "./types.js";
 
 function secureEquals(a: string, b: string): boolean {
   const aBuf = Buffer.from(a, "utf8");
@@ -37,7 +37,8 @@ function resolveBearerToken(req: http.IncomingMessage): string | undefined {
 async function getWalletFromApiKey(pool: Pool, apiKey: string): Promise<string> {
   const apiKeyHash = createHash("sha256").update(apiKey, "utf8").digest("hex");
   const res = await pool.query(
-    `SELECT wallet_id FROM api_keys WHERE api_key_hash = $1`,
+    `SELECT wallet_id FROM api_keys WHERE api_key_hash = $1 AND revoked_at IS NULL
+      AND NOT EXISTS(SELECT 1 FROM users WHERE users.wallet_id=api_keys.wallet_id AND owner_recovery_pending)`,
     [apiKeyHash],
   );
 
@@ -48,15 +49,17 @@ async function getWalletFromApiKey(pool: Pool, apiKey: string): Promise<string> 
   return res.rows[0].wallet_id as string;
 }
 
-async function getWalletFromUser(pool: Pool, userId: string, authVersion: number): Promise<string> {
+async function getWalletFromUser(pool: Pool, userId: string, authVersion: number, financial = false): Promise<string> {
   const res = await pool.query(
-    `SELECT wallet_id FROM users WHERE user_id = $1 AND auth_version = $2`,
+    `SELECT wallet_id,owner_recovery_pending FROM users WHERE user_id = $1 AND auth_version = $2`,
     [userId, authVersion],
   );
 
   if (res.rowCount === 0) {
     throw new RequestError(401, "invalid_credentials", "invalid credentials");
   }
+
+  if (financial && res.rows[0].owner_recovery_pending) throw new RequestError(403, "recovery_enrollment_required", "complete recovery enrollment first");
 
   return res.rows[0].wallet_id as string;
 }
@@ -74,33 +77,33 @@ export function createAuthResolver(args: {
     try {
       const decoded = verifyToken(bearer);
       const walletId = await getWalletFromUser(pool, decoded.userId, decoded.authVersion);
-      return { walletId, userId: decoded.userId, authVersion: decoded.authVersion, method: "owner_jwt" };
+      return { walletId, userId: decoded.userId, authVersion: decoded.authVersion, sessionFingerprint: createHash("sha256").update(bearer).digest("hex"), method: "owner_jwt" };
     } catch (err) {
       if (err instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials");
       throw err;
     }
   };
   const resolveOwnerWallet = async (req: http.IncomingMessage): Promise<string> => (await resolveOwnerPrincipal(req)).walletId;
+  const resolveFinancialPrincipal = async (req: http.IncomingMessage): Promise<WalletAuthentication> => {
+    const pool = args.getPool();
+    if (!pool) throw new Error("DB_NOT_INITIALIZED");
+    const bearer = resolveBearerToken(req);
+    if (bearer) {
+      try {
+        const decoded = verifyToken(bearer), walletId = await getWalletFromUser(pool, decoded.userId, decoded.authVersion, true);
+        return { walletId, method: "owner_jwt", ...decoded };
+      } catch (error) { if (error instanceof InvalidTokenError) throw new RequestError(401, "invalid_credentials", "invalid credentials"); throw error; }
+    }
+    const apiKey = resolveApiKeyHeader(req);
+    if (apiKey) return { walletId: await getWalletFromApiKey(pool, apiKey), method: "wallet_api_key", apiKeyHash: createHash("sha256").update(apiKey).digest("hex") };
+    throw new RequestError(401, "unauthorized", "missing auth");
+  };
   return {
+    resolveFinancialPrincipal,
     resolveOwnerPrincipal,
     resolveOwnerWallet,
     async resolveAuthenticatedWallet(req) {
-      const pool = args.getPool();
-      if (!pool) {
-        throw new Error("DB_NOT_INITIALIZED");
-      }
-
-      const bearer = resolveBearerToken(req);
-      if (bearer) {
-        return resolveOwnerWallet(req);
-      }
-
-      const apiKey = resolveApiKeyHeader(req);
-      if (apiKey) {
-        return getWalletFromApiKey(pool, apiKey);
-      }
-
-      throw new RequestError(401, "unauthorized", "missing auth");
+      return (await resolveFinancialPrincipal(req)).walletId;
     },
 
     requireApiKey(req, res, scope) {

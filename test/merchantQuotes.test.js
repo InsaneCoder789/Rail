@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { createPublicKey, generateKeyPairSync, sign } from "node:crypto";
 import { MerchantQuoteRegistry, merchantQuoteBytes, parseMerchantQuoteProof, verifyMerchantAttestation } from "../dist/crypto/merchantQuotes.js";
 
 const pair = generateKeyPairSync("ed25519");
@@ -10,6 +10,16 @@ const checkout = { version: 1, merchantWalletId: "merchant_wallet", quoteId: "qu
   subtotalMinor: 90, feeMinor: 10, totalMinor: 100, currency: "INR", expiresAt: "2026-12-01T00:00:00.000Z",
   fundingSource: { type: "internal_wallet", walletId: "owner_wallet" } };
 const proof = { keyId: entry.keyId, signature: sign(null, merchantQuoteBytes(checkout, entry.keyId), pair.privateKey).toString("base64") };
+
+test("merchant trust rejects a degenerate Ed25519 key instead of accepting forged quotes", () => {
+  const bytes = Buffer.alloc(32); bytes[0] = 1;
+  const key = createPublicKey({ key: { kty: "OKP", crv: "Ed25519", x: bytes.toString("base64url") }, format: "jwk" });
+  const invalid = { ...entry, publicKey: key.export({ type: "spki", format: "der" }).toString("base64") };
+  assert.throws(() => new MerchantQuoteRegistry(JSON.stringify([invalid])));
+  const signature = Buffer.alloc(64); signature[0] = 1;
+  assert.throws(() => verifyMerchantAttestation(checkout, { version: 1, keyId: invalid.keyId, publicKey: invalid.publicKey,
+    signature: signature.toString("base64"), keyFingerprint: "a".repeat(64) }), /merchant_quote_attestation_invalid/);
+});
 
 test("merchant signature binds every checkout field, audience and signing key ID", () => {
   const registry = new MerchantQuoteRegistry(JSON.stringify([entry]));

@@ -21,7 +21,15 @@ Human transfers retain their existing authenticated authorization path. Agent tr
 
 Agent deployment must exclude owner sessions, operator credentials, database credentials and server crypto keys. A token identifies authority, not whether the caller is human or a language model. If an agent steals an owner's JWT, Rail sees owner authority; credential isolation and stronger owner authentication are essential, separate controls.
 
+[Owner passkey ceremonies and exact-operation grants](./OWNER_PASSKEYS.md) protect execution credential issuance, spending mandates, exact approvals, factor removal and recovery-code rotation. A JWT alone cannot perform these mutations. Recovery requires password plus an unused offline code, replaces the password, revokes sessions/factors/agent authority and permits only scoped new-key enrollment. Money/history is preserved. Emergency revocation remains available without a grant. Browser/hosted/custody/notification acceptance is unfinished; ordinary human transfers and compatibility library fixtures are not universally step-up-protected.
+
 ## Acknowledgement Has Two Explicit Modes
+
+[Shared budgets](./SHARED_BUDGETS.md) optionally coordinate allowance across multiple
+agents while retaining each agent's narrower mandate. Creation, limit changes and
+new members require exact passkey consent; emergency withdrawal remains grant-free.
+Pending approval already holds shared allowance. Internal lifecycle transitions
+update both policy levels atomically. This is not a funded wallet or provider settlement.
 
 1. `approval_required`: the owner approves the exact immutable request fingerprint. Changed recipients, amounts or currencies cannot reuse that approval.
 2. `budgeted`: the owner gives advance permission for fixed recipients, currency, per-payment amount, total budget and expiry. The agent does not need another owner click for each in-policy payment. Users must understand this when creating the mandate.

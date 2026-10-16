@@ -4,7 +4,7 @@ import type { PaymentTransaction } from "../../domain/types.js";
 import { processSyncBatch } from "../../rail/syncBatch.js";
 import { createAuthorization, getAuthorizationById } from "../../stages/authorizationStage.js";
 import { RequestError, applyRateLimit, applyIdentityRateLimit, json, readAndParseJson, requireJsonContentType, toErrorResponse } from "../http.js";
-import type { ServerContext } from "../types.js";
+import type { ServerContext, WalletAuthentication } from "../types.js";
 import { readBehaviourObservation } from "../../risk/behaviourRisk.js";
 import {
   isCurrency,
@@ -107,6 +107,7 @@ export async function handlePaymentRoutes(
   const quota = readScope ? [`${readScope}_read`, 30, 60_000] as const
     : req.method === "POST" ? writeLimits[url.pathname] : undefined;
   let authenticatedWallet: string | undefined;
+  let authentication: WalletAuthentication | undefined;
   if (quota) {
     const [scope, limit, windowMs] = quota;
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: `${scope}_source`,
@@ -115,7 +116,10 @@ export async function handlePaymentRoutes(
     if (privilegedScope) {
       if (!context.authResolver.requireApiKey(req, res, privilegedScope)) return true;
     } else {
-      authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
+      if (context.authResolver.resolveFinancialPrincipal) {
+        authentication = await context.authResolver.resolveFinancialPrincipal(req);
+        authenticatedWallet = authentication.walletId;
+      } else authenticatedWallet = await context.authResolver.resolveAuthenticatedWallet(req);
     }
     // This runtime has one configured privileged issuer, not a principal chosen by the request body.
     await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope,
@@ -198,7 +202,7 @@ export async function handlePaymentRoutes(
       receiverWalletId: body.receiverWalletId as string,
       amountMinor: body.amountMinor as number,
       currency: body.currency as string,
-    }, context.pool);
+    }, context.pool, authentication);
 
     json(res, 200, { authorization });
     return true;
@@ -279,7 +283,7 @@ export async function handlePaymentRoutes(
       }
     }
 
-    const result = await context.engine.execute(txn);
+    const result = await context.engine.execute(txn, authentication);
     json(res, 200, { result });
     return true;
   }

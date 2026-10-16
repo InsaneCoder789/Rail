@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "migrate": "npm run build && node dist/persistence/runMigrations.js",
     "test": "npm run build && node --test test/*.test.js",
+    "test:browser": "npm run build && node --test test/ownerPasskeys.browser.mjs",
     "risk:train": "npm run build && node dist/risk/trainRisk.js",
     "risk:monitor": "npm run build && node dist/risk/monitorRisk.js",
     "audit:batch": "npm run build && node dist/persistence/runAuditBatch.js",
@@ -17,9 +18,12 @@
     "authorizations:sweep": "npm run build && node dist/persistence/runAuthorizationSweep.js",
     "accounting:reconcile": "npm run build && node dist/persistence/runReconciliation.js",
     "demo": "npm run build && node dist/demo/runPayment.js",
+    "demo:agent": "npm run build && node dist/demo/runAgentSimulator.js",
     "server": "npm run build && node dist/server/server.js"
   },
   "dependencies": {
+    "@noble/ed25519": "3.2.0",
+    "@simplewebauthn/server": "14.0.3",
     "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "jsonwebtoken": "^9.0.3",
@@ -30,6 +34,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.13.10",
     "@types/pg": "^8.11.10",
+    "playwright": "1.64.0",
     "typescript": "^5.7.3"
   }
 }

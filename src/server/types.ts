@@ -9,15 +9,26 @@ import type { TransactionEvidenceStore } from "../persistence/transactionEvidenc
 import type { AgentAuthorityStore } from "../persistence/agentAuthority.js";
 import type { RiskProtectionStore } from "../persistence/riskProtection.js";
 import type { AuditBatchStore } from "../persistence/auditBatches.js";
+import type { OwnerPasskeyStore } from "../persistence/ownerPasskeys.js";
 
 export interface AuthenticatedViewer {
   readonly walletId: string;
 }
+export type WalletAuthentication = { readonly walletId: string; readonly method: "owner_jwt"; readonly userId: string; readonly authVersion: number }
+  | { readonly walletId: string; readonly method: "wallet_api_key"; readonly apiKeyHash: string };
 export interface OwnerPrincipal {
   readonly walletId: string;
   readonly method: "owner_jwt" | "trusted_library";
   readonly userId?: string;
   readonly authVersion?: number;
+  readonly sessionFingerprint?: string;
+  readonly stepUp?: {
+    readonly method: "passkey";
+    readonly credentialId: string;
+    readonly challengeId: string;
+    readonly operation: string;
+    readonly operationFingerprint: string;
+  };
 }
 
 export interface SseClient {
@@ -34,6 +45,7 @@ export interface ServerEvent {
 
 
 export interface AuthResolver {
+  resolveFinancialPrincipal?(req: http.IncomingMessage): Promise<WalletAuthentication>;
   resolveOwnerPrincipal?(req: http.IncomingMessage): Promise<OwnerPrincipal>;
   resolveOwnerWallet(req: http.IncomingMessage): Promise<string>;
   resolveAuthenticatedWallet(
@@ -51,6 +63,8 @@ export interface EventStore {
 }
 
 export interface ServerContext {
+  readonly agentProofs?: import("../persistence/agentProofs.js").AgentProofStore;
+  readonly ownerPasskeys?: OwnerPasskeyStore;
   readonly config: ServerConfig;
   readonly pool: Pool;
   readonly databaseUrl: string;

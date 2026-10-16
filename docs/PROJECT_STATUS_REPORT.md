@@ -38,6 +38,263 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Portfolio Review And Simulator TTL Correction, 16 October 2026
+
+KYLR compatibility increment: authenticated `/auth/login` now also returns the
+wallet ID selected from the verified user's database row, never a client-supplied
+wallet field. The token contract is unchanged. A regression verifies wallet binding
+and excludes password/hash disclosure. The paired mobile adapter removes its
+embedded issuer key, uses this owner identity, persists original attempt and
+authorization before execution, and preserves them on retry. This is internal
+wallet orchestration, not a UPI-settlement bridge.
+
+The latest logged direct run passed **408 backend tests and all three Chromium
+journeys, zero failures/skips**, plus audit zero known advisories and diff check.
+Its disposable database was removed. The earlier successful run below predates
+the additive login field. No remote CI or Android-to-deployed-Rail acceptance is
+claimed by these server results.
+
+Fresh direct verification subsequently succeeded: `npm test`, all three native
+Chromium journeys (zero failures/skips) and `npm audit --audit-level=moderate`
+(zero known vulnerabilities). The disposable local database was removed. This
+includes the three independent agent processes, lost post-commit reply, original
+intent replay and changed-payload rejection. The Node host was 20.19.6, not the
+CI Node 22/24 matrix; no remote CI or provider settlement claim follows. The earlier
+background wrapper failed before tests because it imported CommonJS `pg` incorrectly;
+the direct wrapper used `createRequire` and the actual `Pool` export.
+
+Cross-repository maintenance is separately scoped and incomplete; its detailed
+tracker stays private instead of mixing other applications into Rail's technical
+report. InsaneCoder789 remains untouched. No commits or pushes were made.
+
+Added a short root README with source-grounded architecture, local setup, CI and
+documentation links, synthetic-demo instructions and explicit internal-accounting
+versus external-settlement limits. It does not advertise fictional customers or
+claim unpublished CI acceptance. The profile repository InsaneCoder789 is excluded
+from the owner's separately authorized multi-repository maintenance request.
+
+The combined job job-mv9j3h80-ed666c0f finished with 406 backend passes, one failure,
+zero skips and confirmed disposable-database removal. Browser/audit stages did not
+run because backend acceptance failed. The three-process simulator sent a 3600-second
+TTL while the real intent API accepts 60-900 seconds; all proposals were rejected.
+The simulator and test now use 300 seconds, with a unit regression assertion.
+A fresh integration run is required; no acceptance gate is waived.
+
+### C3 Owner Console Locally Verified, Simulator Acceptance Pending, 15 October 2026
+
+Focused rerun `job-mv9iwopf-0274e6f0` passed the actual console browser journey:
+**one passed, zero failed, two unrelated tests excluded by name**. Login, native
+passkey enrollment, exact approval without execution, revision-bound limit consent,
+internal execution, receipt verification, HTML-injection resistance and session
+cleanup passed. Responsive assertions passed at 320/390/768 pixels. Desktop and
+mobile screenshots were inspected against the local concept; the table scrolls
+within its panel and no page-wide overflow remains. The disposable database was
+removed. A subsequent small change also clears hidden totals/fingerprints on logout;
+its additional browser assertions await the combined regression run.
+
+The [three-agent simulator](./AGENT_SIMULATORS.md) executable now supports explicit
+proposal/status/execution using only its own agent credential and key, a stable
+request identity and localhost-only non-production configuration. It imports no
+database, owner session or provider adapter. Six simulator unit tests and three
+console tests pass. The HTTP/PostgreSQL acceptance case now launches three real
+external Node processes, races shared allowance and injects a lost post-commit
+reply before inspecting/replaying the original internal transfer. This updated
+case is implemented but awaits fresh integration acceptance. No provider-settlement
+claim follows from it; C2 remains unfinished and C3 is still in progress.
+
+Historical failure: the first focused console job `job-mv9iv97i-97b054d6` completed real login, native
+passkey ceremonies, exact approval, limit changes and receipt inspection, then
+failed its mobile horizontal-overflow assertion. It is not an acceptance pass.
+Grid/select shrink boundaries are corrected and the browser check now covers
+320, 390 and 768 pixel widths. The disposable database was removed; rerun and
+visual inspection were subsequently completed by the focused rerun above.
+
+The prior foundation job `job-mv9ic4sc-5c168020` passed **398 backend tests and two
+Chromium journeys with zero failures/skips**, dependency audit zero known advisories
+and clean diff. The disposable database was removed. Those results cover the C2
+contract and C3 agent client, not the later console increment below.
+
+An opt-in backend-hosted [owner console](./OWNER_CONSOLE.md) now uses the existing
+real owner/session, passkey, budget and intent APIs. It displays actual owner data,
+supports exact approval/rejection, revision-bound limit changes, emergency withdrawal
+and verified receipt summaries. It performs no agent execution or fake settlement.
+Owner secrets stay in page memory, not browser storage/URLs. Per-response CSP nonces,
+same-origin-only requests, text-node rendering, no caching and async session guards
+protect the presentation boundary. Production cannot enable the demo flag.
+
+The console browser/visual gate passed in the focused rerun above, while later
+simulator and cleanup edits require combined regression. The local design concept
+is a reference, not shipped as a static UI. No external provider account/adapter,
+durable external worker, commit or push was introduced. C2-C3 remain in progress; the overall goal
+is not complete. The owner has confirmed there is no sandbox account yet; real
+provider selection/access and sandbox verification remain open. Local work can
+continue, but no account creation, paid/live provisioning or simulated-as-real
+acceptance is authorized.
+
+### C1 Local Acceptance Passed; C2-C3 Foundations Started, 15 October 2026
+
+The C1 rerun `job-mv9hxvjs-ac64fab6` passed **380 backend tests and both independent
+Chromium journeys, zero failures/skips**, followed by a dependency audit with zero
+known advisories and a clean diff check. Its disposable database was removed. This
+supersedes the earlier combined-browser failure without relaxing any production
+quota or deleting negative assertions. C1 is Ready For Review, not committed/pushed
+or certified for production. The overall C0-C3 goal remains active.
+
+C2 now has a pure [external payment lifecycle contract](./PROVIDER_PAYMENTS.md):
+versioned owner/agent/intent/account/merchant/instrument bindings, fixed fingerprints
+and idempotency keys, explicit unknown/required-action states, retained holds, bounded
+retry windows and conflict detection. Ten unit tests passed. This is not a provider
+adapter, verified callback, durable attempt store or worker. Provider/account selection
+remains unanswered, and real sandbox acceptance is explicitly open.
+
+C3's [narrow Node.js agent client](./AGENT_CLIENT.md) now signs actual API requests
+with fresh nonces and body-bound proofs, rejects redirects, bounds I/O, keeps credentials
+out of public object fields and performs no automatic payment retries. Seven protocol
+tests passed. A separate real HTTP/PostgreSQL test with three independently enrolled
+agent clients passed shared-budget concurrency, cross-agent denial and internal ledger
+checks (the focused command intentionally skipped unrelated cases). No mocked financial
+engine was substituted for this case. These eighteen targeted passes are additional
+to the earlier 380-test baseline, not a newly claimed 398-test full-suite run.
+
+C2 durable composition/real provider acceptance and C3 scenario scripts, owner demo
+and all four end-to-end scenarios remain unfinished. Human/offline behaviour is not
+changed by these isolated foundations. No provider secrets, live payments, new external
+accounts, commits or pushes were created. Full regression will include these new tests.
+
+### C1 Acceptance Review Corrections, 15 October 2026
+
+The first full C1 job (`job-mv9hqn28-f23882ae`) passed **379 backend tests with no
+failures/skips**, then failed its expanded Chromium journey: the combined ceremony
+sequence exhausted the unchanged 30-per-five-minute owner-authentication quota.
+This is not a browser pass. The original authentication/recovery journey and new
+shared-budget journey now use separate disposable browser/database fixtures. No
+rate-limit increase, bypass, bucket deletion or removed adversarial assertion is
+used to make acceptance pass. The failed job removed its disposable database.
+
+Review also found that strict budget admission checked original creation and
+membership consent but not the latest limit-control grant. It now requires all
+three. A real-signature regression confirms that a weaker legacy library writer's
+unstepped limit revision cannot enable strict proposal/execution authority; exact
+owner approval of a new revision restores valid use without rewriting history.
+The focused regression passed; the current full/backend and two-browser acceptance
+rerun is still required. C1 remains in progress, C2-C3 remain open, and no commit or
+push has been made.
+
+### C0 Revalidated; C1 Shared Budgets In Progress, 15 October 2026
+
+C0's isolated acceptance job `job-mv9h0ybe-ead05cc6` completed successfully: **361
+backend tests and one native Chromium journey passed, with zero failures/skips**.
+The full dependency audit found zero known advisories and `git diff --check` passed.
+The disposable local database was removed. This is backend/local evidence, not
+remote CI, hosted/provider, physical-authenticator or independent security acceptance.
+
+C1 now adds owner-controlled shared budget envelopes, explicit same-owner membership,
+revision-bound limit changes and exact passkey-authorized control records. Existing
+mandates can bind to an envelope; shared-budget proposals/intents use v4 fingerprints
+while old unbound fingerprints stay unchanged. Conditional database accounting and
+deferred totals checks coordinate reservations across agents. Internal execution,
+rejection, expiry, withdrawal and owner recovery update shared allowance in the same
+transaction as their existing effects. Existing human/offline APIs remain unchanged.
+
+Fourteen dedicated budget tests passed, and three focused real-signature owner/agent
+cases passed (the filtered command intentionally skipped unrelated cases). Added
+deadline, approval, withdrawal-race and final-commit failure cases passed. A positive
+membership-admission case and native browser shared-budget coverage have also been
+added. C1 remains in progress pending the full regression/browser rerun and review; the
+previous 361-test baseline is not represented as covering these later changes.
+The initial migration test caught a non-immutable generated-column expression;
+an explicit stored fingerprint with a database payload check corrected it.
+
+See [Shared Spending Budgets](./SHARED_BUDGETS.md) for API, accounting, concurrency
+and interview explanations. No external payment provider, settlement, blockchain,
+enforced ML, commit or push is introduced by this increment. C2-C3 remain open.
+
+### C0-C3 Delivery Goal Started, 15 October 2026
+
+The owner approved a bounded delivery goal: revalidate the current authentication
+baseline (C0), implement shared spending budgets across agents (C1), add one sandbox
+provider with durable uncertain-outcome recovery (C2), and deliver a narrow owner demo
+with three independent agent simulators and end-to-end failure scenarios (C3).
+The existing TypeScript/PostgreSQL architecture and human/offline paths remain.
+
+C0 is in progress. The prior 361 backend passes and one Chromium journey below are
+historical evidence, not a fresh run for this goal. Local PostgreSQL connectivity and
+the current diff check passed; fresh acceptance will use a disposable local database.
+C1-C3 are not implemented by this entry. Provider/account access has been requested;
+simulator tests will not be represented as real provider or deployment verification.
+
+The ignored private implementation plan now carries the authoritative milestone,
+acceptance and proposed commit checklist. C4-C8 and the original remaining programme
+are retained as future scope, not automatically authorized implementation. Stop for
+owner review after C3. No commits, pushes, paid provisioning, live payments or work in
+the separate frontend repository are authorized by this implementation approval.
+
+### Priority Authentication Goals Completed, 14 October 2026
+
+1. **Owner authentication: passkey step-up, operation-bound challenges and secure recovery: Completed.** Current owner/session-bound WebAuthn grants protect sensitive authority changes. Enrollment, factor removal, recovery-code rotation and lost-key recovery are implemented. Recovery atomically withdraws affected human/offline/agent spending authority, changes the password/session epoch and admits scoped replacement enrollment. Failed ceremonies, stale sessions, substituted operations, recovery concurrency and financial rollback are covered by real-signature PostgreSQL tests and native Chromium acceptance.
+2. **Agent authentication: proof-of-possession credentials and key rotation: Completed.** The HTTP layer has one DPoP path, not a bearer fallback. Credentials bind owner-approved public keys; exact origin/method/body, one-use nonces and opaque transactional dispatch prevent substitution/replay. Rotation now requires owner passkey approval over predecessor, new key, unchanged scope and lifetime. Revocation and replacement use one native database timestamp and commit with the grant and audit event. Immutable lineage and owner-visible history support response-loss recovery without storing plaintext tokens. Concurrent rotation, scope escalation, stale admission, audit/final-commit rollback, SQL forgery, original receipt preservation and safe replay are tested.
+
+Fresh acceptance: **361 backend tests passed, zero failures/skips**, plus **one Chromium end-to-end journey passed**, including native owner passkeys, signed agent payment execution, real owner-approved agent rotation, rejection of the old key, unchanged historical receipt/replay, factor lifecycle and owner recovery. `npm test` and `node --test test/ownerPasskeys.browser.mjs` supplied this evidence. GitHub Actions runs these cases when published; remote results have not been claimed. Legacy policy/ledger routing fixtures use an explicit test-only proof-service mock; actual proof security is exercised by the dedicated real-signature/database/browser cases.
+
+The completion audit reproduced a degenerate Ed25519 public-key forgery accepted by the local native verifier. Shared key validation now rejects identity/small-order/non-prime-order/noncanonical keys before agent, owner EdDSA or merchant signature use. Pinned, dependency-free `@noble/ed25519` 3.2.0 supplies point validation; no custom curve mathematics or new authentication service was written. Owner COSE keys are also checked for valid P-256 points or 2048-4096-bit RSA with an odd public exponent of at least 65537. Safe ES256/Ed25519/RSA ceremonies continue to work. Unsafe legacy owner keys cannot assert or consume stored grants. Five additional cases cover these boundaries. Package audit reported zero known advisories, not proof of application-wide invulnerability.
+
+Completion here refers to the original Goals 1 and 2 backend implementation and local acceptance, not production certification. Prior entries held these goals open for deployment/custody/device gates; those gates remain explicitly within **Goal 12: Production acceptance**, alongside hosted/proxy interoperability, least-privilege roles, recovery/restore, monitoring and independent review. No scope is removed from the full twelve-goal plan. Goals 3-12 remain unfinished. There is no new blockchain, ML service, queue system or authentication provider in this priority change. Issuance and rotation share a small credential writer in the existing module; obsolete bearer routing was deleted. No commit or push was performed.
+
+### Task 2 Proof-Enabled HTTP And Financial Dispatch, 14 October 2026
+
+The actual server context now requires enrolled public keys for agent credentials and DPoP authentication for agent use. Canonical `RAIL_AGENT_API_ORIGIN` binds signatures independently of Host/forwarded headers; malformed values fail startup and missing configuration disables proof routes instead of downgrading. A bounded raw-byte reader preserves exact signed bodies, rejects invalid UTF-8 JSON and keeps existing size/time limits. Nonce bootstrap, identity, proposal/history and execution routes enforce shared source/agent quotas and exact query-free targets; CORS permits the DPoP header.
+
+Authenticated requests yield opaque, non-serializable server capabilities. Transactional dispatch matches credential/key, method/path and entry-snapshotted body, claims dispatch once, and rechecks live authority/freshness before final financial commit. Copied metadata, wrong route/body, duplicate dispatch and revoked credentials are denied. Proof admission and money idempotency remain separate: a fresh proof can return the original completed result without new ledger entries. Compatibility fixtures are not production bearer writers; deployed legacy agent credentials require replacement rather than upgrading old consent/receipts.
+
+Five new configuration/HTTP/dispatch cases passed, including deferred commit rollback and signed atomic execution/replay. The native Chromium journey also passed with actual signed agent HTTP calls. Atomic owner-approved rotation, its concurrency/response-loss/history acceptance and production interoperability remain open. No numbered task is marked Completed; the full twelve-task goal remains intact. No commit/push or real API origin/key was changed.
+### Task 2 Key Enrollment And Durable Admission, 14 October 2026
+
+Optional Ed25519 public-key credentials now require owner passkey approval of exact agent/key/scope/TTL, including proposal-only credentials. Immutable SQL key/thumbprint and consumed-grant checks preserve v1 unbound history and use a v2 digest for enrolled keys. Protected authority receipt reconstruction recognizes these new issuance grants. Enrolled credentials are deliberately unavailable through old bearer routes until proof-enabled routing exists; readiness does not claim usable execution or silently downgrade them.
+
+The PostgreSQL proof store provides hashed credential/key-bound 60-second server nonces, owner-first live-state locks, raw-byte snapshots, database-time verification, atomic one-use nonce/proof-ID claims and bounded outstanding/retained capacity. Seven new database cases cover exact key substitution, immutable binding/migration, concurrent capacity and admission, secret hygiene, invalid signature/body non-consumption, credential isolation, duplicate proof IDs, final-commit rollback and revocation/recovery denial. Full local verification passed 342 tests without failures/skips. HTTP trusted-origin/raw-body integration, mandatory-key cutover, dispatch admission binding, rotation and full route acceptance remain open. All twelve tasks retain their original scope; no numbered task is Completed and no commit/push occurred.
+
+### Task 2 Cryptographic Foundation, 14 October 2026
+
+Added a bounded Ed25519 DPoP verifier with public-only JWK parsing, stable key thumbprints, exact token/method/URL/server-nonce binding, 30-second freshness and a mandatory digest of raw body bytes. Six new tests use real signatures and reject substitutions, malformed/private/wrong-algorithm keys and altered payloads. The complete suite now passes 335 tests, zero failures/skips. The verifier does not consume nonces and is not yet wired to HTTP: existing agent credentials remain bearer tokens. Owner-authorized enrollment, PostgreSQL replay admission, fail-closed route enforcement, rotation and their integration tests are still required. See [Agent Proof Of Possession](AGENT_PROOF_OF_POSSESSION.md). No task completion, deployment, commit or push is claimed.
+
+### Task 1 Browser Acceptance And Wallet Recovery, 14 October 2026
+
+Fresh verification passed 329 backend tests with zero failures or skips, followed by one Chromium journey through the actual HTTP runtime and isolated PostgreSQL storage. Native browser WebAuthn calls exercise enrollment, exact payment approval/execution/replay, additional-key enrollment, key removal, recovery and replacement enrollment. Adversarial checks reject used challenges, changed payment terms, password-only recovery enrollment, stale sessions/agent credentials, pending-recovery spending and the wrong relying-party hostname. GitHub Actions now installs Chromium and runs this journey on each Node matrix entry; remote execution remains unverified until publication.
+
+Recovery now withdraws ordinary issued authorizations, releasing their reservations, and permanently revokes wallet API keys and offline tokens in the same transaction as agent withdrawal and the password/session reset. Pending recovery blocks financial access. Money work revalidates the ingress JWT epoch or wallet-key status inside its transaction, preventing a request authenticated before recovery from spending after replacement enrollment. Existing committed ledger entries and receipts are not reversed or rewritten. Two additional PostgreSQL cases cover these boundaries.
+
+Task 1 remains in progress against its documented operational acceptance gates: deployed legacy cutover, reviewed key custody/restore and configuration-specific acceptance are not proved by local tests. Chromium uses a virtual authenticator, not a physical-device attestation claim. Lifecycle outbox events do not imply delivered email/push notifications. Tasks 2-12 retain their full scope. No commit, push, real secret change or hosted deployment occurred.
+
+### Task 1 In Progress: Recovery And Factor Lifecycle, 13 October 2026
+
+Implemented ten high-entropy offline recovery codes returned only after first/recovery enrollment or passkey-authorized rotation. Stored hashes are domain-separated by owner; unused prior codes are revoked on rotation. Exact-credential removal requires step-up and cannot remove the last active key. Pending additional enrollment now retains/rechecks its original authorizing factor, closing a discovered revocation gap. Key history is retained rather than deleted to reopen password-only bootstrap.
+
+Recovery requires a current owner JWT, current password, unused code and different replacement password. One transaction consumes the code, replaces password/session epoch, revokes factors and all owned agent identities/credentials/mandates, releases pending policy holds and records the event. Committed money/spent budget/receipts and other owners are untouched. A hashed ten-minute capability binds the newly returned JWT session, owner, epoch and RP/origin and authorizes only new-key enrollment. Completion, key insertion, code rotation and event commit together. Duplicate old credential IDs, expiry, audit failure, deferred commit failure and real backend disconnect cannot partially complete recovery. Lost responses can restart using another remaining code and replacement password while enrollment is pending; completion invalidates that old set. There is no password-only/support/email reset shortcut.
+
+Additive recovery/code/challenge/credential links are immutable, and consumed codes bind one-to-one to recovery records. One authentication owner per wallet is now a database invariant; duplicated legacy ownership must be audited before migration. Original security evidence stays verifiable. Source/owner ceremony quotas are 60/30 per five minutes, enough for the multi-call lifecycle; recovery separately allows only five attempts per owner per fifteen minutes, and challenge/financial quotas remain. Active/retained-key caps are 10/100; recovery-code history is capped at 10,000 rows, with archival still a Task 8 gate.
+
+Fourteen new cases bring full local verification to 327 passes, zero failures/skips, including PostgreSQL and real software-authenticator signatures. Cases cover secret/hash hygiene, rotations/replay, full authority withdrawal and isolation, scoped enrollment, concurrency, response loss, audit/deferred/crash rollback, duplicate credentials, factor revocation, immutable history, unique ownership and shared HTTP quotas. Pinned development-only Playwright 1.64.0 is being prepared for actual browser acceptance; it is not yet a passed browser gate. Reports/CI/private scopes are updated. No commit/push, real secrets/origins, real recovery credentials or hosted deployment were changed. Outbox lifecycle events are implemented, not actual email/push delivery. Task 1 remains in progress pending browser and operational acceptance; Tasks 2-12 retain their original scope and no numbered task is marked Completed.
+
+### Task 1 In Progress: Mandatory Agent Authority Step-Up, 13 October 2026
+
+The HTTP runtime now requires real same-session passkey grants for execution credential issuance, spending mandate creation and exact agent approval. Fixed-order exported digest helpers normalize scope/TTL, policy and receiver order, or exact agent/intent/fingerprint. Consumers ignore body-supplied verification claims and consume grants through the same client as the protected changes, owner evidence and events. Injected audit/final-transaction failure restores grant consumption and removes attempted consent/encryption state. Emergency revocation remains grant-free; ordinary human/offline payment contracts are unchanged.
+
+Encrypted original consent/approval records retain verified passkey context, and execution receipts also bind credential issuance step-up. Verification checks protected snapshots against consumed grant metadata and exact operation fingerprints. SQL enforces immutable/unique grant links, owner/purpose/timing bindings, credential TTL/scope fingerprints and approved-intent linkage. Code-level legacy cutover rejects old JWT-only mandates, unstepped intents and execution credentials for fresh strict-runtime spending without fabricating upgraded history. Readiness hints reflect nullable legacy markers; fresh execution credentials can retrieve historical committed outcomes while original receipts remain unchanged. Direct production library writers must adopt the same required boundary; compatibility fixtures are not a production bypass.
+
+New JWTs use random identifiers so same-second logins have distinct session bindings. Eight additional tests bring full local verification to 313 passes, zero failures/skips, including PostgreSQL and actual passkey signatures. New cases cover complete financial execution/receipt provenance, changed terms/session, audit rollback, legacy rejection/replay, missing services/body forgery, SQL grant reuse/TTL, HTTP JWT-only denial and distinct sessions. Schema-isolated tests caught extension-dependent hash lookup; native PostgreSQL hashing fixes the search-path dependency. CI includes this test file; remote/browser/hosted acceptance is unverified. Reports and private scopes are current; no commit or push occurred.
+
+Task 1 remains incomplete: secure lost-key recovery, credential removal/recovery-code lifecycle and actual browser/cutover acceptance are next. Tasks 2-12 retain their full scope; no numbered task is marked Completed.
+
+### Task 1 In Progress: Owner Passkey Ceremonies, 13 October 2026
+
+Added pinned SimpleWebAuthn 14.0.3 registration/assertion verification, owner-JWT-only ceremony/list routes and PostgreSQL-backed challenge/passkey/grant storage. First enrollment rechecks the password; later enrollment consumes an existing-passkey grant. Original credential history prevents password-only re-enrollment after revocation. Requests bind the exact bearer-session fingerprint and current user/wallet/credential version. Actual UV, origin/RP, counter and signature checks run; cross-origin frames are rejected. Challenges are one-use even on failed verification, with shared per-user capacity and source/owner quotas.
+
+Two-minute grants retain hashed random tokens and exact operation/digest bindings. Supplied-client consumption requires an open transaction, allowing the protected operation to roll back grant consumption. SQL guards preserve identity, challenge/grant binding and counter/revocation history. One database clock sample fixes a lifetime CHECK race found by the real-database tests. Independent authority receipts and current financial flows remain compatible.
+
+Task 1 is not completed: this slice does not yet enforce passkeys on spending-authority changes or supply recovery/removal/rotation/cutover. Operation digests for future actions do not grant payment authority. [OWNER_PASSKEYS.md](./OWNER_PASSKEYS.md) documents contracts and outstanding acceptance. Tasks 2-12 remain open as listed below; no task is marked Completed. CI explicitly exercises real software-authenticator fixtures, not mocked verifier success. Actual browser/device/hosted acceptance is still required. This work is uncommitted/unpushed; prior milestone `48c1c15` remains published.
+
+Full local verification: 305 passes, zero failures/skips, including PostgreSQL. Fifteen new cases cover configuration/startup, cryptographic ceremonies, exact-operation/session/owner binding, outer rollback/autocommit refusal, enrollment races/password checks, origin/frame/UV tampering, counter/challenge replay, revocation/stale sessions, shared capacity, expiry, SQL mutation guards and authenticated HTTP quotas/no-store. Production dependency audit reports zero known advisories, not proof of zero application vulnerabilities. No real environment setting, passkey, recovery credential or hosted deployment was provisioned.
+
 ### Authority And Checkout Milestone: 13 October 2026
 
 This release groups protected original consent/decisions and execution receipts, exact internal-wallet checkout binding, configured merchant signature verification, SQL invariants, deployment guidance and regression/CI coverage into one milestone. Earlier entries saying uncommitted/unpushed describe the state when each slice was completed; Git history records publication of the grouped release. Unrelated local manuals/deliverables and ignored private planning documents are outside this release. The verified local baseline is 290 passing tests with no failures/skips; remote CI, hosted deployment and real merchant/provider acceptance are separate gates, not implied by a repository push.

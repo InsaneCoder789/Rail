@@ -8,7 +8,7 @@ import { withSpan } from "../pipeline/middleware.js";
 import type { Tracer } from "../pipeline/tracing.js";
 import { canonicalTransactionPayload, verifyTransactionSignatureIfRequired } from "../crypto/transactionSigning.js";
 import type { IOfflineTokenStore } from "../rail/offlineTokenStore.js";
-import { claimAuthorizationForExecution, consumeReservation, creditWallet, verifyCommittedAuthorization } from "./authorizationStage.js";
+import { claimAuthorizationForExecution, consumeReservation, creditWallet, verifyCommittedAuthorization, assertWalletNotRecovering } from "./authorizationStage.js";
 import { predictRisk, validateRiskModel, type LogisticRiskModel } from "../risk/logisticRisk.js";
 import { isPaymentTransaction } from "../server/validation.js";
 import { persistBehaviourObservation } from "../risk/behaviourRisk.js";
@@ -57,6 +57,7 @@ function transferAndLedger(tokenStore?: IOfflineTokenStore, riskModel?: Logistic
     if (!client) throw new Error("db_not_initialized");
     const txn = ctx.txn;
     const fingerprint = createHash("sha256").update(canonicalTransactionPayload(txn)).digest("hex");
+    await assertWalletNotRecovering(client, txn.senderWalletId);
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`payment:${txn.txId}`]);
     const ledger = await client.query("SELECT id FROM ledger_entries WHERE tx_id = $1", [txn.txId]);
     if (ledger.rowCount) {

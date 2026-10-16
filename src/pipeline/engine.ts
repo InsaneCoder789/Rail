@@ -8,6 +8,8 @@ import { withSpan } from "./middleware.js";
 import type { Stage } from "./stage.js";
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalTransactionPayload, legacyTransactionPayload } from "../crypto/transactionSigning.js";
+import type { WalletAuthentication } from "../server/types.js";
+import { assertWalletAuthentication } from "../stages/authorizationStage.js";
 import { verifyCommittedAuthorization } from "../stages/authorizationStage.js";
 import type { TransactionEvidenceStore } from "../persistence/transactionEvidence.js";
 import type { PoolClient } from "pg";
@@ -37,8 +39,8 @@ export class PaymentPipelineEngine {
     return Boolean(this.opts.evidence && this.opts.idempotency.dedupeInTransaction);
   }
 
-  async execute(txn: PaymentTransaction): Promise<PipelineResult> {
-    return this.executeBoundary(Object.freeze({ ...txn }));
+  async execute(txn: PaymentTransaction, authentication?: WalletAuthentication): Promise<PipelineResult> {
+    return this.executeBoundary(Object.freeze({ ...txn }), undefined, authentication ? Object.freeze({ ...authentication }) : undefined);
   }
 
   /** Internal composition: never return this provisional result to HTTP before outer COMMIT. */
@@ -49,7 +51,7 @@ export class PaymentPipelineEngine {
     return this.executeBoundary(Object.freeze({ ...txn }), client);
   }
 
-  private async executeBoundary(txn: PaymentTransaction, transaction?: PoolClient): Promise<PipelineResult> {
+  private async executeBoundary(txn: PaymentTransaction, transaction?: PoolClient, authentication?: WalletAuthentication): Promise<PipelineResult> {
     const span = this.opts.tracer.startSpan("payment.execute", {
       txId: txn.txId,
       idempotencyKey: txn.idempotencyKey,
@@ -63,6 +65,10 @@ export class PaymentPipelineEngine {
         ? this.opts.idempotency.dedupeInTransaction!.bind(this.opts.idempotency, transaction)
         : this.opts.idempotency.dedupe.bind(this.opts.idempotency);
       const result = await dedupe(txn.idempotencyKey, fingerprint, async (client) => {
+        if (authentication) {
+          if (!client) throw new PipelineError("transactional_authentication_required", "TRANSACTIONAL_IDEMPOTENCY_REQUIRED");
+          await assertWalletAuthentication(client, txn.senderWalletId, authentication);
+        }
         const outbox = new MemoryOutbox();
         const ctx = createPaymentContext(randomId(), randomId(), txn, outbox, client);
         ctx.state.requireEvidence = Boolean(this.opts.evidence);

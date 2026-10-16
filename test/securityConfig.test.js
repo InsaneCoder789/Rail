@@ -56,6 +56,15 @@ test("JWTs require a credential version and bounded lifetime", () => withEnviron
   assert.equal(verifyToken(generateToken("user_test", 2)).authVersion, 2);
 }));
 
+test("separately issued owner sessions receive distinct tokens even within one issuance second", () => withEnvironment({
+  JWT_SECRET: "unique_session_test_secret_01234567890123456789",
+}, () => {
+  const first = generateToken("session_owner", 0), second = generateToken("session_owner", 0);
+  assert.notEqual(first, second);
+  assert.notEqual(jwt.decode(first).jti, jwt.decode(second).jti);
+  assert.deepEqual(verifyToken(first), verifyToken(second));
+}));
+
 test("HTTP startup rejects corrupt or oversized behavioural artifacts before opening its runtime", async () => {
   const directory = await mkdtemp(join(tmpdir(), "rail-model-startup-"));
   const path = join(directory, "model.json");
@@ -133,6 +142,17 @@ test("malformed merchant public-key configuration fails startup before opening a
     RAIL_EVIDENCE_KEY_RING: raw("merchant_startup_payment"), RAIL_RISK_RECORD_KEY_RING: raw("merchant_startup_risk"),
     RAIL_MERCHANT_QUOTE_KEYS: "invalid_public_key_configuration" }, async () => {
     await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }), { message: "INVALID_MERCHANT_QUOTE_KEYS" });
+  });
+});
+
+test("partial passkey relying-party configuration fails before opening the runtime pool", () => {
+  const raw = keyId => JSON.stringify({ activeKeyId: keyId, keys: [{ keyId,
+    encryptionKey: randomBytes(32).toString("base64"), authenticationKey: randomBytes(32).toString("base64") }] });
+  return withEnvironment({ NODE_ENV: "test", DATABASE_URL: "postgresql://example.invalid/rail", RAIL_RISK_MODEL_PATH: undefined,
+    RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: undefined, RAIL_AGENT_AUTHORITY_KEY_RING: undefined,
+    RAIL_MERCHANT_QUOTE_KEYS: undefined, RAIL_EVIDENCE_KEY_RING: raw("passkey_startup_payment"), RAIL_RISK_RECORD_KEY_RING: raw("passkey_startup_risk"),
+    RAIL_WEBAUTHN_RP_ID: "rail.example", RAIL_WEBAUTHN_ORIGIN: undefined }, async () => {
+    await assert.rejects(createServerContext({ initializeDatabase: false, startBackgroundJobs: false }), { message: "INVALID_WEBAUTHN_CONFIGURATION" });
   });
 });
 

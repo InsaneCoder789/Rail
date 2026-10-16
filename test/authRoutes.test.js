@@ -4,6 +4,28 @@ import { Readable } from "node:stream";
 import { handleAuthRoutes } from "../dist/server/routes/authRoutes.js";
 import { loadServerConfig } from "../dist/server/config.js";
 import { SlidingWindowRateLimiter } from "../dist/server/http.js";
+import { hash } from "bcryptjs";
+import { verifyToken } from "../dist/auth/jwt.js";
+
+test("login returns only the server-bound wallet alongside the owner token", async () => {
+  const secret = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = "auth_wallet_fixture_secret_01234567890123456789";
+  try {
+    const password = "fixture_password";
+    const passwordHash = await hash(password, 4);
+    const context = { config: loadServerConfig(), rateLimiter: new SlidingWindowRateLimiter(),
+      pool: { async query(sql, parameters) {
+        assert.match(sql, /wallet_id/); assert.deepEqual(parameters, ["owner_user"]);
+        return { rowCount: 1, rows: [{ password_hash: passwordHash, auth_version: 2, wallet_id: "server_bound_wallet" }] };
+      } } };
+    let body, status;
+    const res = { setHeader() {}, writeHead(code) { status = code; }, end(raw) { body = JSON.parse(raw); } };
+    await handleAuthRoutes(request({ userId: "owner_user", password, walletId: "forged_wallet" }), res, new URL("http://local/auth/login"), context);
+    assert.equal(status, 200); assert.equal(body.walletId, "server_bound_wallet");
+    assert.deepEqual(verifyToken(body.token), { userId: "owner_user", authVersion: 2 });
+    assert.equal(body.password_hash, undefined); assert.equal(body.password, undefined);
+  } finally { if (secret === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = secret; }
+});
 
 function request(body) {
   const req = Readable.from([JSON.stringify(body)]);

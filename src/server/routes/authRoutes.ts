@@ -97,7 +97,7 @@ export async function handleAuthRoutes(
     await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "login_account", identity: account,
       limit: context.config.rateLimits.loginMax, windowMs: context.config.rateLimits.loginWindowMs });
     const resDb = await context.pool.query(
-      `SELECT password_hash, auth_version FROM users WHERE user_id = $1`,
+      `SELECT password_hash, auth_version, wallet_id FROM users WHERE user_id = $1`,
       [body.userId],
     );
 
@@ -111,7 +111,7 @@ export async function handleAuthRoutes(
     }
 
     const token = generateToken(body.userId, resDb.rows[0].auth_version);
-    json(res, 200, { token });
+    json(res, 200, { token, walletId: resDb.rows[0].wallet_id });
     return true;
   }
 

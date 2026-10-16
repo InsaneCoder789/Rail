@@ -62,6 +62,20 @@ jobs:
         run: node --test --test-name-pattern='evidence|legacy replay remains unprotected' test/postgres.integration.test.js
       - name: Verify agent authority, atomic execution, replay, quotas and revocation races
         run: node --test test/agentAuthority.test.js test/agentEvidence.test.js test/merchantQuotes.test.js
+      - name: Verify agent proof signatures and token, target and payload binding
+        run: node --test test/agentProof.test.js
+      - name: Verify owner recovery, agent proofs, atomic rotation and preserved authority history
+        run: node --test test/ownerPasskeys.test.js
+      - name: Verify shared agent budgets, concurrency, lifecycle, rollback and immutable bindings
+        run: node --test test/sharedBudgets.test.js
+      - name: Verify provider lifecycle rules and narrow agent client protocol safety
+        run: node --test test/providerPayment.test.js test/agentClient.test.js test/agentSimulator.test.js
+      - name: Verify owner console gating, document safety and nonce-based CSP
+        run: node --test test/ownerConsole.test.js
+      - name: Install Chromium for native passkey acceptance
+        run: npx playwright install --with-deps chromium
+      - name: Verify native owner passkeys, payment approval and recovery through HTTP
+        run: npm run test:browser
       - name: Verify single-transaction authorization, evidence, rollback and replay composition
         run: node --test --test-name-pattern='transaction composition:' test/postgres.integration.test.js
       - name: Verify event delivery and stream lifecycle

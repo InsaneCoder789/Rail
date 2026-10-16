@@ -35,15 +35,16 @@ const paymentPaths = ["/v1/payments/authorize", "/v1/payments/execute",
 function fixture(rateLimiter = new SlidingWindowRateLimiter()) {
   const config = loadServerConfig();
   const calls = { auth: 0, work: 0 };
-  const context = { rateLimiter, config: { ...config, disableSse: false,
+  const context = { rateLimiter, config: { ...config, disableSse: false, agentApiOrigin: "http://localhost",
     rateLimits: { ...config.rateLimits, authorizeMax: 2, executeMax: 2, tokenIssueMax: 2, syncMax: 2, loginMax: 2 } },
     authResolver: {
       async resolveAuthenticatedWallet(req) { calls.auth++; if (req.headers.authorization === "bad") throw new RequestError(401, "unauthorized", "invalid"); return req.headers.authorization; },
       async resolveOwnerWallet(req) { calls.auth++; if (req.headers.authorization === "bad") throw new RequestError(401, "unauthorized", "invalid"); return req.headers.authorization; },
       requireApiKey(req) { calls.auth++; if (req.headers.authorization === "bad") throw new RequestError(401, "unauthorized", "invalid"); return true; },
     },
+    agentProofs: { async authenticate(token) { calls.auth++; if (!token) throw new RequestError(401, "unauthorized", "invalid"); return { agentId: "trusted_agent" }; } },
     agentStore: { async resolveCredential(token) { calls.auth++; if (!token) throw new RequestError(401, "unauthorized", "invalid"); return { agentId: "trusted_agent" }; },
-      async listAgents() { calls.work++; return []; }, async listAgentIntents() { calls.work++; return []; } },
+      async createIntent() { calls.work++; return {}; }, async listAgents() { calls.work++; return []; }, async listAgentIntents() { calls.work++; return []; } },
     eventStore: { async listVisibleEvents() { calls.work++; return []; } },
     engine: { async execute() { calls.work++; throw new Error("unexpected_payment_work"); } },
     offlineTokenStore: { async issue() { calls.work++; throw new Error("unexpected_token_work"); } },
@@ -54,6 +55,7 @@ function fixture(rateLimiter = new SlidingWindowRateLimiter()) {
 async function request(handler, path, context, { ip = "192.0.2.1", identity = "wallet_owner", body = "{", contentType = "application/json" } = {}) {
   const req = Readable.from([body]);
   req.method = path.includes("/short/") || path === "/v1/events" || path === "/v1/events/stream" || path === "/v2/agents" || path === "/v2/agent/identity" ? "GET" : "POST";
+  req.url = path;
   req.headers = { authorization: identity, "content-type": contentType };
   req.socket = { remoteAddress: ip };
   const headers = {};
@@ -124,11 +126,11 @@ test("logout invalid credentials cannot bypass source quotas", async () => {
 
 test("agent owner and credential identity quotas are independent of source IP", async () => {
   for (const [path, limit, identity] of [["/v2/agents", 20, "wallet_owner"],
-    ["/v2/agent/intents", 20, `Bearer rail_agent_${"a".repeat(43)}`],
-    ["/v2/agent/identity", 30, `Bearer rail_agent_${"a".repeat(43)}`]]) {
+    ["/v2/agent/intents", 20, `DPoP rail_agent_${"a".repeat(43)}`],
+    ["/v2/agent/identity", 20, `DPoP rail_agent_${"a".repeat(43)}`]]) {
     const { context } = fixture();
-    for (let i = 0; i < limit; i++) assert.notEqual((await request(handleAgentRoutes, path, context, { identity, ip: `192.0.2.${i + 1}` })).status, 429);
-    const blocked = await request(handleAgentRoutes, path, context, { identity, ip: "198.51.100.1" });
+    for (let i = 0; i < limit; i++) assert.notEqual((await request(handleAgentRoutes, path, context, { identity, body: "{}", ip: `192.0.2.${i + 1}` })).status, 429);
+    const blocked = await request(handleAgentRoutes, path, context, { identity, body: "{}", ip: "198.51.100.1" });
     assert.equal(blocked.status, 429);
     assert.ok(Number(blocked.headers["Retry-After"]) > 0);
   }

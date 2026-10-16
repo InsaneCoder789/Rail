@@ -1,42 +1,68 @@
 import type http from "node:http";
-import { RequestError, applyRateLimit, applyIdentityRateLimit, json, readAndParseJson, requireJsonContentType } from "../http.js";
+import { RequestError, applyRateLimit, applyIdentityRateLimit, json, readAndParseJson, readRequestBody, requireJsonContentType } from "../http.js";
 import type { ServerContext } from "../types.js";
 
 export async function handleAgentRoutes(req: http.IncomingMessage, res: http.ServerResponse, url: URL, context: ServerContext): Promise<boolean> {
   const execution = req.method === "POST" ? /^\/v2\/agent\/intents\/([^/]+)\/execute$/.exec(url.pathname) : null;
-  if (((req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/intents") || execution) {
-    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_requests", limit: 30, windowMs: 60_000,
+  const nonceRoute = req.method === "POST" && url.pathname === "/v2/agent/nonces";
+  const proofRoute = nonceRoute || execution || ((req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/intents") ||
+    (req.method === "GET" && url.pathname === "/v2/agent/identity");
+  if (proofRoute) {
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_proof_source", limit: 30, windowMs: 60_000,
       trustProxyHeaders: context.config.trustProxyHeaders });
+    if (!context.agentProofs || !context.config.agentApiOrigin) throw new RequestError(503, "agent_proof_unavailable", "configure the agent proof service and public API origin");
+    if (req.url !== url.pathname) throw new RequestError(400, "invalid_agent_target", "agent routes require an exact path without query or fragment");
     const header = req.headers.authorization;
-    const token = typeof header === "string" ? /^Bearer (rail_agent_[A-Za-z0-9_-]{43})$/.exec(header)?.[1] : undefined;
-    const identity = await context.agentStore.resolveCredential(token);
-    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_intents",
-      identity: identity.agentId, limit: 20, windowMs: 60_000 });
-    if (req.method === "GET") json(res, 200, { intents: await context.agentStore.listAgentIntents(token) });
+    const token = typeof header === "string" ? /^DPoP (rail_agent_[A-Za-z0-9_-]{43})$/.exec(header)?.[1] : undefined;
+    if (!token) throw new RequestError(401, "invalid_agent_credentials", "DPoP-bound agent credentials required");
+    let raw: Buffer = Buffer.alloc(0), body: unknown;
+    if (req.method === "POST") {
+      if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
+      raw = await readRequestBody(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
+      try { body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw) || "{}"); }
+      catch { throw new RequestError(400, "invalid_json", "request body is not valid UTF-8 JSON"); }
+    } else if (req.headers["transfer-encoding"] || (req.headers["content-length"] && req.headers["content-length"] !== "0"))
+      throw new RequestError(400, "invalid_agent_body", "agent GET requests must not carry a body");
+    if (nonceRoute) {
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 0)
+        throw new RequestError(422, "invalid_agent_nonce_request", "nonce requests require an empty object");
+      const nonce = await context.agentProofs.issueNonce(token);
+      await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_nonces", identity: nonce.agentId, limit: 20, windowMs: 60_000 });
+      json(res, 200, { nonce: nonce.nonce, expiresAt: nonce.expiresAt });
+      return true;
+    }
+    const admission = await context.agentProofs.authenticate(token, req.headers.dpop, { method: req.method as "GET" | "POST", url: `${context.config.agentApiOrigin}${url.pathname}`, body: raw });
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_intents", identity: admission.agentId, limit: 20, windowMs: 60_000 });
+    if (url.pathname === "/v2/agent/identity") json(res, 200, { identity: await context.agentStore.resolveCredential(token, admission) });
+    else if (req.method === "GET") json(res, 200, { intents: await context.agentStore.listAgentIntents(token, admission) });
+    else if (execution) json(res, 200, await context.agentStore.executeIntent(token, execution[1], body, admission));
+    else json(res, 200, { intent: await context.agentStore.createIntent(token, body, admission) });
+    return true;
+  }
+  const budgetRoot = url.pathname === "/v2/budgets";
+  const budgetRoute = req.method === "POST" ? /^\/v2\/budgets\/([^/]+)\/(limit|member_add|member_remove|revoke)$/.exec(url.pathname) : null;
+  if ((budgetRoot && (req.method === "GET" || req.method === "POST")) || budgetRoute) {
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_control_source", limit: 30,
+      windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
+    const principal = context.authResolver.resolveOwnerPrincipal ? await context.authResolver.resolveOwnerPrincipal(req)
+      : { walletId: await context.authResolver.resolveOwnerWallet(req), method: "trusted_library" as const };
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_control", identity: principal.walletId, limit: 20, windowMs: 60_000 });
+    res.setHeader("Cache-Control", "no-store");
+    if (req.method === "GET") json(res, 200, { budgets: await context.agentStore.listSharedBudgets(principal.walletId, principal) });
     else {
       if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
       const body = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
-      if (execution) json(res, 200, await context.agentStore.executeIntent(token, execution[1], body));
-      else json(res, 200, { intent: await context.agentStore.createIntent(token, body) });
+      if (budgetRoot) json(res, 201, { budget: await context.agentStore.createSharedBudget(principal.walletId, body, principal) });
+      else json(res, 200, { budget: await context.agentStore.changeSharedBudget(principal.walletId, budgetRoute![1],
+        budgetRoute![2] as "limit" | "member_add" | "member_remove" | "revoke", body, principal) });
     }
     return true;
   }
-  if (req.method === "GET" && url.pathname === "/v2/agent/identity") {
-    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_identity", limit: 30, windowMs: 60_000,
-      trustProxyHeaders: context.config.trustProxyHeaders });
-    const header = req.headers.authorization;
-    const token = typeof header === "string" ? /^Bearer (rail_agent_[A-Za-z0-9_-]{43})$/.exec(header)?.[1] : undefined;
-    const identity = await context.agentStore.resolveCredential(token);
-    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_identity",
-      identity: identity.agentId, limit: 30, windowMs: 60_000 });
-    json(res, 200, { identity });
-    return true;
-  }
-
   const root = url.pathname === "/v2/agents";
-  const route = /^\/v2\/agents\/([^/]+)\/(revoke|credentials|mandates|intents)(?:\/([^/]+)\/(revoke|decision|authority))?$/.exec(url.pathname);
+  const route = /^\/v2\/agents\/([^/]+)\/(revoke|credentials|mandates|intents)(?:\/([^/]+)\/(revoke|rotate|decision|authority))?$/.exec(url.pathname);
   if ((!root && !route) || (req.method !== "GET" && req.method !== "POST")) return false;
   if (route && route[4] === "authority" && (route[2] !== "intents" || req.method !== "GET")) return false;
+  if (route && route[4] === "rotate" && (route[2] !== "credentials" || req.method !== "POST")) return false;
   if (route && ((route[2] === "revoke" && req.method !== "POST") || (route[3] && route[4] !== "authority" && req.method !== "POST") || (route[2] === "revoke" && route[3]))) return false;
   if (route && ((route[2] === "intents" && (route[4] === "revoke" || (req.method === "POST" && !route[3]))) ||
     (route[2] !== "intents" && route[4] === "decision"))) return false;
@@ -69,8 +95,9 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     if (action === "revoke") json(res, 200, { agent: await context.agentStore.revokeAgent(owner, agentId) });
     else if (action === "intents") json(res, 200, { intent: await context.agentStore.decideIntent(owner, agentId, resourceId, body, principal) });
     else if (action === "credentials") {
-      if (resourceId) json(res, 200, { credential: await context.agentStore.revokeCredential(owner, agentId, resourceId) });
-      else json(res, 201, { credential: await context.agentStore.issueCredential(owner, agentId, body) });
+      if (route![4] === "rotate") json(res, 201, { credential: await context.agentStore.rotateCredential(owner, agentId, resourceId, body, principal) });
+      else if (resourceId) json(res, 200, { credential: await context.agentStore.revokeCredential(owner, agentId, resourceId) });
+      else json(res, 201, { credential: await context.agentStore.issueCredential(owner, agentId, body, principal) });
     } else if (action === "mandates") {
       if (resourceId) json(res, 200, { mandate: await context.agentStore.revokeMandate(owner, agentId, resourceId) });
       else json(res, 201, { mandate: await context.agentStore.createMandate(owner, agentId, body, principal) });

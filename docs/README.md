@@ -52,7 +52,7 @@ Rail began with offline-aware payment orchestration. That work supplies the reli
 | Event delivery | Transactional outbox with leases, retries, acknowledgement and dead letters; wallet-scoped REST history and advisory SSE on persistent servers. |
 | Operational checks | Accounting reconciliation, authorization expiry cleanup, bounded request parsing and shared source/identity quotas. |
 
-The latest backend verification passed **290 tests with zero failures or skips**, including real PostgreSQL integration tests, on 13 October 2026. The badge links to live CI results; that local count is not a statement that every future revision or deployment has passed. The suite includes concurrent requests, response-loss recovery, backend termination, merchant signature/downgrade checks, checkout expiry, original consent/decision binding, receipt rollback/key rotation, policy tampering, revocation races and failed final commits.
+The latest complete local verification on 16 October 2026 passed the backend suite and all three Chromium journeys, with a dependency audit reporting zero known advisories and confirmed disposable-database cleanup. This includes three independent agent processes, shared-budget contention, changed-payload rejection, lost internal replies and exact original-intent replay. The host used Node 20.19.6; remote CI's Node 22/24 matrix remains unverified before publication. Shared budgets retain narrower mandate and wallet checks. The [owner console](./OWNER_CONSOLE.md) and [simulators](./AGENT_SIMULATORS.md) have local internal-wallet acceptance, not external settlement. The [provider lifecycle contract](./PROVIDER_PAYMENTS.md) is still not a real adapter; durable external recovery and selected-provider sandbox acceptance remain unfinished. Missing services cannot enable an agent bearer fallback.
 
 ## Runtime Flow
 
@@ -112,6 +112,8 @@ The important boundary: **a token is not a blanket permission to spend, and an o
 `nfc`, `ble` and `qr` are supported transaction channel values. This repository does not implement mobile transport, secure device storage, hardware attestation or a protocol proving final settlement while both devices are disconnected. Device-ID matching is a backend binding, not proof that a physical device is uncompromised. There is no NPCI, USSD, IVR or bank connector.
 
 ## Agent Payments
+
+Owner passkey assertions gate execution credentials, spending mandates, exact approvals, factor removal and recovery-code rotation. Lost-key recovery requires password plus an unused offline code, withdraws sessions and agent authority, and allows only scoped new-key enrollment. Committed money and receipts remain intact. Browser/operator acceptance is still open. See [Owner Passkey Controls](./OWNER_PASSKEYS.md); this is not universal step-up on ordinary human transfers.
 
 An agent receives its own scoped credential, not the owner's login or a server encryption key. Owners manage agents using a current user JWT. Random credentials are stored as hashes, expire and can be revoked; proposal-only credentials cannot execute payments.
 

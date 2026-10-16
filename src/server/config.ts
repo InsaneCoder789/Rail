@@ -9,6 +9,7 @@ function resolvePositiveIntEnv(name: string, fallback: number): number {
 }
 
 export interface ServerConfig {
+  readonly ownerDemoEnabled: boolean;
   readonly port: number;
   readonly serverless: boolean;
   readonly dbPoolMax: number;
@@ -23,6 +24,7 @@ export interface ServerConfig {
   readonly exposeInternalErrors: boolean;
   readonly requireJsonContentType: boolean;
   readonly authSweepIntervalMs: number;
+  readonly agentApiOrigin?: string;
   readonly rateLimits: {
     readonly loginMax: number;
     readonly loginWindowMs: number;
@@ -64,6 +66,17 @@ export function loadServerConfig(): ServerConfig {
   if (process.env.RAIL_PKCS11_MODULE_PATH || process.env.RAIL_KMS_KEY_ID) throw new Error("HSM_PROVIDER_NOT_IMPLEMENTED");
   const serverless = process.env.VERCEL === "1" || process.env.RAIL_RUNTIME === "serverless";
   const isProduction = process.env.NODE_ENV === "production";
+  if (isProduction && process.env.RAIL_DEMO_MODE === "true") throw new Error("DEMO_REQUIRES_EXPLICIT_NON_PRODUCTION_MODE");
+  const agentApiOrigin = process.env.RAIL_AGENT_API_ORIGIN;
+  if (agentApiOrigin !== undefined) {
+    let valid = false;
+    try {
+      const origin = new URL(agentApiOrigin);
+      valid = origin.origin === agentApiOrigin && !origin.username && !origin.password &&
+        (origin.protocol === "https:" || (!isProduction && origin.protocol === "http:" && origin.hostname === "localhost"));
+    } catch { /* Do not disclose malformed configuration values. */ }
+    if (!valid) throw new Error("INVALID_AGENT_API_ORIGIN");
+  }
   const allowedOrigins = resolveAllowedOrigins();
   const jwtSecret = process.env.JWT_SECRET ?? "";
   const signingSecret = process.env.RAIL_SIGNING_SECRET ?? "";
@@ -82,6 +95,8 @@ export function loadServerConfig(): ServerConfig {
   }
 
   return {
+    ownerDemoEnabled: !isProduction && process.env.RAIL_DEMO_MODE === "true",
+    agentApiOrigin,
     port: Number(process.env.PORT ?? 8787),
     serverless,
     dbPoolMax: resolvePositiveIntEnv("RAIL_DB_POOL_MAX", serverless ? 5 : 20),

@@ -62,7 +62,7 @@ export function applyCors(
   }
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RAIL-API-KEY, X-KYLR-API-KEY");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, DPoP, X-RAIL-API-KEY, X-KYLR-API-KEY");
 }
 
 export function json(res: http.ServerResponse, status: number, body: unknown): void {
@@ -76,7 +76,7 @@ export function json(res: http.ServerResponse, status: number, body: unknown): v
   res.end(payload);
 }
 
-export function readJsonBody(req: http.IncomingMessage, maxBytes: number, timeoutMs = 10_000): Promise<string> {
+export function readRequestBody(req: http.IncomingMessage, maxBytes: number, timeoutMs = 10_000): Promise<Buffer> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
     return Promise.reject(new Error("invalid_body_read_limits"));
   }
@@ -102,7 +102,7 @@ export function readJsonBody(req: http.IncomingMessage, maxBytes: number, timeou
       reject(err);
     };
 
-    const resolveOnce = (value: string): void => {
+    const resolveOnce = (value: Buffer): void => {
       if (finished) return;
       finished = true;
       cleanup();
@@ -125,7 +125,7 @@ export function readJsonBody(req: http.IncomingMessage, maxBytes: number, timeou
       }
       chunks.push(chunk);
     };
-    const onEnd = () => resolveOnce(Buffer.concat(chunks).toString("utf8"));
+    const onEnd = () => resolveOnce(Buffer.concat(chunks));
     const onError = (error: Error) => rejectOnce(error);
     const onAborted = () => rejectOnce(new RequestError(400, "request_aborted", "request body was interrupted"));
     const onClose = () => { if (!finished) onAborted(); };
@@ -146,6 +146,10 @@ export async function readAndParseJson(req: http.IncomingMessage, maxBytes: numb
   } catch {
     throw new RequestError(400, "invalid_json", "request body is not valid JSON");
   }
+}
+
+export async function readJsonBody(req: http.IncomingMessage, maxBytes: number, timeoutMs = 10_000): Promise<string> {
+  return (await readRequestBody(req, maxBytes, timeoutMs)).toString("utf8");
 }
 
 export function requireJsonContentType(
@@ -272,8 +276,10 @@ export function toErrorResponse(
     return { status: 503, body: { error: "accounting_review_required" } };
   }
   if (err instanceof PipelineError) {
+    if (err.code === "OWNER_RECOVERY_PENDING") return { status: 403, body: { error: "recovery_enrollment_required" } };
+    if (err.code === "WALLET_CREDENTIAL_REVOKED") return { status: 401, body: { error: "invalid_credentials" } };
     const conflicts = ["IDEMPOTENCY_KEY_REUSED", "PAYMENT_ALREADY_EXECUTED", "AUTH_NOT_EXECUTABLE", "COMMITTED_PAYMENT_MISMATCH",
-      "unknown_or_expired_token", "token_expired", "wallet_mismatch", "device_mismatch", "currency_mismatch", "insufficient_token_headroom"];
+      "unknown_or_expired_token", "token_expired", "token_revoked", "wallet_mismatch", "device_mismatch", "currency_mismatch", "insufficient_token_headroom"];
     if (conflicts.includes(err.code)) return { status: 409, body: { error: err.code.toLowerCase() } };
     if (["offline_spend_mismatch", "AUTHORIZATION_TX_CONFLICT"].includes(err.code)) return { status: 409, body: { error: err.code.toLowerCase() } };
     if (["INVALID_TRANSACTION", "SELF_TRANSFER", "invalid_amount", "invalid_transaction"].includes(err.code)) return { status: 422, body: { error: err.code.toLowerCase() } };

@@ -24,6 +24,12 @@ import { AgentEvidenceStore } from "../dist/persistence/agentEvidence.js";
 import { MerchantQuoteRegistry, merchantQuoteBytes } from "../dist/crypto/merchantQuotes.js";
 
 dotenv.config();
+
+// These routing regressions isolate policy/ledger behavior; real DPoP is tested in ownerPasskeys and Chromium.
+function routingFixture(config, store) {
+  return { config: { ...config, agentApiOrigin: "http://localhost" },
+    agentProofs: { async authenticate(token) { return store.resolveCredential(token); } } };
+}
 const databaseUrl = process.env.DATABASE_URL;
 const authorityKey = { keyId: "agent_authority_test_v1", encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) };
 const authorityEvidence = () => new AgentEvidenceStore(new TransactionKeyRing(authorityKey.keyId, [authorityKey]));
@@ -49,11 +55,11 @@ test("signed merchant checkout survives authenticated HTTP approval, execution a
     const merchant = merchantFixture(), store = executionStore(pool, undefined, false, undefined, authorityEvidence(), merchant.registry);
     const setup = await intentSetup(store, owner), value = checkout();
     const execution = await store.issueCredential(owner, setup.agent.agentId, { scope: "payments:execute" });
-    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+    const context = { ...routingFixture(loadServerConfig(), store), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
       authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
     const call = async (method, path, body, bearer) => {
       const req = Readable.from(body ? [JSON.stringify(body)] : []);
-      req.method = method; req.headers = { authorization: `Bearer ${bearer}`, "content-type": "application/json" };
+      req.method = method; req.url = path; req.headers = { authorization: `${bearer?.startsWith("rail_agent_") ? "DPoP" : "Bearer"} ${bearer}`, "content-type": "application/json" };
       req.socket = { remoteAddress: "192.0.2.1" };
       const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
       assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost${path}`), context), true);
@@ -564,12 +570,12 @@ test("credential and mandate capacities bound retained control-plane records", {
 
 test("owner endpoints use JWT-only authority and an IP-independent shared management quota", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, store, token }) => {
-    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+    const context = { ...routingFixture(loadServerConfig(), store), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
       authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
     let ip = 0;
     const call = async (method, path, body, authorization = `Bearer ${token}`, extra = {}) => {
       const req = Readable.from(body === undefined ? [] : [JSON.stringify(body)]);
-      req.method = method;
+      req.method = method; req.url = path;
       req.headers = { authorization, "content-type": "application/json", ...extra };
       req.socket = { remoteAddress: `192.0.2.${++ip}` };
       const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
@@ -579,12 +585,12 @@ test("owner endpoints use JWT-only authority and an IP-independent shared manage
     const agent = (await call("POST", "/v2/agents", { name: "API agent" })).body.agent;
     const credential = (await call("POST", `/v2/agents/${agent.agentId}/credentials`, {})).body.credential;
     const mandate = (await call("POST", `/v2/agents/${agent.agentId}/mandates`, policy)).body.mandate;
-    assert.equal((await call("GET", "/v2/agent/identity", undefined, `Bearer ${credential.token}`)).body.identity.executionEnabled, false);
+    assert.equal((await call("GET", "/v2/agent/identity", undefined, `DPoP ${credential.token}`)).body.identity.executionEnabled, false);
     assert.equal((await call("GET", `/v2/agents/${agent.agentId}/credentials`)).body.credentials.length, 1);
     assert.equal((await call("GET", `/v2/agents/${agent.agentId}/mandates`)).body.mandates.length, 1);
     await call("POST", `/v2/agents/${agent.agentId}/mandates/${mandate.mandateId}/revoke`, {});
     await call("POST", `/v2/agents/${agent.agentId}/credentials/${credential.credentialId}/revoke`, {});
-    await assert.rejects(call("GET", "/v2/agent/identity", undefined, `Bearer ${credential.token}`), { status: 401 });
+    await assert.rejects(call("GET", "/v2/agent/identity", undefined, `DPoP ${credential.token}`), { status: 401 });
     await assert.rejects(call("GET", "/v2/agents", undefined, `Bearer ${credential.token}`), { status: 401 });
     await assert.rejects(call("GET", "/v2/agents", undefined, undefined, { authorization: undefined, "x-rail-api-key": credential.token }), { status: 401 });
     // Seven owner-authorized calls above; rotating source addresses cannot create new buckets.
@@ -755,12 +761,12 @@ test("revoked credentials and out-of-policy proposals cannot create new reservat
 test("agent intent endpoints separate proposal credentials from owner approvals", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, store, owner, token }) => {
     const { agent, credential, input } = await intentSetup(store, owner);
-    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
+    const context = { ...routingFixture(loadServerConfig(), store), agentStore: store, rateLimiter: new PostgresRateLimiter(pool),
       authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
     const call = async (method, path, body, bearer) => {
       const req = Readable.from(body ? [JSON.stringify(body)] : []);
-      req.method = method;
-      req.headers = { authorization: `Bearer ${bearer}`, "content-type": "application/json" };
+      req.method = method; req.url = path;
+      req.headers = { authorization: `${bearer?.startsWith("rail_agent_") ? "DPoP" : "Bearer"} ${bearer}`, "content-type": "application/json" };
       req.socket = { remoteAddress: "192.0.2.1" };
       const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
       assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost${path}`), context), true);
@@ -829,11 +835,11 @@ test("concurrent revocation and proposals leave no live intents or reserved budg
 test("agent intent quotas remain shared when request source addresses change", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, store, owner }) => {
     const { credential, input } = await intentSetup(store, owner);
-    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool) };
+    const context = { ...routingFixture(loadServerConfig(), store), agentStore: store, rateLimiter: new PostgresRateLimiter(pool) };
     for (let i = 0; i < 21; i++) {
       const req = Readable.from([JSON.stringify(input)]);
-      req.method = "POST";
-      req.headers = { authorization: `Bearer ${credential.token}`, "content-type": "application/json" };
+      req.method = "POST"; req.url = "/v2/agent/intents";
+      req.headers = { authorization: `DPoP ${credential.token}`, "content-type": "application/json" };
       req.socket = { remoteAddress: `192.0.2.${i + 1}` };
       const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
       const call = () => handleAgentRoutes(req, res, new URL("http://localhost/v2/agent/intents"), context);
@@ -1344,11 +1350,11 @@ test("database prevents unbacked agent execution and rewriting consumed budget o
 test("agent execution HTTP endpoint returns only committed receipts under agent quotas", { skip: !databaseUrl }, async () => {
   await fixture(async ({ pool, owner, token }) => {
     const { store, executionCredential, intent, request } = await executionSetup(pool, owner, "budgeted");
-    const context = { config: loadServerConfig(), agentStore: store, rateLimiter: new PostgresRateLimiter(pool) };
+    const context = { ...routingFixture(loadServerConfig(), store), agentStore: store, rateLimiter: new PostgresRateLimiter(pool) };
     const call = async bearer => {
       const req = Readable.from([JSON.stringify(request)]);
-      req.method = "POST";
-      req.headers = { authorization: `Bearer ${bearer}`, "content-type": "application/json" };
+      req.method = "POST"; req.url = `/v2/agent/intents/${intent.intentId}/execute`;
+      req.headers = { authorization: `${bearer?.startsWith("rail_agent_") ? "DPoP" : "Bearer"} ${bearer}`, "content-type": "application/json" };
       req.socket = { remoteAddress: "192.0.2.40" };
       const res = { setHeader() {}, writeHead(status) { this.status = status; }, end(raw) { this.body = JSON.parse(raw); } };
       assert.equal(await handleAgentRoutes(req, res, new URL(`http://localhost/v2/agent/intents/${intent.intentId}/execute`), context), true);

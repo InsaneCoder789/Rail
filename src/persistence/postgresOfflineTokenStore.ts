@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import type { PaymentTransaction } from "../domain/types.js";
 import { canonicalTransactionPayload } from "../crypto/transactionSigning.js";
 import { validateTokenIssue, validSpendAmount, validSpendIdentity, type IssuedOfflineToken, type IssueOfflineTokenInput, type IOfflineTokenStore } from "../rail/offlineTokenStore.js";
+import { assertWalletNotRecovering } from "../stages/authorizationStage.js";
 
 function mapRow(row: Record<string, unknown>): IssuedOfflineToken {
   return {
@@ -40,15 +41,19 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
     }
   }
 
-  async issue(input: IssueOfflineTokenInput): Promise<IssuedOfflineToken> {
+  async issue(value: IssueOfflineTokenInput): Promise<IssuedOfflineToken> {
+    const input = { ...value };
     validateTokenIssue(input);
     const tokenId = `otk_${randomBytes(12).toString("hex")}`;
     const issuedAtMs = Date.now();
     const expiresAtMs = issuedAtMs + (input.ttlSeconds ?? 345600) * 1000;
     const currency = input.currency ?? "INR";
-    await this.pool.query(`INSERT INTO rail_offline_tokens
-      (token_id, wallet_id, device_id, amount_cap_minor, remaining_minor, currency, issued_at_ms, expires_at_ms)
-      VALUES ($1,$2,$3,$4,$4,$5,$6,$7)`, [tokenId, input.walletId, input.deviceId, input.amountCapMinor, currency, issuedAtMs, expiresAtMs]);
+    await this.transaction(undefined, async client => {
+      await assertWalletNotRecovering(client, input.walletId);
+      await client.query(`INSERT INTO rail_offline_tokens
+        (token_id, wallet_id, device_id, amount_cap_minor, remaining_minor, currency, issued_at_ms, expires_at_ms)
+        VALUES ($1,$2,$3,$4,$4,$5,$6,$7)`, [tokenId, input.walletId, input.deviceId, input.amountCapMinor, currency, issuedAtMs, expiresAtMs]);
+    });
     return { tokenId, walletId: input.walletId, deviceId: input.deviceId, amountCapMinor: input.amountCapMinor,
       remainingMinor: input.amountCapMinor, currency, issuedAtMs, expiresAtMs };
   }
@@ -60,10 +65,12 @@ export class PostgresOfflineTokenStore implements IOfflineTokenStore {
     if (!txn.offlineTokenId) return { ok: false, reason: "offline_token_required" };
     if (!txn.deviceId) return { ok: false, reason: "offline_device_required" };
     return this.transaction(provided, async client => {
+      await assertWalletNotRecovering(client, txn.senderWalletId);
       // Serialize the spend identity as well as the token: one transaction cannot reserve two tokens.
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`offline_spend:${txn.txId}`]);
       const tokenResult = await client.query("SELECT * FROM rail_offline_tokens WHERE token_id = $1 FOR UPDATE", [txn.offlineTokenId]);
       if (!tokenResult.rows.length) return { ok: false, reason: "unknown_or_expired_token" };
+      if (tokenResult.rows[0].revoked_at) return { ok: false, reason: "token_revoked" };
       const token = mapRow(tokenResult.rows[0]);
       if (token.walletId !== txn.senderWalletId) return { ok: false, reason: "wallet_mismatch" };
       if (token.deviceId !== txn.deviceId) return { ok: false, reason: "device_mismatch" };

@@ -2,6 +2,7 @@ import { createHash, createPublicKey, verify, type KeyObject } from "node:crypto
 import type { AgentCheckout } from "../persistence/agentAuthority.js";
 import { isRecord, isSafeText } from "../server/validation.js";
 import { RequestError } from "../server/http.js";
+import { assertEd25519PublicKey } from "./transactionSigning.js";
 
 export interface MerchantQuoteProof {
   readonly keyId: string;
@@ -33,6 +34,7 @@ function publicKey(raw: unknown): { key: KeyObject; encoded: string; fingerprint
   const der = Buffer.from(raw, "base64");
   const key = createPublicKey({ key: der, type: "spki", format: "der" });
   if (key.asymmetricKeyType !== "ed25519" || !key.export({ type: "spki", format: "der" }).equals(der)) throw new Error();
+  assertEd25519PublicKey(Buffer.from(key.export({ format: "jwk" }).x!, "base64url"));
   return { key, encoded: raw, fingerprint: createHash("sha256").update(der).digest("hex") };
 }
 

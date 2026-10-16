@@ -11,6 +11,7 @@ import { TransactionEvidenceStore } from "../persistence/transactionEvidence.js"
 import { RiskProtectionStore, loadRiskKeyRing } from "../persistence/riskProtection.js";
 import { AuditBatchStore } from "../persistence/auditBatches.js";
 import { AgentAuthorityStore } from "../persistence/agentAuthority.js";
+import { AgentProofStore } from "../persistence/agentProofs.js";
 dotenv.config();
 
 import { MemoryDeadLetterQueue } from "../pipeline/dlq.js";
@@ -29,11 +30,14 @@ import { createEventStore } from "./events.js";
 import { RateLimitError, RequestError, applyCors, json, toErrorResponse } from "./http.js";
 import { handleAuthRoutes } from "./routes/authRoutes.js";
 import { handleAgentRoutes } from "./routes/agentRoutes.js";
+import { handleOwnerConsole } from "./routes/ownerConsole.js";
 import { handleEventRoutes } from "./routes/eventRoutes.js";
 import { handlePaymentRoutes } from "./routes/paymentRoutes.js";
 import type { ServerContext } from "./types.js";
 import { AgentEvidenceStore, loadAgentAuthorityKeyRing } from "../persistence/agentEvidence.js";
 import { MerchantQuoteRegistry } from "../crypto/merchantQuotes.js";
+import { OwnerPasskeyStore, loadOwnerPasskeyConfig } from "../persistence/ownerPasskeys.js";
+import { handlePasskeyRoutes } from "./routes/passkeyRoutes.js";
 
 const tracer = consoleTracer("[rail]");
 
@@ -58,7 +62,9 @@ export async function createServerContext(options: {
   const authorityEvidence = process.env.RAIL_AGENT_AUTHORITY_KEY_RING
     ? new AgentEvidenceStore(loadAgentAuthorityKeyRing(process.env.RAIL_AGENT_AUTHORITY_KEY_RING, [paymentKeys, riskKeys])) : undefined;
   const merchantQuotes = new MerchantQuoteRegistry(process.env.RAIL_MERCHANT_QUOTE_KEYS);
+  const passkeyConfig = loadOwnerPasskeyConfig(process.env.RAIL_WEBAUTHN_RP_ID, process.env.RAIL_WEBAUTHN_ORIGIN);
   const pool = createPool(databaseUrl, config.dbPoolMax);
+  const ownerPasskeys = passkeyConfig ? new OwnerPasskeyStore(pool, passkeyConfig) : undefined;
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
   const startBackgroundJobs = options.startBackgroundJobs ?? !config.serverless;
 
@@ -105,6 +111,8 @@ export async function createServerContext(options: {
   });
 
   return {
+    agentProofs: new AgentProofStore(pool),
+    ownerPasskeys,
     config,
     pool,
     databaseUrl,
@@ -114,7 +122,7 @@ export async function createServerContext(options: {
     evidenceStore,
     riskProtection,
     auditStore: new AuditBatchStore(pool, evidenceStore, riskProtection),
-    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes),
+    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes, { required: true, store: ownerPasskeys }, { required: true, ready: Boolean(config.agentApiOrigin) }),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,
@@ -146,6 +154,7 @@ export async function handleRequest(
       }
 
       const url = new URL(req.url, `http://127.0.0.1:${context.config.port}`);
+      if (handleOwnerConsole(req, res, url, context)) return;
 
       if (req.method === "GET" && url.pathname === "/health") {
         json(res, 200, {
@@ -161,7 +170,7 @@ export async function handleRequest(
         return;
       }
 
-      if (await handleAuthRoutes(req, res, url, context)) {
+      if (await handlePasskeyRoutes(req, res, url, context) || await handleAuthRoutes(req, res, url, context)) {
         return;
       }
       if (await handleAgentRoutes(req, res, url, context)) return;

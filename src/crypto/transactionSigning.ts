@@ -1,6 +1,15 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { PaymentTransaction } from "../domain/types.js";
 import { PipelineError } from "../pipeline/errors.js";
+import { Point } from "@noble/ed25519";
+
+/** Native signature verification alone can accept degenerate keys; validate their group membership first. */
+export function assertEd25519PublicKey(bytes: Uint8Array): void {
+  try {
+    const point = Point.fromBytes(bytes, false);
+    if (point.isSmallOrder() || !point.isTorsionFree() || !Buffer.from(point.toBytes()).equals(Buffer.from(bytes))) throw new Error();
+  } catch { throw new Error("INVALID_ED25519_PUBLIC_KEY"); }
+}
 
 /**
  * Canonical UTF-8 string for HMAC. Version this format if you add fields (e.g. `v1:` prefix).

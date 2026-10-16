@@ -5,8 +5,41 @@ import type { PaymentTransaction } from "../domain/types.js";
 import { PipelineError } from "../pipeline/errors.js";
 import { signAuthorization } from "../crypto/authorizationSigning.js";
 import { withTransactionSavepoint } from "../persistence/transaction.js";
+import type { WalletAuthentication } from "../server/types.js";
 
 const DEFAULT_AUTH_TTL_MS = 5 * 60 * 1000;
+
+export async function assertWalletNotRecovering(client: PoolClient, walletId: string): Promise<void> {
+  const user = await client.query("SELECT owner_recovery_pending FROM users WHERE wallet_id=$1 FOR SHARE", [walletId]);
+  if (user.rows[0]?.owner_recovery_pending) throw new PipelineError("owner_recovery_pending", "OWNER_RECOVERY_PENDING");
+}
+
+/** Credentials are rechecked under the financial transaction, not just at HTTP ingress. */
+export async function assertWalletAuthentication(client: PoolClient, walletId: string, actor?: WalletAuthentication): Promise<void> {
+  await assertWalletNotRecovering(client, walletId);
+  if (!actor) return;
+  if (actor.walletId !== walletId) throw new PipelineError("wallet_credential_revoked", "WALLET_CREDENTIAL_REVOKED");
+  const current = actor.method === "owner_jwt"
+    ? await client.query("SELECT user_id FROM users WHERE user_id=$1 AND wallet_id=$2 AND auth_version=$3 FOR SHARE", [actor.userId, walletId, actor.authVersion])
+    : await client.query("SELECT key_id FROM api_keys WHERE api_key_hash=$1 AND wallet_id=$2 AND revoked_at IS NULL FOR SHARE", [actor.apiKeyHash, walletId]);
+  if (current.rowCount !== 1) throw new PipelineError("wallet_credential_revoked", "WALLET_CREDENTIAL_REVOKED");
+}
+
+/** The caller already holds the owner-user lock. Posted effects are never undone here. */
+export async function withdrawWalletSpendingAuthority(client: PoolClient, walletId: string) {
+  const issued = await client.query(`UPDATE authorizations SET status='revoked',released_at=clock_timestamp()
+    WHERE sender_wallet_id=$1 AND status='issued' RETURNING amount_minor,currency`, [walletId]);
+  const totals = new Map<string, bigint>();
+  for (const row of issued.rows) totals.set(row.currency, (totals.get(row.currency) ?? 0n) + BigInt(row.amount_minor));
+  for (const [currency, amount] of totals) {
+    const released = await client.query(`UPDATE wallets SET balance=balance+$2,reserved=reserved-$2
+      WHERE wallet_id=$1 AND currency=$3 AND reserved>=$2 RETURNING wallet_id`, [walletId, amount.toString(), currency]);
+    if (released.rowCount !== 1) throw new Error("recovery_authorization_reservation_mismatch");
+  }
+  const keys = await client.query("UPDATE api_keys SET revoked_at=clock_timestamp() WHERE wallet_id=$1 AND revoked_at IS NULL", [walletId]);
+  const tokens = await client.query("UPDATE rail_offline_tokens SET revoked_at=clock_timestamp() WHERE wallet_id=$1 AND revoked_at IS NULL", [walletId]);
+  return { revokedAuthorizations: issued.rowCount ?? 0, revokedWalletKeys: keys.rowCount ?? 0, revokedOfflineTokens: tokens.rowCount ?? 0 };
+}
 function validateMoney(amount: number, currency: string): void {
   if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 1e12 || !/^[A-Z]{3}$/.test(currency)) {
     throw new PipelineError("INVALID_TRANSACTION", "INVALID_TRANSACTION");
@@ -197,13 +230,14 @@ export interface AuthorizationInput {
   readonly ttlMs?: number;
 }
 
-export async function createAuthorization(input: AuthorizationInput, db: Pool): Promise<PaymentAuthorization> {
+export async function createAuthorization(input: AuthorizationInput, db: Pool, authentication?: WalletAuthentication): Promise<PaymentAuthorization> {
   const snapshot = { ...input };
-  return authorizationTransaction(db, client => createAuthorizationInTransaction(snapshot, client));
+  const actor = authentication ? { ...authentication } : undefined;
+  return authorizationTransaction(db, client => createAuthorizationInTransaction(snapshot, client, { authentication: actor }));
 }
 
 /** Trusted server composition only; no BEGIN, COMMIT or separate pool checkout. */
-export async function createAuthorizationInTransaction(value: AuthorizationInput, client: PoolClient, options: { cleanupExpired?: boolean } = {}): Promise<PaymentAuthorization> {
+export async function createAuthorizationInTransaction(value: AuthorizationInput, client: PoolClient, options: { cleanupExpired?: boolean; authentication?: WalletAuthentication } = {}): Promise<PaymentAuthorization> {
   const input = { ...value };
   validateMoney(input.amountMinor, input.currency);
   for (const [id, minimum] of [[input.txId, 8], [input.senderWalletId, 3], [input.receiverWalletId, 3]] as const) {
@@ -221,6 +255,7 @@ export async function createAuthorizationInTransaction(value: AuthorizationInput
   }
 
   return withTransactionSavepoint(client, async () => {
+    await assertWalletAuthentication(client, input.senderWalletId, options.authentication);
     // Serialize issuance even when the authorization row does not exist yet.
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`authorize:${input.txId}`]);
     let existing = await client.query(

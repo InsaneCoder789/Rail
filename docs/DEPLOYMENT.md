@@ -4,11 +4,17 @@ Rail can run locally as a long-lived Node.js process or as a Vercel serverless A
 
 ## Architecture
 
+### Local Acceptance Is Not Deployment Acceptance
+
+The latest full local backend run passed 361 tests without failures/skips. `npm run test:browser` additionally requires PostgreSQL and Playwright Chromium and exercises native WebAuthn, signed money routes, owner-approved agent key rotation and recovery in a temporary schema. Install that browser with `npx playwright install chromium` locally; CI uses `--with-deps` on Ubuntu. The fixture generates temporary test keys and cleans its schema, without provisioning production credentials. Goals 1 and 2 backend implementation/local acceptance are complete. Hosted/proxy/physical-device acceptance, custody/restore and independent certification remain Goal 12; a virtual authenticator cannot prove those requirements. Audit retained keys before rollout: new validation rejects degenerate Ed25519 points and unsafe owner RSA parameters, including legacy assertions/grants. Do not weaken validation or manufacture replacement consent to bypass cutover.
+
 Vercel hosts the HTTP function. A managed PostgreSQL provider stores wallets, users, authorizations, idempotency records, offline tokens, ledger entries, and outbox events. Vercel environment variables provide secrets at runtime.
 
 The API is reachable over HTTPS, but it is not an unauthenticated public product. Payment routes require a JWT or scoped API key, and token-issue and sync routes require the server API key. Do not publish the deployment URL in the frontend until the frontend has been configured with the correct origin and credentials.
 
 ## Required Vercel variables
+
+Agent HTTP use additionally requires `RAIL_AGENT_API_ORIGIN=https://your-public-api.example`, canonical with no trailing slash/path. It is independent of the owner's WebAuthn frontend origin. Missing configuration disables proof endpoints; malformed values fail startup. The real runtime always requires public-key agent credentials, so replace old bearer credentials through owner step-up rather than enabling a downgrade flag. See [Agent Proof Of Possession](AGENT_PROOF_OF_POSSESSION.md) for nonce/bootstrap/header/retry contracts. Database dispatch state and grants must migrate before new writers run, and old bearer writers must be drained. Physical/hosted-origin and proxy acceptance remain unverified locally.
 
 Configure these for the **Production** environment:
 
@@ -60,6 +66,16 @@ Apply migrations before the new runtime. New required-evidence payments cannot c
 The library engine keeps evidence optional for isolated V1 regression/demo callers; the HTTP runtime always supplies the evidence store. Direct library integrations must opt in explicitly. Ledger fields and existing event payloads remain relational/plaintext; this phase encrypts the canonical audit copy only. Least-privilege database roles, retention, secure secret storage, monitoring and a production key-provider review remain release gates.
 
 ## Database setup
+
+### Owner Passkey Ceremony Configuration
+
+Optional `RAIL_WEBAUTHN_RP_ID` and `RAIL_WEBAUTHN_ORIGIN` enable the new ceremony endpoints. Both must be supplied together; the RP ID equals the origin hostname and production requires a canonical HTTPS origin. Malformed/partial settings fail before the pool opens. No actual deployment values were changed. Apply migrations first and keep runtime roles unable to delete credential history or modify guards. [OWNER_PASSKEYS.md](./OWNER_PASSKEYS.md) explains session binding and lifecycle limits.
+
+The HTTP runtime requires grants for execution credentials, mandates, approvals, factor removal and code rotation. Lost-key recovery requires the current password and an unused recovery code, then replaces password/session authority, withdraws agent delegations and scopes re-enrollment to a new session. Missing passkey configuration disables these features rather than providing a JWT/password-only fallback. Keep emergency revocation available. Browser/hosted acceptance, custody/restore and actual notification delivery remain pending.
+
+This migration enforces a unique authentication owner per wallet. Audit duplicate `users.wallet_id` mappings before deployment; it fails rather than choosing one owner or deleting accounts. Retain password/session epochs, factor/code history and referenced recovery records. First/recovery enrollment returns ten codes once; a recovered owner must provision new agent authority explicitly, not reactivate revoked agents. Remaining codes permit retry after a lost recovery response only while enrollment is pending. Successful re-enrollment rotates them, and the scoped capability never authorizes spending. No support override or out-of-band delivery service is configured.
+
+Drain old writers before this cutover. Old nullable credential/mandate/intent markers are not upgraded in place; release old unexecuted holds and obtain new stepped authority. Historical protected receipts remain verifiable and completed outcomes can replay through a fresh execution credential without rewriting their original assurance. Every direct production integration must configure required owner control like the HTTP runtime. Creation and consumption use owner-user locks before agent/control locks; preserve that order in recovery and future workers. `consumed_at` and grant/credential/evidence links are durable history, not disposable session cache.
 
 ### Merchant Quote Trust Configuration
 

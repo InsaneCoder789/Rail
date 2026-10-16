@@ -294,6 +294,27 @@ CREATE TABLE IF NOT EXISTS api_keys (
   api_key_hash TEXT NOT NULL UNIQUE,
   wallet_id TEXT NOT NULL
 );
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+CREATE OR REPLACE FUNCTION rail_protect_wallet_key() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF ROW(NEW.key_id,NEW.api_key_hash,NEW.wallet_id) IS DISTINCT FROM ROW(OLD.key_id,OLD.api_key_hash,OLD.wallet_id)
+    OR (OLD.revoked_at IS NOT NULL AND NEW IS DISTINCT FROM OLD) THEN
+    RAISE EXCEPTION 'wallet_key_history_is_immutable' USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_wallet_key_protect ON api_keys;
+CREATE TRIGGER rail_wallet_key_protect BEFORE UPDATE ON api_keys FOR EACH ROW EXECUTE FUNCTION rail_protect_wallet_key();
+ALTER TABLE rail_offline_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+CREATE OR REPLACE FUNCTION rail_protect_offline_revocation() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.revoked_at IS NOT NULL AND NEW IS DISTINCT FROM OLD THEN
+    RAISE EXCEPTION 'offline_token_revocation_is_permanent' USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_offline_token_revocation ON rail_offline_tokens;
+CREATE TRIGGER rail_offline_token_revocation BEFORE UPDATE ON rail_offline_tokens FOR EACH ROW EXECUTE FUNCTION rail_protect_offline_revocation();
 
 DO $$
 BEGIN
@@ -322,8 +343,127 @@ CREATE TABLE IF NOT EXISTS users (
   wallet_id TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_users_wallet ON users(wallet_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet_unique ON users(wallet_id);
+DROP INDEX IF EXISTS idx_users_wallet;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0 CHECK (auth_version >= 0);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS owner_recovery_pending BOOLEAN NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS rail_owner_passkeys (
+  credential_id TEXT PRIMARY KEY CHECK (length(credential_id) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL REFERENCES users(user_id),
+  public_key BYTEA NOT NULL CHECK (octet_length(public_key) BETWEEN 32 AND 4096),
+  sign_count BIGINT NOT NULL CHECK (sign_count BETWEEN 0 AND 4294967295),
+  device_type TEXT NOT NULL CHECK (device_type IN ('singleDevice','multiDevice')),
+  backed_up BOOLEAN NOT NULL CHECK (device_type='multiDevice' OR NOT backed_up),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_owner_passkeys_user ON rail_owner_passkeys(user_id, created_at);
+CREATE TABLE IF NOT EXISTS rail_owner_challenges (
+  challenge_id UUID PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(user_id), auth_version INTEGER NOT NULL CHECK (auth_version>=0),
+  session_fingerprint TEXT NOT NULL CHECK (session_fingerprint ~ '^[a-f0-9]{64}$'),
+  kind TEXT NOT NULL CHECK (kind IN ('registration','authentication')),
+  challenge TEXT NOT NULL CHECK (length(challenge) BETWEEN 32 AND 256),
+  operation TEXT NOT NULL CHECK (operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes')),
+  operation_fingerprint TEXT NOT NULL CHECK (operation_fingerprint ~ '^[a-f0-9]{64}$'), bootstrap BOOLEAN NOT NULL,
+  rp_id TEXT NOT NULL, origin TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ, CHECK(expires_at>created_at AND expires_at<=created_at+interval '5 minutes'),
+  CHECK(used_at IS NULL OR used_at>=created_at), CHECK(kind='registration' OR NOT bootstrap)
+);
+CREATE INDEX IF NOT EXISTS idx_owner_challenges_user ON rail_owner_challenges(user_id, expires_at);
+CREATE TABLE IF NOT EXISTS rail_owner_step_up_grants (
+  token_hash TEXT PRIMARY KEY CHECK (token_hash ~ '^[a-f0-9]{64}$'),
+  challenge_id UUID NOT NULL UNIQUE REFERENCES rail_owner_challenges(challenge_id),
+  credential_id TEXT NOT NULL REFERENCES rail_owner_passkeys(credential_id), user_id TEXT NOT NULL REFERENCES users(user_id),
+  auth_version INTEGER NOT NULL CHECK (auth_version>=0), session_fingerprint TEXT NOT NULL CHECK (session_fingerprint ~ '^[a-f0-9]{64}$'),
+  operation TEXT NOT NULL CHECK (operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes')),
+  operation_fingerprint TEXT NOT NULL CHECK (operation_fingerprint ~ '^[a-f0-9]{64}$'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ, CHECK(expires_at>created_at AND expires_at<=created_at+interval '2 minutes'),
+  CHECK(consumed_at IS NULL OR consumed_at>=created_at)
+);
+CREATE INDEX IF NOT EXISTS idx_owner_grants_user ON rail_owner_step_up_grants(user_id, expires_at);
+CREATE TABLE IF NOT EXISTS rail_owner_recovery_codes (
+  code_hash TEXT PRIMARY KEY CHECK(code_hash ~ '^[a-f0-9]{64}$'), user_id TEXT NOT NULL REFERENCES users(user_id),
+  generation_id UUID NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), consumed_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ,
+  CHECK(consumed_at IS NULL OR consumed_at>=created_at), CHECK(revoked_at IS NULL OR revoked_at>=created_at),
+  CHECK(consumed_at IS NULL OR revoked_at IS NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_owner_recovery_codes_user ON rail_owner_recovery_codes(user_id, generation_id);
+CREATE TABLE IF NOT EXISTS rail_owner_recoveries (
+  recovery_id UUID PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(user_id), auth_version INTEGER NOT NULL CHECK(auth_version>=0),
+  token_hash TEXT NOT NULL UNIQUE CHECK(token_hash ~ '^[a-f0-9]{64}$'), session_fingerprint TEXT NOT NULL CHECK(session_fingerprint ~ '^[a-f0-9]{64}$'),
+  rp_id TEXT NOT NULL, origin TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+  completed_at TIMESTAMPTZ, superseded_at TIMESTAMPTZ,
+  CHECK(expires_at>created_at AND expires_at<=created_at+interval '10 minutes'),
+  CHECK(completed_at IS NULL OR (completed_at>=created_at AND completed_at<expires_at)),
+  CHECK(superseded_at IS NULL OR superseded_at>=created_at), CHECK(completed_at IS NULL OR superseded_at IS NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_single_pending_recovery ON rail_owner_recoveries(user_id) WHERE completed_at IS NULL AND superseded_at IS NULL;
+ALTER TABLE rail_owner_recoveries ADD COLUMN IF NOT EXISTS consumed_code_hash TEXT REFERENCES rail_owner_recovery_codes(code_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_recovery_code_use ON rail_owner_recoveries(consumed_code_hash) WHERE consumed_code_hash IS NOT NULL;
+CREATE OR REPLACE FUNCTION rail_check_owner_recovery_code() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF NEW.consumed_code_hash IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM rail_owner_recovery_codes code WHERE code.code_hash=NEW.consumed_code_hash AND code.user_id=NEW.user_id
+      AND code.consumed_at IS NOT NULL AND code.consumed_at<=NEW.created_at AND code.revoked_at IS NULL) THEN
+    RAISE EXCEPTION 'owner_recovery_code_binding_invalid' USING ERRCODE='23514';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_owner_recovery_code_binding_commit ON rail_owner_recoveries;
+CREATE CONSTRAINT TRIGGER rail_owner_recovery_code_binding_commit AFTER INSERT ON rail_owner_recoveries
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_owner_recovery_code();
+ALTER TABLE rail_owner_challenges ADD COLUMN IF NOT EXISTS authorization_challenge_id UUID REFERENCES rail_owner_step_up_grants(challenge_id);
+ALTER TABLE rail_owner_challenges ADD COLUMN IF NOT EXISTS recovery_id UUID REFERENCES rail_owner_recoveries(recovery_id);
+ALTER TABLE rail_owner_passkeys ADD COLUMN IF NOT EXISTS enrollment_challenge_id UUID REFERENCES rail_owner_challenges(challenge_id);
+ALTER TABLE rail_owner_passkeys ADD COLUMN IF NOT EXISTS recovery_id UUID REFERENCES rail_owner_recoveries(recovery_id);
+CREATE OR REPLACE FUNCTION rail_protect_owner_recovery() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_TABLE_NAME='rail_owner_recovery_codes' THEN
+    IF (to_jsonb(NEW)-ARRAY['consumed_at','revoked_at']) IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['consumed_at','revoked_at']) OR
+      ((OLD.consumed_at IS NOT NULL OR OLD.revoked_at IS NOT NULL) AND NEW IS DISTINCT FROM OLD) THEN
+      RAISE EXCEPTION 'owner_recovery_code_is_immutable' USING ERRCODE='23514';
+    END IF;
+  ELSE
+    IF (to_jsonb(NEW)-ARRAY['completed_at','superseded_at']) IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['completed_at','superseded_at']) OR
+      ((OLD.completed_at IS NOT NULL OR OLD.superseded_at IS NOT NULL) AND NEW IS DISTINCT FROM OLD) THEN
+      RAISE EXCEPTION 'owner_recovery_is_immutable' USING ERRCODE='23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_owner_recovery_code_protect ON rail_owner_recovery_codes;
+CREATE TRIGGER rail_owner_recovery_code_protect BEFORE UPDATE ON rail_owner_recovery_codes FOR EACH ROW EXECUTE FUNCTION rail_protect_owner_recovery();
+DROP TRIGGER IF EXISTS rail_owner_recovery_protect ON rail_owner_recoveries;
+CREATE TRIGGER rail_owner_recovery_protect BEFORE UPDATE ON rail_owner_recoveries FOR EACH ROW EXECUTE FUNCTION rail_protect_owner_recovery();
+CREATE OR REPLACE FUNCTION rail_protect_owner_security() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_TABLE_NAME='rail_owner_passkeys' THEN
+    IF ROW(NEW.credential_id,NEW.user_id,NEW.public_key,NEW.device_type,NEW.created_at,NEW.enrollment_challenge_id,NEW.recovery_id)
+       IS DISTINCT FROM ROW(OLD.credential_id,OLD.user_id,OLD.public_key,OLD.device_type,OLD.created_at,OLD.enrollment_challenge_id,OLD.recovery_id)
+       OR NEW.sign_count<OLD.sign_count OR (OLD.revoked_at IS NOT NULL AND NEW IS DISTINCT FROM OLD) THEN
+      RAISE EXCEPTION 'owner_passkey_history_is_immutable' USING ERRCODE='23514';
+    END IF;
+  ELSIF TG_TABLE_NAME='rail_owner_challenges' THEN
+    IF (to_jsonb(NEW)-'used_at') IS DISTINCT FROM (to_jsonb(OLD)-'used_at') OR
+      (OLD.used_at IS NOT NULL AND NEW.used_at IS DISTINCT FROM OLD.used_at) OR (NEW.used_at IS NOT NULL AND NEW.used_at>=NEW.expires_at) THEN
+      RAISE EXCEPTION 'owner_challenge_is_immutable' USING ERRCODE='23514';
+    END IF;
+  ELSE
+    IF (to_jsonb(NEW)-'consumed_at') IS DISTINCT FROM (to_jsonb(OLD)-'consumed_at') OR
+      (OLD.consumed_at IS NOT NULL AND NEW.consumed_at IS DISTINCT FROM OLD.consumed_at) OR (NEW.consumed_at IS NOT NULL AND NEW.consumed_at>=NEW.expires_at) THEN
+      RAISE EXCEPTION 'owner_step_up_grant_is_immutable' USING ERRCODE='23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_owner_key_protect ON rail_owner_passkeys;
+CREATE TRIGGER rail_owner_key_protect BEFORE UPDATE ON rail_owner_passkeys FOR EACH ROW EXECUTE FUNCTION rail_protect_owner_security();
+DROP TRIGGER IF EXISTS rail_owner_challenge_protect ON rail_owner_challenges;
+CREATE TRIGGER rail_owner_challenge_protect BEFORE UPDATE ON rail_owner_challenges FOR EACH ROW EXECUTE FUNCTION rail_protect_owner_security();
+DROP TRIGGER IF EXISTS rail_owner_grant_protect ON rail_owner_step_up_grants;
+CREATE TRIGGER rail_owner_grant_protect BEFORE UPDATE ON rail_owner_step_up_grants FOR EACH ROW EXECUTE FUNCTION rail_protect_owner_security();
 
 CREATE TABLE IF NOT EXISTS rail_agents (
   agent_id UUID PRIMARY KEY,
@@ -346,7 +486,100 @@ CREATE TABLE IF NOT EXISTS rail_agent_credentials (
   revoked_at TIMESTAMPTZ,
   CHECK (expires_at > created_at AND expires_at <= created_at + interval '30 days')
 );
+ALTER TABLE rail_agent_credentials ADD COLUMN IF NOT EXISTS owner_step_up_challenge_id UUID REFERENCES rail_owner_step_up_grants(challenge_id);
+ALTER TABLE rail_agent_credentials ADD COLUMN IF NOT EXISTS proof_public_key JSONB;
+ALTER TABLE rail_agent_credentials ADD COLUMN IF NOT EXISTS proof_key_thumbprint TEXT;
+ALTER TABLE rail_agent_credentials ADD COLUMN IF NOT EXISTS rotated_from_credential_id UUID REFERENCES rail_agent_credentials(credential_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_credential_rotation ON rail_agent_credentials(rotated_from_credential_id) WHERE rotated_from_credential_id IS NOT NULL;
+ALTER TABLE rail_agent_credentials DROP CONSTRAINT IF EXISTS rail_agent_rotation_binding;
+ALTER TABLE rail_agent_credentials ADD CONSTRAINT rail_agent_rotation_binding CHECK (
+  rotated_from_credential_id IS NULL OR (rotated_from_credential_id<>credential_id AND proof_public_key IS NOT NULL AND owner_step_up_challenge_id IS NOT NULL));
+ALTER TABLE rail_agent_credentials DROP CONSTRAINT IF EXISTS rail_agent_proof_key_binding;
+ALTER TABLE rail_agent_credentials ADD CONSTRAINT rail_agent_proof_key_binding CHECK (
+  (proof_public_key IS NULL AND proof_key_thumbprint IS NULL) OR
+  (proof_public_key IS NOT NULL AND proof_key_thumbprint IS NOT NULL AND owner_step_up_challenge_id IS NOT NULL
+   AND proof_key_thumbprint ~ '^[A-Za-z0-9_-]{43}$'));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_credential_owner_grant ON rail_agent_credentials(owner_step_up_challenge_id) WHERE owner_step_up_challenge_id IS NOT NULL;
+CREATE OR REPLACE FUNCTION rail_check_credential_step_up() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF NEW.rotated_from_credential_id IS NOT NULL AND (
+    NOT EXISTS(SELECT 1 FROM rail_agent_credentials source WHERE source.credential_id=NEW.rotated_from_credential_id
+      AND source.agent_id=NEW.agent_id AND source.scope=NEW.scope AND source.revoked_at=NEW.created_at
+      AND source.created_at<NEW.created_at AND source.expires_at>NEW.created_at)
+    OR EXISTS(SELECT 1 FROM rail_agent_credentials history WHERE history.agent_id=NEW.agent_id
+      AND history.credential_id<>NEW.credential_id AND history.proof_key_thumbprint=NEW.proof_key_thumbprint)) THEN
+    RAISE EXCEPTION 'agent_rotation_binding_invalid' USING ERRCODE='23514';
+  END IF;
+  IF NEW.proof_public_key IS NOT NULL AND (
+    NEW.proof_public_key IS DISTINCT FROM jsonb_build_object('kty','OKP','crv','Ed25519','x',NEW.proof_public_key->>'x')
+    OR COALESCE(NEW.proof_public_key->>'x','') !~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+    OR NEW.proof_key_thumbprint IS DISTINCT FROM translate(rtrim(encode(sha256(convert_to(
+      '{"crv":"Ed25519","kty":"OKP","x":"' || (NEW.proof_public_key->>'x') || '"}', 'UTF8')), 'base64'), '='), '+/', '-_')) THEN
+    RAISE EXCEPTION 'agent_proof_key_binding_invalid' USING ERRCODE='23514';
+  END IF;
+  IF NEW.owner_step_up_challenge_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM rail_owner_step_up_grants grant_record JOIN users owner ON owner.user_id=grant_record.user_id
+      JOIN rail_agents agent ON agent.agent_id=NEW.agent_id
+    WHERE grant_record.challenge_id=NEW.owner_step_up_challenge_id AND grant_record.operation='agent_credential'
+      AND grant_record.consumed_at IS NOT NULL AND grant_record.consumed_at<=NEW.created_at
+      AND grant_record.consumed_at<grant_record.expires_at AND owner.wallet_id=agent.owner_wallet_id AND (NEW.scope='payments:execute' OR NEW.proof_public_key IS NOT NULL)
+      AND EXTRACT(EPOCH FROM NEW.expires_at-NEW.created_at)=trunc(EXTRACT(EPOCH FROM NEW.expires_at-NEW.created_at))
+      AND grant_record.operation_fingerprint=encode(sha256(convert_to(
+        CASE WHEN NEW.rotated_from_credential_id IS NOT NULL THEN '["rail:owner-operation:v3","agent_credential_rotate","' || NEW.agent_id::text || '","' || NEW.rotated_from_credential_id::text || '","' || NEW.scope || '",' || EXTRACT(EPOCH FROM NEW.expires_at-NEW.created_at)::bigint::text || ',"' || NEW.proof_key_thumbprint || '"]'
+        WHEN NEW.proof_public_key IS NULL THEN '["rail:owner-operation:v1","agent_credential","' || NEW.agent_id::text || '","' || NEW.scope || '",' || EXTRACT(EPOCH FROM NEW.expires_at-NEW.created_at)::bigint::text || ']'
+        ELSE '["rail:owner-operation:v2","agent_credential","' || NEW.agent_id::text || '","' || NEW.scope || '",' || EXTRACT(EPOCH FROM NEW.expires_at-NEW.created_at)::bigint::text || ',"' || NEW.proof_key_thumbprint || '"]' END, 'UTF8')), 'hex')) THEN
+    RAISE EXCEPTION 'agent_credential_step_up_binding_invalid' USING ERRCODE='23514';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_credential_step_up ON rail_agent_credentials;
+CREATE CONSTRAINT TRIGGER rail_agent_credential_step_up AFTER INSERT ON rail_agent_credentials
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_credential_step_up();
 CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent ON rail_agent_credentials(agent_id);
+CREATE TABLE IF NOT EXISTS rail_agent_proof_nonces (
+  nonce_hash TEXT PRIMARY KEY CHECK (nonce_hash ~ '^[a-f0-9]{64}$'),
+  credential_id UUID NOT NULL REFERENCES rail_agent_credentials(credential_id),
+  key_thumbprint TEXT NOT NULL CHECK (key_thumbprint ~ '^[A-Za-z0-9_-]{43}$'),
+  created_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL CHECK (expires_at = created_at + interval '60 seconds'),
+  consumed_at TIMESTAMPTZ,
+  proof_id TEXT CHECK (proof_id ~ '^[A-Za-z0-9_-]{43}$'),
+  CHECK ((consumed_at IS NULL AND proof_id IS NULL) OR (consumed_at >= created_at AND consumed_at < expires_at AND proof_id IS NOT NULL)),
+  UNIQUE (credential_id, proof_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_proof_nonces_credential ON rail_agent_proof_nonces(credential_id, expires_at);
+ALTER TABLE rail_agent_proof_nonces ADD COLUMN IF NOT EXISTS proof_expires_at TIMESTAMPTZ;
+ALTER TABLE rail_agent_proof_nonces ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ;
+ALTER TABLE rail_agent_proof_nonces DROP CONSTRAINT IF EXISTS rail_agent_proof_dispatch_time;
+ALTER TABLE rail_agent_proof_nonces ADD CONSTRAINT rail_agent_proof_dispatch_time CHECK (
+  dispatched_at IS NULL OR (consumed_at IS NOT NULL AND proof_expires_at IS NOT NULL
+    AND dispatched_at>=consumed_at AND dispatched_at<expires_at AND dispatched_at<proof_expires_at));
+CREATE OR REPLACE FUNCTION rail_protect_agent_nonce() RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP='DELETE' THEN
+    IF OLD.expires_at>clock_timestamp() THEN RAISE EXCEPTION 'active_agent_nonce_is_immutable' USING ERRCODE='23514'; END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP='UPDATE' AND (
+    ROW(NEW.nonce_hash,NEW.credential_id,NEW.key_thumbprint,NEW.created_at,NEW.expires_at)
+      IS DISTINCT FROM ROW(OLD.nonce_hash,OLD.credential_id,OLD.key_thumbprint,OLD.created_at,OLD.expires_at)
+    OR NEW.consumed_at IS NULL OR NEW.proof_id IS NULL OR NEW.proof_expires_at IS NULL
+    OR (OLD.consumed_at IS NULL AND NEW.dispatched_at IS NOT NULL)
+    OR (OLD.consumed_at IS NOT NULL AND (
+      ROW(NEW.consumed_at,NEW.proof_id,NEW.proof_expires_at) IS DISTINCT FROM ROW(OLD.consumed_at,OLD.proof_id,OLD.proof_expires_at)
+      OR OLD.dispatched_at IS NOT NULL OR NEW.dispatched_at IS NULL))) THEN
+    RAISE EXCEPTION 'agent_nonce_is_immutable' USING ERRCODE='23514';
+  END IF;
+  IF TG_OP='INSERT' AND (NEW.consumed_at IS NOT NULL OR NEW.proof_id IS NOT NULL OR NEW.proof_expires_at IS NOT NULL OR NEW.dispatched_at IS NOT NULL OR NOT EXISTS (
+    SELECT 1 FROM rail_agent_credentials WHERE credential_id=NEW.credential_id
+      AND proof_key_thumbprint=NEW.key_thumbprint AND revoked_at IS NULL AND expires_at>NEW.created_at)) THEN
+    RAISE EXCEPTION 'agent_nonce_credential_binding_invalid' USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_agent_nonce_immutable ON rail_agent_proof_nonces;
+CREATE TRIGGER rail_agent_nonce_immutable BEFORE INSERT OR UPDATE OR DELETE ON rail_agent_proof_nonces
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_agent_nonce();
 ALTER TABLE rail_agent_credentials DROP CONSTRAINT IF EXISTS rail_agent_credentials_scope_check;
 ALTER TABLE rail_agent_credentials ADD CONSTRAINT rail_agent_credentials_scope_check CHECK (scope IN ('payments:propose','payments:execute'));
 CREATE TABLE IF NOT EXISTS rail_agent_mandates (
@@ -401,6 +634,9 @@ ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS consent_receipt_version
 ALTER TABLE rail_agent_mandates ALTER COLUMN consent_receipt_version SET DEFAULT 1;
 ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS owner_evidence_version SMALLINT CHECK (owner_evidence_version IS NULL OR owner_evidence_version = 1);
 ALTER TABLE rail_agent_intents ALTER COLUMN owner_evidence_version SET DEFAULT 1;
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS owner_step_up_version SMALLINT CHECK (owner_step_up_version IS NULL OR owner_step_up_version=1);
+ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS owner_step_up_challenge_id UUID REFERENCES rail_owner_step_up_grants(challenge_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_mandate_owner_grant ON rail_agent_mandates(owner_step_up_challenge_id) WHERE owner_step_up_challenge_id IS NOT NULL;
 ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS checkout JSONB;
 ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS merchant_attestation JSONB;
 DO $$ BEGIN
@@ -465,6 +701,8 @@ CREATE TABLE IF NOT EXISTS rail_agent_owner_evidence (
   CHECK (COALESCE(jsonb_typeof(envelope) = 'object' AND envelope->>'purpose' = purpose AND envelope->>'txId' = subject_id::text
     AND envelope->>'nonce' = nonce AND envelope->>'version' = '1', FALSE))
 );
+ALTER TABLE rail_agent_owner_evidence ADD COLUMN IF NOT EXISTS step_up_challenge_id UUID REFERENCES rail_owner_step_up_grants(challenge_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_owner_evidence_grant ON rail_agent_owner_evidence(step_up_challenge_id) WHERE step_up_challenge_id IS NOT NULL;
 -- Existing intents remain legacy records; newly created intents require authority receipts.
 ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS authority_receipt_version SMALLINT
   CHECK (authority_receipt_version IS NULL OR authority_receipt_version = 1);
@@ -493,12 +731,33 @@ CREATE OR REPLACE FUNCTION rail_check_agent_owner_evidence() RETURNS TRIGGER
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF TG_TABLE_NAME = 'rail_agent_mandates' THEN
+    IF NEW.owner_step_up_challenge_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM rail_owner_step_up_grants grant_record JOIN users owner ON owner.user_id=grant_record.user_id
+        JOIN rail_agent_owner_evidence consent ON consent.mandate_id=NEW.mandate_id AND consent.purpose='agent-mandate-v1'
+      WHERE grant_record.challenge_id=NEW.owner_step_up_challenge_id AND consent.step_up_challenge_id=grant_record.challenge_id
+        AND grant_record.operation='agent_mandate' AND grant_record.consumed_at IS NOT NULL
+        AND grant_record.consumed_at<=NEW.created_at AND grant_record.consumed_at<grant_record.expires_at
+        AND owner.wallet_id=NEW.owner_wallet_id) THEN
+      RAISE EXCEPTION 'agent_mandate_step_up_binding_invalid' USING ERRCODE='23514';
+    END IF;
     IF EXISTS (SELECT 1 FROM rail_agent_mandates mandate WHERE mandate.mandate_id=NEW.mandate_id
       AND mandate.consent_receipt_version=1 AND NOT EXISTS (SELECT 1 FROM rail_agent_owner_evidence evidence
         WHERE evidence.mandate_id=mandate.mandate_id AND evidence.purpose='agent-mandate-v1')) THEN
       RAISE EXCEPTION 'agent_mandate_consent_required' USING ERRCODE='23514';
     END IF;
   ELSE
+    IF EXISTS (SELECT 1 FROM rail_agent_intents intent JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id
+      WHERE intent.intent_id=NEW.intent_id AND intent.owner_step_up_version=1 AND (mandate.owner_step_up_challenge_id IS NULL OR
+        (intent.status IN ('approved','executed') AND mandate.mode='approval_required' AND NOT EXISTS (
+          SELECT 1 FROM rail_agent_owner_evidence approval JOIN rail_owner_step_up_grants grant_record ON grant_record.challenge_id=approval.step_up_challenge_id
+          JOIN users owner ON owner.user_id=grant_record.user_id
+          WHERE approval.intent_id=intent.intent_id AND approval.purpose='agent-approval-v1' AND approval.mandate_id=intent.mandate_id
+            AND owner.wallet_id=intent.owner_wallet_id AND grant_record.operation='agent_approval'
+            AND grant_record.consumed_at IS NOT NULL AND grant_record.consumed_at<=approval.recorded_at
+            AND grant_record.consumed_at<grant_record.expires_at
+            AND grant_record.operation_fingerprint=encode(sha256(convert_to('["rail:owner-operation:v1","agent_approval","' || intent.agent_id::text || '","' || intent.intent_id::text || '","' || intent.request_fingerprint || '"]', 'UTF8')), 'hex'))))) THEN
+      RAISE EXCEPTION 'agent_intent_step_up_binding_invalid' USING ERRCODE='23514';
+    END IF;
     IF EXISTS (SELECT 1 FROM rail_agent_intents intent JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id
       WHERE intent.intent_id=NEW.intent_id AND intent.owner_evidence_version=1 AND
         ((intent.status IN ('approved','executed') AND (mandate.consent_receipt_version IS DISTINCT FROM 1 OR NOT EXISTS
@@ -597,15 +856,15 @@ BEGIN
       RAISE EXCEPTION 'agent_identity_is_immutable' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'rail_agent_credentials' THEN
-    IF ROW(NEW.credential_id, NEW.agent_id, NEW.token_hash, NEW.scope, NEW.created_at, NEW.expires_at)
-      IS DISTINCT FROM ROW(OLD.credential_id, OLD.agent_id, OLD.token_hash, OLD.scope, OLD.created_at, OLD.expires_at) THEN
+    IF ROW(NEW.credential_id, NEW.agent_id, NEW.token_hash, NEW.scope, NEW.created_at, NEW.expires_at, NEW.owner_step_up_challenge_id, NEW.proof_public_key, NEW.proof_key_thumbprint, NEW.rotated_from_credential_id)
+      IS DISTINCT FROM ROW(OLD.credential_id, OLD.agent_id, OLD.token_hash, OLD.scope, OLD.created_at, OLD.expires_at, OLD.owner_step_up_challenge_id, OLD.proof_public_key, OLD.proof_key_thumbprint, OLD.rotated_from_credential_id) THEN
       RAISE EXCEPTION 'agent_credential_is_immutable' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'rail_agent_mandates' THEN
     IF ROW(NEW.mandate_id, NEW.agent_id, NEW.owner_wallet_id, NEW.mode, NEW.currency,
-        NEW.per_payment_limit_minor, NEW.total_budget_minor, NEW.allowed_receiver_wallet_ids, NEW.created_at, NEW.expires_at, NEW.consent_receipt_version)
+        NEW.per_payment_limit_minor, NEW.total_budget_minor, NEW.allowed_receiver_wallet_ids, NEW.created_at, NEW.expires_at, NEW.consent_receipt_version, NEW.owner_step_up_challenge_id)
       IS DISTINCT FROM ROW(OLD.mandate_id, OLD.agent_id, OLD.owner_wallet_id, OLD.mode, OLD.currency,
-        OLD.per_payment_limit_minor, OLD.total_budget_minor, OLD.allowed_receiver_wallet_ids, OLD.created_at, OLD.expires_at, OLD.consent_receipt_version) THEN
+        OLD.per_payment_limit_minor, OLD.total_budget_minor, OLD.allowed_receiver_wallet_ids, OLD.created_at, OLD.expires_at, OLD.consent_receipt_version, OLD.owner_step_up_challenge_id) THEN
       RAISE EXCEPTION 'agent_mandate_policy_is_immutable' USING ERRCODE = '23514';
     END IF;
   END IF;
@@ -641,9 +900,9 @@ LANGUAGE plpgsql AS $$
 BEGIN
   IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'agent_intent_history_is_immutable' USING ERRCODE = '23514'; END IF;
   IF ROW(NEW.intent_id, NEW.agent_id, NEW.mandate_id, NEW.owner_wallet_id, NEW.client_request_id,
-      NEW.proposal_fingerprint, NEW.request_fingerprint, NEW.receiver_wallet_id, NEW.amount_minor, NEW.currency, NEW.created_at, NEW.expires_at, NEW.authority_receipt_version, NEW.owner_evidence_version, NEW.checkout, NEW.merchant_attestation)
+      NEW.proposal_fingerprint, NEW.request_fingerprint, NEW.receiver_wallet_id, NEW.amount_minor, NEW.currency, NEW.created_at, NEW.expires_at, NEW.authority_receipt_version, NEW.owner_evidence_version, NEW.checkout, NEW.merchant_attestation, NEW.owner_step_up_version)
     IS DISTINCT FROM ROW(OLD.intent_id, OLD.agent_id, OLD.mandate_id, OLD.owner_wallet_id, OLD.client_request_id,
-      OLD.proposal_fingerprint, OLD.request_fingerprint, OLD.receiver_wallet_id, OLD.amount_minor, OLD.currency, OLD.created_at, OLD.expires_at, OLD.authority_receipt_version, OLD.owner_evidence_version, OLD.checkout, OLD.merchant_attestation)
+      OLD.proposal_fingerprint, OLD.request_fingerprint, OLD.receiver_wallet_id, OLD.amount_minor, OLD.currency, OLD.created_at, OLD.expires_at, OLD.authority_receipt_version, OLD.owner_evidence_version, OLD.checkout, OLD.merchant_attestation, OLD.owner_step_up_version)
     OR (OLD.status IN ('rejected','expired','executed') AND ROW(NEW.status, NEW.terminal_reason, NEW.payment_tx_id, NEW.executed_at)
       IS DISTINCT FROM ROW(OLD.status, OLD.terminal_reason, OLD.payment_tx_id, OLD.executed_at))
     OR (OLD.status = 'approved' AND NEW.status = 'pending') OR (OLD.status = 'pending' AND NEW.status = 'executed') THEN
@@ -912,6 +1171,9 @@ CREATE TRIGGER rail_agent_owner_evidence_immutable BEFORE UPDATE OR DELETE ON ra
 DROP TRIGGER IF EXISTS rail_agent_nonce_immutable ON rail_agent_evidence_nonces;
 CREATE TRIGGER rail_agent_nonce_immutable BEFORE UPDATE OR DELETE ON rail_agent_evidence_nonces
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
+DROP TRIGGER IF EXISTS rail_owner_passkey_no_delete ON rail_owner_passkeys;
+CREATE TRIGGER rail_owner_passkey_no_delete BEFORE DELETE ON rail_owner_passkeys
+  FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
 DROP TRIGGER IF EXISTS rail_audit_batch_immutable ON rail_audit_batches;
 CREATE TRIGGER rail_audit_batch_immutable BEFORE UPDATE OR DELETE ON rail_audit_batches
   FOR EACH ROW EXECUTE FUNCTION rail_reject_history_mutation();
@@ -987,6 +1249,218 @@ END $$;
 DROP TRIGGER IF EXISTS rail_used_authorization_immutable ON authorizations;
 CREATE TRIGGER rail_used_authorization_immutable BEFORE UPDATE ON authorizations
   FOR EACH ROW EXECUTE FUNCTION rail_protect_used_authorization();
+
+ALTER TABLE rail_owner_challenges DROP CONSTRAINT IF EXISTS rail_owner_challenges_operation_check;
+ALTER TABLE rail_owner_challenges ADD CONSTRAINT rail_owner_challenges_operation_check
+  CHECK(operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes','shared_budget'));
+ALTER TABLE rail_owner_step_up_grants DROP CONSTRAINT IF EXISTS rail_owner_step_up_grants_operation_check;
+ALTER TABLE rail_owner_step_up_grants ADD CONSTRAINT rail_owner_step_up_grants_operation_check
+  CHECK(operation IN ('agent_credential','agent_mandate','agent_approval','passkey_enroll','passkey_revoke','recovery_codes','shared_budget'));
+
+CREATE TABLE IF NOT EXISTS rail_shared_budgets (
+  budget_id UUID PRIMARY KEY, owner_wallet_id TEXT NOT NULL REFERENCES wallets(wallet_id),
+  name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 80), currency TEXT NOT NULL CHECK(currency ~ '^[A-Z]{3}$'),
+  total_budget_minor BIGINT NOT NULL CHECK(total_budget_minor BETWEEN 1 AND 1000000000000),
+  reserved_budget_minor BIGINT NOT NULL DEFAULT 0 CHECK(reserved_budget_minor>=0),
+  spent_budget_minor BIGINT NOT NULL DEFAULT 0 CHECK(spent_budget_minor>=0),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+  created_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ, created_control_id UUID NOT NULL, current_control_id UUID NOT NULL, revoked_control_id UUID,
+  UNIQUE(budget_id,owner_wallet_id), CHECK(reserved_budget_minor+spent_budget_minor<=total_budget_minor),
+  CHECK(expires_at>created_at AND expires_at<=created_at+interval '30 days'),
+  CHECK((revoked_at IS NULL)=(revoked_control_id IS NULL)), CHECK(revoked_at IS NULL OR revoked_at>=created_at)
+);
+CREATE INDEX IF NOT EXISTS idx_shared_budgets_owner ON rail_shared_budgets(owner_wallet_id,created_at,budget_id);
+CREATE TABLE IF NOT EXISTS rail_shared_budget_controls (
+  control_id UUID PRIMARY KEY, budget_id UUID NOT NULL, owner_wallet_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK(action IN ('create','limit','member_add','member_remove','revoke')),
+  canonical_payload TEXT NOT NULL CHECK(octet_length(canonical_payload) BETWEEN 10 AND 8192),
+  operation_fingerprint TEXT NOT NULL CHECK(operation_fingerprint=encode(sha256(convert_to(canonical_payload,'UTF8')),'hex')),
+  step_up_challenge_id UUID UNIQUE REFERENCES rail_owner_step_up_grants(challenge_id),
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  FOREIGN KEY(budget_id,owner_wallet_id) REFERENCES rail_shared_budgets(budget_id,owner_wallet_id) DEFERRABLE INITIALLY DEFERRED,
+  UNIQUE(control_id,budget_id,owner_wallet_id),
+  CHECK(jsonb_typeof(canonical_payload::jsonb)='array' AND jsonb_array_length(canonical_payload::jsonb)=5),
+  CHECK(COALESCE(canonical_payload::jsonb->>0='rail:owner-operation:v1' AND canonical_payload::jsonb->>1='shared_budget'
+    AND canonical_payload::jsonb->>2=action AND (CASE WHEN action='create' THEN canonical_payload::jsonb->3='null'::jsonb
+      ELSE canonical_payload::jsonb->>3=budget_id::text END),false))
+);
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='rail_shared_budgets'::regclass AND conname='shared_budget_creation_control') THEN
+    ALTER TABLE rail_shared_budgets ADD CONSTRAINT shared_budget_creation_control FOREIGN KEY(created_control_id,budget_id,owner_wallet_id)
+      REFERENCES rail_shared_budget_controls(control_id,budget_id,owner_wallet_id) DEFERRABLE INITIALLY DEFERRED;
+    ALTER TABLE rail_shared_budgets ADD CONSTRAINT shared_budget_current_control FOREIGN KEY(current_control_id,budget_id,owner_wallet_id)
+      REFERENCES rail_shared_budget_controls(control_id,budget_id,owner_wallet_id) DEFERRABLE INITIALLY DEFERRED;
+    ALTER TABLE rail_shared_budgets ADD CONSTRAINT shared_budget_revocation_control FOREIGN KEY(revoked_control_id,budget_id,owner_wallet_id)
+      REFERENCES rail_shared_budget_controls(control_id,budget_id,owner_wallet_id) DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS rail_shared_budget_members (
+  budget_id UUID NOT NULL, agent_id UUID NOT NULL, owner_wallet_id TEXT NOT NULL,
+  created_control_id UUID NOT NULL, revoked_control_id UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), revoked_at TIMESTAMPTZ,
+  PRIMARY KEY(budget_id,agent_id,owner_wallet_id),
+  FOREIGN KEY(budget_id,owner_wallet_id) REFERENCES rail_shared_budgets(budget_id,owner_wallet_id),
+  FOREIGN KEY(agent_id,owner_wallet_id) REFERENCES rail_agents(agent_id,owner_wallet_id),
+  FOREIGN KEY(created_control_id,budget_id,owner_wallet_id) REFERENCES rail_shared_budget_controls(control_id,budget_id,owner_wallet_id),
+  FOREIGN KEY(revoked_control_id,budget_id,owner_wallet_id) REFERENCES rail_shared_budget_controls(control_id,budget_id,owner_wallet_id),
+  CHECK((revoked_at IS NULL)=(revoked_control_id IS NULL)), CHECK(revoked_at IS NULL OR revoked_at>=created_at)
+);
+ALTER TABLE rail_agent_mandates ADD COLUMN IF NOT EXISTS shared_budget_id UUID;
+ALTER TABLE rail_agent_intents ADD COLUMN IF NOT EXISTS shared_budget_id UUID;
+ALTER TABLE rail_agent_intents DROP CONSTRAINT IF EXISTS rail_agent_intents_terminal_reason_check;
+ALTER TABLE rail_agent_intents ADD CONSTRAINT rail_agent_intents_terminal_reason_check
+  CHECK(terminal_reason IN ('owner_rejected','agent_revoked','mandate_revoked','deadline_expired','shared_budget_revoked','shared_budget_membership_revoked'));
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='rail_agent_mandates'::regclass AND conname='agent_shared_budget_membership') THEN
+    ALTER TABLE rail_agent_mandates ADD CONSTRAINT agent_shared_budget_membership FOREIGN KEY(shared_budget_id,agent_id,owner_wallet_id)
+      REFERENCES rail_shared_budget_members(budget_id,agent_id,owner_wallet_id);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_agent_mandate_shared_budget ON rail_agent_mandates(shared_budget_id,agent_id) WHERE shared_budget_id IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION rail_protect_shared_budget_history() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+  IF TG_OP='DELETE' OR TG_TABLE_NAME='rail_shared_budget_controls' THEN
+    RAISE EXCEPTION 'shared_budget_history_is_immutable' USING ERRCODE='23514';
+  END IF;
+  IF TG_TABLE_NAME IN ('rail_agent_mandates','rail_agent_intents') THEN
+    IF NEW.shared_budget_id IS DISTINCT FROM OLD.shared_budget_id THEN
+      RAISE EXCEPTION 'shared_budget_binding_is_immutable' USING ERRCODE='23514';
+    END IF;
+  ELSIF TG_TABLE_NAME='rail_shared_budgets' THEN
+    IF ROW(NEW.budget_id,NEW.owner_wallet_id,NEW.name,NEW.currency,NEW.created_at,NEW.expires_at,NEW.created_control_id)
+      IS DISTINCT FROM ROW(OLD.budget_id,OLD.owner_wallet_id,OLD.name,OLD.currency,OLD.created_at,OLD.expires_at,OLD.created_control_id)
+      OR (OLD.revoked_at IS NOT NULL AND ROW(NEW.revoked_at,NEW.revoked_control_id,NEW.total_budget_minor,NEW.revision,NEW.current_control_id)
+        IS DISTINCT FROM ROW(OLD.revoked_at,OLD.revoked_control_id,OLD.total_budget_minor,OLD.revision,OLD.current_control_id)) THEN
+      RAISE EXCEPTION 'shared_budget_policy_is_immutable' USING ERRCODE='23514';
+    END IF;
+    IF ROW(NEW.total_budget_minor,NEW.revision,NEW.current_control_id) IS DISTINCT FROM ROW(OLD.total_budget_minor,OLD.revision,OLD.current_control_id)
+      AND (NEW.revision<>OLD.revision+1 OR NEW.current_control_id=OLD.current_control_id) THEN
+      RAISE EXCEPTION 'shared_budget_revision_invalid' USING ERRCODE='23514';
+    END IF;
+  ELSE
+    IF ROW(NEW.budget_id,NEW.agent_id,NEW.owner_wallet_id,NEW.created_at,NEW.created_control_id)
+      IS DISTINCT FROM ROW(OLD.budget_id,OLD.agent_id,OLD.owner_wallet_id,OLD.created_at,OLD.created_control_id)
+      OR (OLD.revoked_at IS NOT NULL AND ROW(NEW.revoked_at,NEW.revoked_control_id) IS DISTINCT FROM ROW(OLD.revoked_at,OLD.revoked_control_id)) THEN
+      RAISE EXCEPTION 'shared_budget_membership_is_immutable' USING ERRCODE='23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_shared_control_immutable ON rail_shared_budget_controls;
+CREATE TRIGGER rail_shared_control_immutable BEFORE UPDATE OR DELETE ON rail_shared_budget_controls FOR EACH ROW EXECUTE FUNCTION rail_protect_shared_budget_history();
+DROP TRIGGER IF EXISTS rail_shared_budget_immutable ON rail_shared_budgets;
+CREATE TRIGGER rail_shared_budget_immutable BEFORE UPDATE OR DELETE ON rail_shared_budgets FOR EACH ROW EXECUTE FUNCTION rail_protect_shared_budget_history();
+DROP TRIGGER IF EXISTS rail_shared_member_immutable ON rail_shared_budget_members;
+CREATE TRIGGER rail_shared_member_immutable BEFORE UPDATE OR DELETE ON rail_shared_budget_members FOR EACH ROW EXECUTE FUNCTION rail_protect_shared_budget_history();
+DROP TRIGGER IF EXISTS rail_shared_mandate_binding ON rail_agent_mandates;
+CREATE TRIGGER rail_shared_mandate_binding BEFORE UPDATE ON rail_agent_mandates FOR EACH ROW EXECUTE FUNCTION rail_protect_shared_budget_history();
+DROP TRIGGER IF EXISTS rail_shared_intent_binding ON rail_agent_intents;
+CREATE TRIGGER rail_shared_intent_binding BEFORE UPDATE ON rail_agent_intents FOR EACH ROW EXECUTE FUNCTION rail_protect_shared_budget_history();
+
+CREATE OR REPLACE FUNCTION rail_check_shared_budget_control() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE terms JSONB; policy rail_shared_budgets%ROWTYPE; control rail_shared_budget_controls%ROWTYPE;
+BEGIN
+  IF TG_TABLE_NAME='rail_shared_budget_controls' THEN
+    IF NEW.step_up_challenge_id IS NOT NULL AND NOT EXISTS(
+      SELECT 1 FROM rail_owner_step_up_grants grant_record JOIN users owner ON owner.user_id=grant_record.user_id
+      WHERE grant_record.challenge_id=NEW.step_up_challenge_id AND owner.wallet_id=NEW.owner_wallet_id
+        AND grant_record.operation='shared_budget' AND grant_record.operation_fingerprint=NEW.operation_fingerprint
+        AND grant_record.consumed_at IS NOT NULL AND grant_record.consumed_at<=NEW.recorded_at
+        AND grant_record.consumed_at<grant_record.expires_at) THEN
+      RAISE EXCEPTION 'shared_budget_step_up_binding_invalid' USING ERRCODE='23514';
+    END IF;
+  ELSIF TG_TABLE_NAME='rail_shared_budgets' THEN
+    SELECT * INTO policy FROM rail_shared_budgets WHERE budget_id=NEW.budget_id;
+    SELECT * INTO control FROM rail_shared_budget_controls WHERE control_id=policy.created_control_id;
+    terms:=control.canonical_payload::jsonb->4;
+    IF control.action IS DISTINCT FROM 'create' OR terms->>0 IS DISTINCT FROM policy.name OR terms->>1 IS DISTINCT FROM policy.currency
+      OR terms->4 IS DISTINCT FROM (SELECT jsonb_agg(agent_id::text ORDER BY agent_id) FROM rail_shared_budget_members
+        WHERE budget_id=policy.budget_id AND created_control_id=policy.created_control_id)
+      OR (terms->>3)::integer IS DISTINCT FROM extract(epoch FROM policy.expires_at-policy.created_at)::integer THEN
+      RAISE EXCEPTION 'shared_budget_creation_binding_invalid' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO control FROM rail_shared_budget_controls WHERE control_id=policy.current_control_id;
+    terms:=control.canonical_payload::jsonb->4;
+    IF (policy.revision=1 AND (control.action IS DISTINCT FROM 'create' OR (terms->>2)::bigint IS DISTINCT FROM policy.total_budget_minor))
+      OR (policy.revision>1 AND (control.action IS DISTINCT FROM 'limit' OR (terms->>0)::integer IS DISTINCT FROM policy.revision-1
+        OR (terms->>1)::bigint IS DISTINCT FROM policy.total_budget_minor)) THEN
+      RAISE EXCEPTION 'shared_budget_limit_binding_invalid' USING ERRCODE='23514';
+    END IF;
+    IF policy.revoked_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rail_shared_budget_controls
+      WHERE control_id=policy.revoked_control_id AND action='revoke' AND recorded_at<=policy.revoked_at) THEN
+      RAISE EXCEPTION 'shared_budget_revocation_binding_invalid' USING ERRCODE='23514';
+    END IF;
+  ELSE
+    SELECT * INTO control FROM rail_shared_budget_controls WHERE control_id=NEW.created_control_id;
+    terms:=control.canonical_payload::jsonb->4;
+    IF NOT COALESCE((control.action='create' AND terms->4 @> jsonb_build_array(NEW.agent_id::text))
+      OR (control.action='member_add' AND terms=jsonb_build_array(NEW.agent_id::text)),false) THEN
+      RAISE EXCEPTION 'shared_budget_membership_binding_invalid' USING ERRCODE='23514';
+    END IF;
+    IF NEW.revoked_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM rail_shared_budget_controls
+      WHERE control_id=NEW.revoked_control_id AND action='member_remove' AND canonical_payload::jsonb->4=jsonb_build_array(NEW.agent_id::text)
+        AND recorded_at<=NEW.revoked_at) THEN
+      RAISE EXCEPTION 'shared_budget_member_revocation_invalid' USING ERRCODE='23514';
+    END IF;
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_shared_control_binding ON rail_shared_budget_controls;
+CREATE CONSTRAINT TRIGGER rail_shared_control_binding AFTER INSERT ON rail_shared_budget_controls DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_control();
+DROP TRIGGER IF EXISTS rail_shared_budget_binding ON rail_shared_budgets;
+CREATE CONSTRAINT TRIGGER rail_shared_budget_binding AFTER INSERT OR UPDATE ON rail_shared_budgets DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_control();
+DROP TRIGGER IF EXISTS rail_shared_member_binding ON rail_shared_budget_members;
+CREATE CONSTRAINT TRIGGER rail_shared_member_binding AFTER INSERT OR UPDATE ON rail_shared_budget_members DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_control();
+
+CREATE OR REPLACE FUNCTION rail_account_shared_budget() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE id UUID; old_held BIGINT:=0; old_spent BIGINT:=0; new_held BIGINT:=0; new_spent BIGINT:=0;
+BEGIN
+  SELECT shared_budget_id INTO id FROM rail_agent_mandates WHERE mandate_id=NEW.mandate_id;
+  IF NEW.shared_budget_id IS DISTINCT FROM id THEN RAISE EXCEPTION 'shared_budget_binding_invalid' USING ERRCODE='23514'; END IF;
+  IF id IS NULL THEN RETURN NULL; END IF;
+  IF TG_OP='UPDATE' THEN
+    IF OLD.status IN ('pending','approved') THEN old_held:=OLD.amount_minor; END IF;
+    IF OLD.status='executed' THEN old_spent:=OLD.amount_minor; END IF;
+  END IF;
+  IF NEW.status IN ('pending','approved') THEN new_held:=NEW.amount_minor; END IF;
+  IF NEW.status='executed' THEN new_spent:=NEW.amount_minor; END IF;
+  IF new_held=old_held AND new_spent=old_spent THEN RETURN NULL; END IF;
+  UPDATE rail_shared_budgets SET reserved_budget_minor=reserved_budget_minor+new_held-old_held,
+    spent_budget_minor=spent_budget_minor+new_spent-old_spent
+    WHERE budget_id=id AND owner_wallet_id=NEW.owner_wallet_id AND currency=NEW.currency
+      AND reserved_budget_minor+new_held-old_held>=0 AND spent_budget_minor+new_spent-old_spent>=0
+      AND reserved_budget_minor+new_held-old_held+spent_budget_minor+new_spent-old_spent<=total_budget_minor
+      AND ((new_held<=old_held AND new_spent<=old_spent) OR (revoked_at IS NULL AND expires_at>clock_timestamp()
+        AND EXISTS(SELECT 1 FROM rail_shared_budget_members member WHERE member.budget_id=id
+          AND member.agent_id=NEW.agent_id AND member.owner_wallet_id=NEW.owner_wallet_id AND member.revoked_at IS NULL)));
+  IF NOT FOUND THEN RAISE EXCEPTION 'shared_budget_unavailable' USING ERRCODE='23514'; END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_shared_intent_accounting ON rail_agent_intents;
+CREATE TRIGGER rail_shared_intent_accounting AFTER INSERT OR UPDATE ON rail_agent_intents FOR EACH ROW EXECUTE FUNCTION rail_account_shared_budget();
+CREATE OR REPLACE FUNCTION rail_check_shared_budget_totals() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+DECLARE id UUID;
+BEGIN
+  IF TG_TABLE_NAME='rail_shared_budgets' THEN id:=NEW.budget_id;
+  ELSE SELECT shared_budget_id INTO id FROM rail_agent_mandates WHERE mandate_id=NEW.mandate_id; END IF;
+  IF id IS NOT NULL AND EXISTS(SELECT 1 FROM rail_shared_budgets budget WHERE budget.budget_id=id AND
+    (budget.reserved_budget_minor<>COALESCE((SELECT sum(intent.amount_minor) FROM rail_agent_intents intent
+      JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id WHERE mandate.shared_budget_id=id AND intent.status IN ('pending','approved')),0)
+    OR budget.spent_budget_minor<>COALESCE((SELECT sum(intent.amount_minor) FROM rail_agent_intents intent
+      JOIN rail_agent_mandates mandate ON mandate.mandate_id=intent.mandate_id WHERE mandate.shared_budget_id=id AND intent.status='executed'),0))) THEN
+    RAISE EXCEPTION 'shared_budget_accounting_mismatch' USING ERRCODE='23514';
+  END IF;
+  RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS rail_shared_totals_check ON rail_shared_budgets;
+CREATE CONSTRAINT TRIGGER rail_shared_totals_check AFTER INSERT OR UPDATE ON rail_shared_budgets DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_totals();
+DROP TRIGGER IF EXISTS rail_shared_intent_totals_check ON rail_agent_intents;
+CREATE CONSTRAINT TRIGGER rail_shared_intent_totals_check AFTER INSERT OR UPDATE ON rail_agent_intents DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rail_check_shared_budget_totals();
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {

@@ -1,4 +1,5 @@
 import jwt from "jsonwebtoken";
+import { randomUUID } from "node:crypto";
 
 const JWT_ISSUER = "rail";
 const JWT_AUDIENCE = "rail-clients";
@@ -22,6 +23,7 @@ export function generateToken(userId: string, authVersion = 0) {
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
     algorithm: "HS256",
+    jwtid: randomUUID(),
   });
 }
 

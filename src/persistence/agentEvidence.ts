@@ -5,7 +5,7 @@ import { TransactionKeyRing, loadTransactionKeyRing } from "../crypto/transactio
 import { protectRecord, decryptRecord, type RiskEnvelope } from "./riskProtection.js";
 import type { OwnerPrincipal } from "../server/types.js";
 import { RequestError } from "../server/http.js";
-import type { AgentCheckout } from "./agentAuthority.js";
+import { credentialOperationFingerprint, mandateOperationFingerprint, approvalOperationFingerprint, type AgentCheckout } from "./agentAuthority.js";
 import { verifyMerchantAttestation, type MerchantAttestation } from "../crypto/merchantQuotes.js";
 
 export interface AgentAuthorityReceipt {
@@ -29,7 +29,9 @@ export interface AgentAuthorityReceipt {
   readonly checkout?: AgentCheckout;
   readonly quoteAssurance?: "agent_proposed_unverified" | "configured_merchant_signature";
   readonly merchantAttestation?: MerchantAttestation;
+  readonly credentialOwnerStepUp?: { readonly method: "passkey"; readonly credentialId: string; readonly challengeId: string; readonly operationFingerprint: string };
   readonly policy: {
+    readonly sharedBudgetId?: string;
     readonly mode: "approval_required" | "budgeted";
     readonly currency: string;
     readonly perPaymentLimitMinor: number;
@@ -62,12 +64,21 @@ export function loadAgentAuthorityKeyRing(raw: string, otherRings: readonly Tran
 const SELECT = `SELECT intent.*, execution.request_fingerprint AS payment_fingerprint,
   mandate.mode, mandate.currency AS policy_currency, mandate.per_payment_limit_minor, mandate.total_budget_minor,
   mandate.allowed_receiver_wallet_ids, mandate.created_at AS policy_created_at, mandate.expires_at AS policy_expires_at,
-  credential.credential_id, credential.scope, credential.created_at AS credential_created_at, credential.expires_at AS credential_expires_at
+  credential.credential_id, credential.scope, credential.proof_public_key, credential.rotated_from_credential_id, credential.created_at AS credential_created_at, credential.expires_at AS credential_expires_at,
+  grant_record.challenge_id AS credential_challenge_id, grant_record.credential_id AS owner_passkey_id,
+  grant_record.operation AS credential_operation, grant_record.operation_fingerprint AS credential_operation_fingerprint,
+  grant_record.consumed_at AS credential_grant_consumed_at, grant_record.expires_at AS credential_grant_expires_at
   FROM rail_agent_intents intent JOIN rail_payment_executions execution ON execution.tx_id = intent.payment_tx_id
   JOIN rail_agent_mandates mandate ON mandate.mandate_id = intent.mandate_id
-  JOIN rail_agent_credentials credential ON credential.agent_id = intent.agent_id`;
+  JOIN rail_agent_credentials credential ON credential.agent_id = intent.agent_id
+  LEFT JOIN rail_owner_step_up_grants grant_record ON grant_record.challenge_id=credential.owner_step_up_challenge_id`;
 
 interface AuthorityRow {
+  shared_budget_id: string | null;
+  rotated_from_credential_id: string | null;
+  proof_public_key: unknown | null;
+  credential_challenge_id: string | null; owner_passkey_id: string | null; credential_operation: string | null;
+  credential_operation_fingerprint: string | null; credential_grant_consumed_at: Date | null; credential_grant_expires_at: Date | null;
   checkout: AgentCheckout | null;
   merchant_attestation: MerchantAttestation | null;
   owner_evidence_version: number | null;
@@ -78,6 +89,14 @@ interface AuthorityRow {
   total_budget_minor: string; allowed_receiver_wallet_ids: string[]; policy_created_at: Date; policy_expires_at: Date;
 }
 function receipt(row: AuthorityRow): AgentAuthorityReceipt {
+  if (row.credential_challenge_id && (!row.owner_passkey_id || row.credential_operation !== "agent_credential" ||
+      !row.credential_grant_consumed_at || !row.credential_grant_expires_at ||
+      new Date(row.credential_grant_consumed_at) > new Date(row.credential_created_at) ||
+      new Date(row.credential_grant_consumed_at) >= new Date(row.credential_grant_expires_at) ||
+      row.credential_operation_fingerprint !== credentialOperationFingerprint(row.agent_id, { scope: row.scope,
+        ...(row.proof_public_key ? { publicKey: row.proof_public_key } : {}),
+        ...(row.rotated_from_credential_id ? { rotatedFromCredentialId: row.rotated_from_credential_id } : {}),
+        ttlSeconds: (new Date(row.credential_expires_at).getTime() - new Date(row.credential_created_at).getTime()) / 1000 }))) throw new Error("agent_credential_step_up_invalid");
   if (row.merchant_attestation) verifyMerchantAttestation(row.checkout!, row.merchant_attestation);
   if (row.status !== "executed" || row.scope !== "payments:execute" ||
       new Date(row.executed_at) < new Date(row.credential_created_at) || new Date(row.executed_at) >= new Date(row.credential_expires_at)) {
@@ -87,11 +106,14 @@ function receipt(row: AuthorityRow): AgentAuthorityReceipt {
     agentId: row.agent_id, mandateId: row.mandate_id, intentId: row.intent_id, txId: row.payment_tx_id,
     intentFingerprint: row.request_fingerprint, paymentFingerprint: row.payment_fingerprint,
     credentialId: row.credential_id, credentialScope: "payments:execute",
+    ...(row.credential_challenge_id ? { credentialOwnerStepUp: { method: "passkey" as const, credentialId: row.owner_passkey_id!,
+      challengeId: row.credential_challenge_id, operationFingerprint: row.credential_operation_fingerprint! } } : {}),
     consentSource: row.mode === "budgeted" ? "advance_budget_mandate" : "exact_approved_intent",
     receiverWalletId: row.receiver_wallet_id, amountMinor: Number(row.amount_minor), executedAt: new Date(row.executed_at).toISOString(),
     ...(row.checkout ? { checkout: row.checkout, quoteAssurance: row.merchant_attestation ? "configured_merchant_signature" as const : "agent_proposed_unverified" as const,
       ...(row.merchant_attestation ? { merchantAttestation: row.merchant_attestation } : {}) } : {}),
     policy: { mode: row.mode, currency: row.policy_currency, perPaymentLimitMinor: Number(row.per_payment_limit_minor),
+      ...(row.shared_budget_id ? { sharedBudgetId: row.shared_budget_id } : {}),
       totalBudgetMinor: Number(row.total_budget_minor), allowedReceiverWalletIds: [...row.allowed_receiver_wallet_ids].sort(),
       createdAt: new Date(row.policy_created_at).toISOString(), expiresAt: new Date(row.policy_expires_at).toISOString() } };
 }
@@ -123,6 +145,7 @@ export class AgentEvidenceStore {
     if (!row) throw new Error("agent_owner_evidence_binding_missing");
     const body = { version: 1, ownerWalletId: String(row.owner_wallet_id), agentId: String(row.agent_id), mandateId,
       policy: { mode: String(row.mode), currency: String(row.currency), perPaymentLimitMinor: Number(row.per_payment_limit_minor),
+        ...(row.shared_budget_id ? { sharedBudgetId: String(row.shared_budget_id) } : {}),
         totalBudgetMinor: Number(row.total_budget_minor), allowedReceiverWalletIds: [...row.allowed_receiver_wallet_ids].sort(),
         createdAt: new Date(row.created_at).toISOString(), expiresAt: new Date(row.expires_at).toISOString() } };
     if (!intentId) return body;
@@ -148,19 +171,45 @@ export class AgentEvidenceStore {
       if (!user.rowCount) throw new RequestError(401, "invalid_owner_credentials", "owner authentication is no longer valid");
       authentication = { walletId: principal.walletId, method: "owner_jwt", userId: principal.userId, authVersion: principal.authVersion };
     }
+    if (principal.stepUp) {
+      if (decision?.decision === "reject") throw new Error("agent_owner_step_up_invalid");
+      authentication = { ...authentication, stepUp: await this.checkStepUp(client, principal, body, decision?.intentId) };
+    }
     const purpose = decision ? (decision.decision === "approve" ? "agent-approval-v1" : "agent-rejection-v1") : "agent-mandate-v1";
     const subjectId = decision?.intentId ?? mandateId;
     const recordedAt = new Date((await client.query("SELECT clock_timestamp() AS now")).rows[0].now).toISOString();
     const value = { ...body, authentication, recordedAt, decision: decision?.decision ?? "mandate_consent" };
     const expected = this.ownerBinding(purpose, subjectId, body);
     const protectedRecord = await this.protect(client, value, expected, purpose);
-    await client.query(`INSERT INTO rail_agent_owner_evidence(subject_id, purpose, mandate_id, intent_id, recorded_at, key_fingerprint, nonce, envelope, commitment)
-      VALUES ($1,$2,$3,$4,$5::timestamptz,$6,$7,$8::jsonb,$9)`, [subjectId, purpose, mandateId, decision?.intentId ?? null,
-      recordedAt, protectedRecord.keyFingerprint, protectedRecord.envelope.nonce, JSON.stringify(protectedRecord.envelope), protectedRecord.commitment]);
+    await client.query(`INSERT INTO rail_agent_owner_evidence(subject_id, purpose, mandate_id, intent_id, recorded_at, key_fingerprint, nonce, envelope, commitment, step_up_challenge_id)
+      VALUES ($1,$2,$3,$4,$5::timestamptz,$6,$7,$8::jsonb,$9,$10::uuid)`, [subjectId, purpose, mandateId, decision?.intentId ?? null,
+      recordedAt, protectedRecord.keyFingerprint, protectedRecord.envelope.nonce, JSON.stringify(protectedRecord.envelope), protectedRecord.commitment, authentication.stepUp?.challengeId ?? null]);
   }
 
   private ownerBinding(purpose: string, subjectId: string, body: object) {
     return { txId: subjectId, requestFingerprint: createHash("sha256").update(JSON.stringify(["rail:owner-evidence:v1", purpose, body])).digest("hex") };
+  }
+
+  private async checkStepUp(client: PoolClient, principal: OwnerPrincipal, body: Awaited<ReturnType<AgentEvidenceStore["ownerBody"]>>, intentId?: string): Promise<OwnerPrincipal["stepUp"]> {
+    const proof = principal.stepUp;
+    if (!proof) return undefined;
+    if (principal.method !== "owner_jwt" || proof.method !== "passkey" || Object.keys(proof).length !== 5)
+      throw new Error("agent_owner_step_up_invalid");
+    const policy = body.policy;
+    const expected = intentId ? approvalOperationFingerprint(body.agentId, intentId, (body as { intentFingerprint: string }).intentFingerprint)
+      : mandateOperationFingerprint(body.agentId, { ...policy, ttlSeconds: (Date.parse(policy.expiresAt) - Date.parse(policy.createdAt)) / 1000 });
+    const operation = intentId ? "agent_approval" : "agent_mandate";
+    if (proof.operation !== operation || proof.operationFingerprint !== expected) throw new Error("agent_owner_step_up_invalid");
+    const found = await client.query(`SELECT 1 FROM rail_owner_step_up_grants grant_record JOIN rail_owner_passkeys key
+      ON key.credential_id=grant_record.credential_id AND key.user_id=grant_record.user_id
+      JOIN users owner ON owner.user_id=grant_record.user_id
+      WHERE grant_record.challenge_id=$1 AND grant_record.credential_id=$2 AND grant_record.user_id=$3 AND owner.wallet_id=$4
+        AND grant_record.auth_version=$5 AND grant_record.operation=$6 AND grant_record.operation_fingerprint=$7
+        AND grant_record.consumed_at IS NOT NULL AND grant_record.consumed_at>=grant_record.created_at
+        AND grant_record.consumed_at<grant_record.expires_at`,
+      [proof.challengeId, proof.credentialId, principal.userId, principal.walletId, principal.authVersion, operation, expected]);
+    if (!found.rowCount) throw new Error("agent_owner_step_up_invalid");
+    return { method: "passkey", credentialId: proof.credentialId, challengeId: proof.challengeId, operation, operationFingerprint: expected };
   }
 
   private async readOwner(client: PoolClient, mandateId: string, purpose: "agent-mandate-v1" | "agent-approval-v1", intentId?: string) {
@@ -173,8 +222,10 @@ export class AgentEvidenceStore {
     if (!auth || auth.walletId !== body.ownerWalletId || (auth.method !== "trusted_library" && auth.method !== "owner_jwt") ||
         (auth.method === "owner_jwt" && (typeof auth.userId !== "string" || !auth.userId.trim() || !Number.isSafeInteger(auth.authVersion) || auth.authVersion! < 0)))
       throw new Error("agent_owner_evidence_invalid");
+    const stepUp = await this.checkStepUp(client, auth, body, intentId);
+    if ((stored.step_up_challenge_id ?? undefined) !== stepUp?.challengeId) throw new Error("agent_owner_step_up_invalid");
     const authentication: OwnerPrincipal = auth.method === "owner_jwt"
-      ? { walletId: auth.walletId, method: auth.method, userId: auth.userId, authVersion: auth.authVersion }
+      ? { walletId: auth.walletId, method: auth.method, userId: auth.userId, authVersion: auth.authVersion, ...(stepUp ? { stepUp } : {}) }
       : { walletId: auth.walletId, method: auth.method };
     const expected = { ...body, authentication, recordedAt: new Date(stored.recorded_at).toISOString(),
       decision: intentId ? "approve" : "mandate_consent" };
