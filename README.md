@@ -1,5 +1,7 @@
 # Rail
 
+[![Rail CI](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml/badge.svg)](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
+
 **Owner-controlled payment execution for AI agents and people.**
 
 Rail lets an owner delegate limited payment authority without handing an agent
@@ -86,6 +88,13 @@ npm run test:browser
 ```
 
 ## Documentation And Evidence
+
+Each Node 22/24 CI job publishes full-suite test counts, failures/skips, duration and
+informational backend coverage in its job summary. Download TAP, JUnit, LCOV and
+JSON reports from that run's artifacts (retained for 14 days). Coverage describes
+observed compiled modules, not every file or real-provider acceptance; no arbitrary
+coverage threshold is used to imply correctness. Focused diagnostic re-runs are
+not double-counted in these totals.
 
 - [CI workflow and published runs](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
 - [Detailed project README](docs/README.md)

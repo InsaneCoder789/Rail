@@ -38,6 +38,30 @@ Use it in the following ways:
 
 ## Latest Status
 
+### GitHub CI Metrics, 21 October 2026
+
+CI now records backend/browser test totals, passes, failures, skips and wall-clock
+suite duration separately for Node 22 and 24. Focused diagnostic re-runs are not
+double-counted. Backend tests additionally collect
+native Node coverage; the application summary filters to observed compiled `dist`
+modules, excluding test/dependency code. Coverage is informational: unimported
+modules and killed subprocesses may be absent, and browser execution is not included.
+Missing reports are shown as unavailable/not run, never fabricated zero failures.
+Full-suite reports fail closed on skipped/incomplete tests as well as process errors.
+
+Each job always attempts a Markdown summary and uploads TAP, JUnit, LCOV and JSON
+artifacts for 14 days, including failure diagnostics when available. A README badge
+links to real workflow status. These are test-suite metrics, not measured payment
+throughput, production security or provider acceptance. Local metrics verification
+passed all 461 backend tests and three browser journeys with zero failures/skips;
+TAP/JUnit/LCOV/JSON/Markdown outputs were generated and the dependency audit found
+zero known vulnerabilities. The disposable database was removed. On local Node
+20.19.6, observed coverage across 68 compiled modules was 95.89% lines, 96.19%
+functions and 87.95% branches; these are not remote Node 22/24 results or whole-repo
+coverage. Missing-report and runner-directory fallback checks also passed.
+The CI-only commit preserves the three simulator feature commits and will publish
+with them; remote workflow acceptance is pending, not claimed passed.
+
 ### Simulator Execution Queue And Recovery, 21 October 2026
 
 Added an explicitly enabled local-simulator execution path for owner-approved

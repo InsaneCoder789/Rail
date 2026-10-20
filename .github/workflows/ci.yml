@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         node: [22, 24]
-    timeout-minutes: 10
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16-alpine
@@ -53,7 +53,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Build and run full test suite
-        run: npm test
+        run: npm run test:ci
       - name: Run hardening tests explicitly
         run: node --test test/hardening.test.js
       - name: Verify protected transaction evidence and key lifecycle
@@ -77,7 +77,7 @@ jobs:
       - name: Install Chromium for native passkey acceptance
         run: npx playwright install --with-deps chromium
       - name: Verify native owner passkeys, payment approval and recovery through HTTP
-        run: npm run test:browser
+        run: node scripts/ci-metrics.mjs browser
       - name: Verify single-transaction authorization, evidence, rollback and replay composition
         run: node --test --test-name-pattern='transaction composition:' test/postgres.integration.test.js
       - name: Verify event delivery and stream lifecycle
@@ -100,3 +100,14 @@ jobs:
         run: node --test test/auditCommitment.test.js test/auditBatches.integration.test.js
       - name: Verify independent source and identity quotas, pre-auth limits and database clock consistency
         run: node --test test/routeQuotas.test.js
+      - name: Publish CI metrics summary
+        if: always()
+        run: node scripts/ci-metrics.mjs summary
+      - name: Upload test results and coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rail-ci-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/rail-ci/
+          if-no-files-found: warn
+          retention-days: 14

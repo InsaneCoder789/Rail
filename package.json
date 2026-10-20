@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "migrate": "npm run build && node dist/persistence/runMigrations.js",
     "test": "npm run build && node --test --test-concurrency=2 test/*.test.js",
+    "test:ci": "npm run build && node scripts/ci-metrics.mjs backend",
     "test:browser": "npm run build && node --test test/ownerPasskeys.browser.mjs",
     "risk:train": "npm run build && node dist/risk/trainRisk.js",
     "risk:monitor": "npm run build && node dist/risk/monitorRisk.js",
