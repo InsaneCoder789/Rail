@@ -117,6 +117,18 @@ async function lockProviderAuthority(client: PoolClient, binding: ProviderPaymen
   return mandate.rows[0];
 }
 
+export async function requireProviderSubmission(client: PoolClient, operationId: string, targets: ProviderTargetRegistry) {
+  const found = await client.query(`SELECT payment.*,proposal.target_snapshot FROM rail_provider_payments payment
+    JOIN rail_provider_proposals proposal USING(operation_id) WHERE operation_id=$1`, [operationId]);
+  const row = found.rows[0];
+  if (!row?.authorization_required) throw new Error("PROVIDER_ADMITTED_PROPOSAL_REQUIRED");
+  const payment = restore(row);
+  await lockProviderAuthority(client, payment.binding, true);
+  targets.requireCurrent(parseProviderTarget(row.target_snapshot));
+  if (Date.parse(payment.binding.authorizationExpiresAt) <= await databaseTime(client)) throw new Error("PROVIDER_AUTHORIZATION_EXPIRED");
+  return payment;
+}
+
 /** Trusted coordinator only: resolve provider/instrument/merchant ownership before calling. No agent-supplied mappings. */
 export async function authorizeProviderPaymentInTransaction(client: PoolClient, input: {
   readonly binding: ProviderPaymentBinding; readonly trustedMerchantWalletId: string;

@@ -1701,6 +1701,11 @@ END $$;
 DROP TRIGGER IF EXISTS rail_provider_proposal_immutable ON rail_provider_proposals;
 CREATE TRIGGER rail_provider_proposal_immutable BEFORE INSERT OR UPDATE OR DELETE ON rail_provider_proposals
   FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_proposal();
+CREATE TABLE IF NOT EXISTS rail_simulator_effects (
+  idempotency_key TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL CHECK(fingerprint ~ '^[a-f0-9]{64}$'),
+  observation JSONB NOT NULL
+);
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {
@@ -1755,6 +1760,57 @@ export async function ensureOutboxSchema(pool: Pool): Promise<void> {
       ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS last_delivery_error TEXT;
+    ALTER TABLE outbox
+      ADD COLUMN IF NOT EXISTS provider_operation_id UUID,
+      ADD COLUMN IF NOT EXISTS provider_credential_id UUID,
+      ADD COLUMN IF NOT EXISTS provider_proof_id TEXT,
+      ADD COLUMN IF NOT EXISTS provider_key_thumbprint TEXT;
+    DO $$ BEGIN
+      -- Notification-only installations may initialize the outbox before the payment schema.
+      IF to_regclass('rail_provider_proposals') IS NOT NULL AND NOT EXISTS(
+        SELECT 1 FROM pg_constraint WHERE conrelid='outbox'::regclass AND conname='outbox_provider_operation_fk') THEN
+        ALTER TABLE outbox ADD CONSTRAINT outbox_provider_operation_fk FOREIGN KEY(provider_operation_id) REFERENCES rail_provider_proposals(operation_id);
+      END IF;
+      IF to_regclass('rail_agent_credentials') IS NOT NULL AND NOT EXISTS(
+        SELECT 1 FROM pg_constraint WHERE conrelid='outbox'::regclass AND conname='outbox_provider_credential_fk') THEN
+        ALTER TABLE outbox ADD CONSTRAINT outbox_provider_credential_fk FOREIGN KEY(provider_credential_id) REFERENCES rail_agent_credentials(credential_id);
+      END IF;
+    END $$;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_provider_operation ON outbox(provider_operation_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_provider_proof ON outbox(provider_credential_id,provider_proof_id);
+    CREATE OR REPLACE FUNCTION rail_protect_payment_job() RETURNS TRIGGER
+    LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
+      IF TG_OP='DELETE' THEN
+        IF OLD.provider_operation_id IS NOT NULL THEN RAISE EXCEPTION 'provider_job_is_durable' USING ERRCODE='23514'; END IF;
+        RETURN OLD;
+      END IF;
+      IF TG_OP='UPDATE' AND ROW(NEW.provider_operation_id,NEW.provider_credential_id,NEW.provider_proof_id,NEW.provider_key_thumbprint)
+        IS DISTINCT FROM ROW(OLD.provider_operation_id,OLD.provider_credential_id,OLD.provider_proof_id,OLD.provider_key_thumbprint) THEN
+        RAISE EXCEPTION 'provider_job_binding_is_immutable' USING ERRCODE='23514';
+      END IF;
+      IF NEW.provider_operation_id IS NOT NULL THEN
+        IF NEW.work_kind<>'provider_payment' OR NEW.type<>'provider.execute' OR NEW.payload<>'{}'::jsonb OR NEW.delivery_status='dead_letter' THEN
+          RAISE EXCEPTION 'invalid_provider_job' USING ERRCODE='23514';
+        END IF;
+        IF TG_OP='INSERT' AND NOT EXISTS(
+          SELECT 1 FROM rail_provider_payments payment JOIN rail_provider_proposals proposal USING(operation_id)
+          JOIN rail_agent_credentials credential ON credential.agent_id=payment.agent_id
+          JOIN rail_agent_proof_nonces nonce ON nonce.credential_id=credential.credential_id
+          WHERE payment.operation_id=NEW.provider_operation_id AND payment.authorization_required AND payment.status='reserved'
+            AND credential.credential_id=NEW.provider_credential_id AND credential.scope='payments:execute'
+            AND credential.proof_key_thumbprint=NEW.provider_key_thumbprint AND credential.revoked_at IS NULL
+            AND credential.expires_at>clock_timestamp() AND nonce.proof_id=NEW.provider_proof_id
+            AND nonce.key_thumbprint=NEW.provider_key_thumbprint AND nonce.dispatched_at IS NOT NULL) THEN
+          RAISE EXCEPTION 'provider_job_requires_execution_admission' USING ERRCODE='23514';
+        END IF;
+      ELSIF NEW.provider_credential_id IS NOT NULL OR NEW.provider_proof_id IS NOT NULL OR NEW.provider_key_thumbprint IS NOT NULL THEN
+        RAISE EXCEPTION 'invalid_provider_job' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$;
+    DROP TRIGGER IF EXISTS rail_payment_job_guard ON outbox;
+    CREATE TRIGGER rail_payment_job_guard BEFORE INSERT OR UPDATE OR DELETE ON outbox
+      FOR EACH ROW EXECUTE FUNCTION rail_protect_payment_job();
     CREATE OR REPLACE FUNCTION rail_protect_outbox_work_kind() RETURNS TRIGGER
     LANGUAGE plpgsql AS $$ BEGIN
       IF NEW.work_kind IS DISTINCT FROM OLD.work_kind THEN
