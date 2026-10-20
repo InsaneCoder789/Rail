@@ -4,10 +4,11 @@ import type { ServerContext } from "../types.js";
 
 export async function handleAgentRoutes(req: http.IncomingMessage, res: http.ServerResponse, url: URL, context: ServerContext): Promise<boolean> {
   const execution = req.method === "POST" ? /^\/v2\/agent\/intents\/([^/]+)\/execute$/.exec(url.pathname) : null;
+  const providerExecution = req.method === "POST" ? /^\/v2\/agent\/provider-payments\/([^/]+)\/execute$/.exec(url.pathname) : null;
   const nonceRoute = req.method === "POST" && url.pathname === "/v2/agent/nonces";
   const providerRoute = (req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/provider-payments";
   const proofRoute = nonceRoute || execution || ((req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/intents") ||
-    (req.method === "GET" && url.pathname === "/v2/agent/identity") || providerRoute;
+    (req.method === "GET" && url.pathname === "/v2/agent/identity") || providerRoute || providerExecution;
   if (proofRoute) {
     res.setHeader("Cache-Control", "no-store");
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_proof_source", limit: 30, windowMs: 60_000,
@@ -35,7 +36,8 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     }
     const admission = await context.agentProofs.authenticate(token, req.headers.dpop, { method: req.method as "GET" | "POST", url: `${context.config.agentApiOrigin}${url.pathname}`, body: raw });
     await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_intents", identity: admission.agentId, limit: 20, windowMs: 60_000 });
-    if (providerRoute) json(res, req.method === "GET" ? 200 : 201, { proposals: req.method === "GET"
+    if (providerExecution) json(res, 202, await context.agentStore.executeProviderProposal(token, providerExecution[1], body, admission));
+    else if (providerRoute) json(res, req.method === "GET" ? 200 : 201, { proposals: req.method === "GET"
       ? await context.agentStore.listAgentProviderProposals(token, admission)
       : [await context.agentStore.createProviderProposal(token, body, admission)] });
     else if (url.pathname === "/v2/agent/identity") json(res, 200, { identity: await context.agentStore.resolveCredential(token, admission) });

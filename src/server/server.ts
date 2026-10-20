@@ -124,7 +124,8 @@ export async function createServerContext(options: {
     evidenceStore,
     riskProtection,
     auditStore: new AuditBatchStore(pool, evidenceStore, riskProtection),
-    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes, { required: true, store: ownerPasskeys }, { required: true, ready: Boolean(config.agentApiOrigin) }, providerTargets),
+    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes, { required: true, store: ownerPasskeys }, { required: true, ready: Boolean(config.agentApiOrigin) }, providerTargets,
+      process.env.RAIL_PROVIDER_SIMULATOR === "true" && process.env.RAIL_DEMO_MODE === "true" && process.env.NODE_ENV !== "production"),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,

@@ -17,6 +17,7 @@ import { isBudgetId, mapSharedBudget, parseSharedBudgetInput, requireSharedBudge
 import { cancelUnsubmittedProviderPayments, parseProviderProposalRequest, prepareProviderProposalInTransaction,
   providerProposalView, authorizeProviderPaymentInTransaction } from "./providerPayments.js";
 import { ProviderTargetRegistry, parseProviderTarget } from "../domain/providerTargets.js";
+import { enqueueProviderPayment } from "./providerWorker.js";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -175,7 +176,23 @@ export class AgentAuthorityStore {
     private readonly merchantQuotes = new MerchantQuoteRegistry(),
     private readonly ownerControl?: { readonly required: boolean; readonly store?: OwnerPasskeyStore },
     private readonly proofControl?: { readonly required: boolean; readonly ready: boolean },
-    private readonly providerTargets = new ProviderTargetRegistry()) {}
+    private readonly providerTargets = new ProviderTargetRegistry(),
+    private readonly simulatorExecutionEnabled = false) {}
+
+  async executeProviderProposal(token: unknown, operationId: string, value: unknown, admission?: AgentAdmission) {
+    if (!this.simulatorExecutionEnabled) throw new RequestError(503, "provider_execution_unavailable", "only explicitly enabled local simulator execution is supported");
+    if (!isAgentId(operationId) || !isRecord(value) || Object.keys(value).length !== 1 ||
+        typeof value.requestFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.requestFingerprint)) invalid();
+    const fingerprint = value.requestFingerprint, proofValue = structuredClone(value);
+    return this.transaction(async client => {
+      const agent = await this.credentialForMutation(client, token, true, admission,
+        { method: "POST", path: `/v2/agent/provider-payments/${operationId}/execute`, value: proofValue });
+      if (!admission || !this.authorityEvidence || !this.ownerControl?.required || !this.executionEnabled)
+        throw new RequestError(503, "provider_execution_unavailable", "protected execution authority required");
+      return enqueueProviderPayment(client, { operationId, agentId: agent.agent_id, ownerWalletId: agent.owner_wallet_id,
+        fingerprint, credentialId: agent.credentialId, proofId: admission.proofId, keyThumbprint: admission.keyThumbprint }, this.providerTargets);
+    });
+  }
 
   async createProviderProposal(token: unknown, value: unknown, admission?: AgentAdmission) {
     const input = parseProviderProposalRequest(value), proofValue = structuredClone(value);
