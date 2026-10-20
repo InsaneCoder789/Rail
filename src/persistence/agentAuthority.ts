@@ -14,7 +14,9 @@ import { agentKeyThumbprint, parseAgentPublicKey, type AgentPublicKey } from "..
 import { dispatchAgentAdmission, type AgentAdmission } from "./agentProofs.js";
 import { isBudgetId, mapSharedBudget, parseSharedBudgetInput, requireSharedBudget, sharedBudgetOperationFingerprint,
   sharedBudgetOperationPayload, type SharedBudgetAction } from "./sharedBudgets.js";
-import { cancelUnsubmittedProviderPayments } from "./providerPayments.js";
+import { cancelUnsubmittedProviderPayments, parseProviderProposalRequest, prepareProviderProposalInTransaction,
+  providerProposalView, authorizeProviderPaymentInTransaction } from "./providerPayments.js";
+import { ProviderTargetRegistry, parseProviderTarget } from "../domain/providerTargets.js";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -172,7 +174,56 @@ export class AgentAuthorityStore {
   constructor(private readonly pool: Pool, private readonly engine?: PaymentPipelineEngine, private readonly authorityEvidence?: AgentEvidenceStore,
     private readonly merchantQuotes = new MerchantQuoteRegistry(),
     private readonly ownerControl?: { readonly required: boolean; readonly store?: OwnerPasskeyStore },
-    private readonly proofControl?: { readonly required: boolean; readonly ready: boolean }) {}
+    private readonly proofControl?: { readonly required: boolean; readonly ready: boolean },
+    private readonly providerTargets = new ProviderTargetRegistry()) {}
+
+  async createProviderProposal(token: unknown, value: unknown, admission?: AgentAdmission) {
+    const input = parseProviderProposalRequest(value), proofValue = structuredClone(value);
+    return this.transaction(async client => {
+      const agent = await this.credentialForMutation(client, token, false, admission, { method: "POST", path: "/v2/agent/provider-payments", value: proofValue });
+      if (!admission || !this.authorityEvidence) throw new RequestError(503, "provider_admission_unavailable", "proof-bound provider proposals require protected authority");
+      return prepareProviderProposalInTransaction(client, input, { agentId: agent.agent_id, ownerWalletId: agent.owner_wallet_id,
+        credentialId: agent.credentialId, proofId: admission.proofId, keyThumbprint: admission.keyThumbprint }, this.providerTargets,
+      this.authorityEvidence, Boolean(this.ownerControl?.required));
+    });
+  }
+
+  async listAgentProviderProposals(token: unknown, admission?: AgentAdmission) {
+    return this.transaction(async client => {
+      const agent = await this.credentialForMutation(client, token, false, admission, { method: "GET", path: "/v2/agent/provider-payments" });
+      return (await client.query(`SELECT proposal.*,payment.status AS operation_status FROM rail_provider_proposals proposal
+        LEFT JOIN rail_provider_payments payment USING(operation_id) WHERE proposal.agent_id=$1 ORDER BY proposal.operation_id LIMIT 1000`, [agent.agent_id]))
+        .rows.map(row => providerProposalView(row));
+    });
+  }
+
+  async listOwnerProviderProposals(owner: string, agentId: string, principal: OwnerPrincipal) {
+    return this.transaction(async client => {
+      await this.lockOwnerContext(client, owner, principal); await this.ownedAgent(client, owner, agentId, false);
+      return (await client.query(`SELECT proposal.*,payment.status AS operation_status FROM rail_provider_proposals proposal
+        LEFT JOIN rail_provider_payments payment USING(operation_id) WHERE proposal.agent_id=$1 AND proposal.owner_wallet_id=$2
+        ORDER BY proposal.operation_id LIMIT 1000`, [agentId, owner])).rows.map(row => providerProposalView(row, true));
+    });
+  }
+
+  async authorizeProviderProposal(owner: string, agentId: string, operationId: string, value: unknown, principal: OwnerPrincipal) {
+    if (!isAgentId(agentId) || !isAgentId(operationId) || !isRecord(value) || Object.keys(value).some(key => !["requestFingerprint", "grantToken"].includes(key)) ||
+        typeof value.requestFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.requestFingerprint)) invalid();
+    const expected = value.requestFingerprint, token = value.grantToken;
+    return this.transaction(async client => {
+      await this.lockOwnerContext(client, owner, principal);
+      const result = await client.query("SELECT * FROM rail_provider_proposals WHERE operation_id=$1 AND agent_id=$2 AND owner_wallet_id=$3", [operationId, agentId, owner]);
+      const row = result.rows[0];
+      if (!row) throw new RequestError(404, "provider_proposal_not_found", "provider proposal not found");
+      const proposal = providerProposalView(row, true);
+      if (expected !== proposal.requestFingerprint) throw new RequestError(409, "provider_proposal_mismatch", "approval does not match the proposal");
+      if (!this.ownerControl?.store || !this.authorityEvidence) throw new RequestError(503, "provider_admission_unavailable", "owner passkeys and protected authority required");
+      const existing = await client.query("SELECT operation_id FROM rail_provider_payments WHERE operation_id=$1", [operationId]);
+      if (!existing.rowCount) this.providerTargets.requireCurrent(parseProviderTarget(row.target_snapshot));
+      return authorizeProviderPaymentInTransaction(client, { binding: proposal.binding!, trustedMerchantWalletId: proposal.merchantWalletId!,
+        principal, grantToken: token }, this.ownerControl.store, this.authorityEvidence);
+    });
+  }
 
   private get executionEnabled(): boolean {
     return Boolean(this.authorityEvidence) && (!this.ownerControl?.required || Boolean(this.ownerControl.store)) && (!this.proofControl?.required || this.proofControl.ready) &&

@@ -38,6 +38,35 @@ Use it in the following ways:
 
 ## Latest Status
 
+### C2 Trusted Targets And Signed Proposals, 21 October 2026
+
+Agents can now propose external payment terms using an operator-configured target
+alias, rather than supplying provider account, instrument or merchant references.
+The immutable snapshot binds the authenticated owner/agent, current mandate/shared
+budget, amount, currency and deadline. Genuine DPoP admission is recorded in the
+same PostgreSQL transaction; failed persistence rolls back the dispatch claim.
+Agent reads hide operator references; owner-only reads expose exact consent terms.
+An owner session and exact-payment passkey grant admit the original proposal through
+the existing atomic allowance-hold coordinator. Target substitution/revocation
+blocks fresh authorization/submission, without preventing historical replay or
+reconciliation. Database guards reject mutation, proof reuse and proposal backfill.
+
+`RAIL_PROVIDER_TARGETS` is optional and fails closed for new proposals when empty.
+It is operator-declared configuration, not verified provider ownership; coordinated
+rollout/draining is required because snapshots are per instance. No external execute
+route, payment worker producer, provider network call or settlement was added.
+See [the lifecycle contract](PROVIDER_PAYMENTS.md) for routes and configuration.
+
+Local acceptance: all 443 backend tests and three native Chromium journeys passed
+with zero failures/skips; `npm audit --audit-level=moderate` reported zero known
+vulnerabilities. Tests used a disposable local PostgreSQL database, removed after
+the run. The HTTP journey exercised real loopback requests, DPoP signatures and
+software-generated WebAuthn assertions, not a physical authenticator or provider.
+The preceding commit `2cbe53f` has successful GitHub Actions evidence; this increment's
+remote CI is pending publication and is not claimed passed. Execution-proof admission, worker
+recovery/fencing, callbacks, protected outcome receipts and actual provider sandbox
+acceptance remain later C2 work; C2 is not complete.
+
 ### C2 Exact External Consent And Allowance Holds, 17 October 2026
 
 Added a trusted-coordinator transaction that requires a fresh `provider_payment`

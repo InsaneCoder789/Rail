@@ -1594,6 +1594,11 @@ BEGIN
     IF consent.operation_id IS NOT NULL THEN RAISE EXCEPTION 'provider_consent_requires_new_operation' USING ERRCODE='23514'; END IF;
     RETURN NULL;
   END IF;
+  IF EXISTS(SELECT 1 FROM rail_provider_proposals WHERE operation_id=id) AND NOT EXISTS(
+    SELECT 1 FROM rail_provider_proposals proposal WHERE proposal.operation_id=id AND proposal.binding=payment.binding
+      AND proposal.binding_fingerprint=payment.fingerprint AND proposal.target_snapshot->>'merchantWalletId'=consent.merchant_wallet_id) THEN
+    RAISE EXCEPTION 'provider_proposal_authorization_mismatch' USING ERRCODE='23514';
+  END IF;
   IF consent.operation_id IS NULL OR consent.canonical_payload::jsonb IS DISTINCT FROM
       jsonb_build_array('rail:owner-operation:v1','provider_payment',payment.fingerprint,consent.merchant_wallet_id)
     OR EXISTS(SELECT 1 FROM rail_agent_intents WHERE intent_id=payment.intent_id)
@@ -1648,6 +1653,54 @@ END $$;
 DROP TRIGGER IF EXISTS rail_provider_budget_accounting ON rail_provider_payments;
 CREATE TRIGGER rail_provider_budget_accounting AFTER INSERT OR UPDATE ON rail_provider_payments
   FOR EACH ROW EXECUTE FUNCTION rail_account_provider_budget();
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_credential_proposal_binding ON rail_agent_credentials(credential_id,agent_id,proof_key_thumbprint);
+CREATE TABLE IF NOT EXISTS rail_provider_proposals (
+  operation_id UUID PRIMARY KEY,
+  agent_id UUID NOT NULL,
+  owner_wallet_id TEXT NOT NULL,
+  mandate_id UUID NOT NULL,
+  shared_budget_id UUID NOT NULL,
+  client_request_id TEXT NOT NULL CHECK(length(client_request_id) BETWEEN 8 AND 128),
+  proposal_fingerprint TEXT NOT NULL CHECK(proposal_fingerprint ~ '^[a-f0-9]{64}$'),
+  binding JSONB NOT NULL,
+  binding_fingerprint TEXT NOT NULL CHECK(binding_fingerprint ~ '^[a-f0-9]{64}$'),
+  target_snapshot JSONB NOT NULL,
+  target_fingerprint TEXT NOT NULL CHECK(target_fingerprint ~ '^[a-f0-9]{64}$'),
+  credential_id UUID NOT NULL,
+  proof_id TEXT NOT NULL CHECK(proof_id ~ '^[A-Za-z0-9_-]{43}$'),
+  key_thumbprint TEXT NOT NULL,
+  UNIQUE(agent_id,client_request_id), UNIQUE(credential_id,proof_id),
+  FOREIGN KEY(mandate_id,agent_id,owner_wallet_id,shared_budget_id)
+    REFERENCES rail_agent_mandates(mandate_id,agent_id,owner_wallet_id,shared_budget_id),
+  FOREIGN KEY(credential_id,agent_id,key_thumbprint)
+    REFERENCES rail_agent_credentials(credential_id,agent_id,proof_key_thumbprint),
+  CHECK(COALESCE(binding->>'operationId'=operation_id::text AND binding->>'agentId'=agent_id::text
+    AND binding->>'ownerWalletId'=owner_wallet_id AND binding->>'mandateId'=mandate_id::text
+    AND binding->>'sharedBudgetId'=shared_budget_id::text
+    AND target_snapshot->>'ownerWalletId'=owner_wallet_id
+    AND target_snapshot->>'provider'=binding->>'provider'
+    AND target_snapshot->>'providerAccountRef'=binding->>'providerAccountRef'
+    AND target_snapshot->>'instrumentRef'=binding->>'instrumentRef'
+    AND target_snapshot->>'merchantRef'=binding->>'merchantRef'
+    AND target_snapshot->>'currency'=binding->>'currency',FALSE))
+);
+CREATE INDEX IF NOT EXISTS idx_provider_proposals_owner ON rail_provider_proposals(owner_wallet_id,agent_id,operation_id);
+CREATE OR REPLACE FUNCTION rail_protect_provider_proposal() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
+  IF TG_OP<>'INSERT' THEN RAISE EXCEPTION 'provider_proposal_is_immutable' USING ERRCODE='23514'; END IF;
+  IF NOT EXISTS(SELECT 1 FROM rail_agent_proof_nonces WHERE credential_id=NEW.credential_id AND proof_id=NEW.proof_id
+    AND key_thumbprint=NEW.key_thumbprint AND dispatched_at IS NOT NULL) THEN
+    RAISE EXCEPTION 'provider_proposal_requires_dispatched_proof' USING ERRCODE='23514';
+  END IF;
+  IF EXISTS(SELECT 1 FROM rail_provider_payments WHERE operation_id=NEW.operation_id) THEN
+    RAISE EXCEPTION 'provider_proposal_cannot_backfill_operation' USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_proposal_immutable ON rail_provider_proposals;
+CREATE TRIGGER rail_provider_proposal_immutable BEFORE INSERT OR UPDATE OR DELETE ON rail_provider_proposals
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_proposal();
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {

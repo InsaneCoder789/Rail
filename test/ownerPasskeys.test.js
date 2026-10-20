@@ -36,6 +36,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { runAgentSimulation } from "../dist/demo/runAgentSimulator.js";
+import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
 import { providerPaymentConsentFingerprint } from "../dist/domain/providerPayment.js";
 import { authorizeProviderPaymentInTransaction, advanceProviderPaymentInTransaction, createProviderPaymentInTransaction,
   readProviderPaymentInTransaction } from "../dist/persistence/providerPayments.js";
@@ -66,14 +67,14 @@ async function fixture(work, ownerBalance = 0) {
   }
 }
 
-function agentStores(pool, passkeys) {
+function agentStores(pool, passkeys, targets) {
   const key = id => ({ keyId: id, encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) });
   const authorityKey = key("stepped_authority"), paymentKey = key("stepped_payment");
   const authority = new AgentEvidenceStore(new TransactionKeyRing(authorityKey.keyId, [authorityKey]));
   const engine = new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
     dlq: new MemoryDeadLetterQueue(), pipeline: buildHardenedPaymentPipeline(noopTracer),
     evidence: new TransactionEvidenceStore(new TransactionKeyRing(paymentKey.keyId, [paymentKey])) });
-  return { authority, engine, strict: new AgentAuthorityStore(pool, engine, authority, undefined, { required: true, store: passkeys }),
+  return { authority, engine, strict: new AgentAuthorityStore(pool, engine, authority, undefined, { required: true, store: passkeys }, undefined, targets),
     legacy: new AgentAuthorityStore(pool, engine, authority) };
 }
 const mandatePolicy = { mode: "approval_required", currency: "INR", perPaymentLimitMinor: 100,
@@ -601,9 +602,9 @@ async function consume(pool, store, token, operation = "agent_approval", expecte
   finally { client.release(); }
 }
 
-async function proofFixture(work, scope = "payments:propose", balance = 0) {
+async function proofFixture(work, scope = "payments:propose", balance = 0, targets) {
   return fixture(async ({ pool, store }) => {
-    const ownerKey = await enroll(store), { strict } = agentStores(pool, store);
+    const ownerKey = await enroll(store), { strict, authority, engine } = agentStores(pool, store, targets);
     const agent = await strict.createAgent(principal.walletId, { name: "proof_agent" });
     const key = generateKeyPairSync("ed25519"), publicKey = key.publicKey.export({ format: "jwk" });
     const terms = { publicKey, scope, ttlSeconds: 120 };
@@ -635,9 +636,134 @@ async function proofFixture(work, scope = "payments:propose", balance = 0) {
       assert.equal(await handleAgentRoutes(req, res, new URL(`https://rail.example${path}`), options.context ?? context), true);
       return res;
     }
-    await work({ pool, store, strict, ownerKey, agent, credential, proofs, request, proof, key, publicKey, http, context });
+    await work({ pool, store, strict, authority, engine, ownerKey, agent, credential, proofs, request, proof, key, publicKey, http, context });
   }, balance);
 }
+
+const providerTargetFixture = { version: 1, targetId: "fixture_trip", revision: 1, ownerWalletId: "owner_wallet", provider: "simulator",
+  providerAccountRef: "account_fixture", instrumentRef: "instrument_fixture", merchantWalletId: "other_wallet", merchantRef: "merchant_fixture", currency: "INR", status: "active" };
+
+async function providerProposalFixture(work) {
+  const previous = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = "provider_http_fixture_jwt_secret_01234567890123456789";
+  try {
+    await proofFixture(async fixture => {
+      const { strict, store, ownerKey, agent, pool, engine, authority } = fixture;
+      const terms = { name: "Signed provider proposals", currency: "INR", totalBudgetMinor: 1000, ttlSeconds: 3600, agentIds: [agent.agentId] };
+      const budgetGrant = await grant(store, ownerKey, principal, "shared_budget", sharedBudgetOperationFingerprint("create", null, terms), 2);
+      const budget = await strict.createSharedBudget(principal.walletId, { ...terms, grantToken: budgetGrant.grantToken }, principal);
+      const policy = { ...mandatePolicy, mode: "budgeted", perPaymentLimitMinor: 1000, sharedBudgetId: budget.budgetId };
+      const mandateGrant = await grant(store, ownerKey, principal, "agent_mandate", mandateOperationFingerprint(agent.agentId, policy), 3);
+      const mandate = await strict.createMandate(principal.walletId, agent.agentId, { ...policy, grantToken: mandateGrant.grantToken }, principal);
+      const token = generateToken(principal.userId), owner = { ...principal, sessionFingerprint: createHash("sha256").update(token).digest("hex") };
+      let counter = 3;
+      const consent = value => grant(store, ownerKey, owner, "provider_payment", value, ++counter);
+      const replacement = value => new AgentAuthorityStore(pool, engine, authority, undefined, { required: true, store }, undefined,
+        new ProviderTargetRegistry(JSON.stringify([value])));
+      const input = { mandateId: mandate.mandateId, clientRequestId: "signed_provider_fixture", targetId: "fixture_trip", amountMinor: 100, currency: "INR" };
+      await work({ ...fixture, input, budget, owner, token, consent, replacement });
+    }, "payments:propose", 0, new ProviderTargetRegistry(JSON.stringify([providerTargetFixture])));
+  } finally { if (previous === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = previous; }
+}
+
+test("provider proposals cross real loopback HTTP with DPoP and exact owner consent, never provider submission", { skip: !databaseUrl }, async () => {
+  await providerProposalFixture(async ({ pool, context, credential, proof, key, input, agent, token, consent, budget }) => {
+    const runtime = { ...context, config: { ...context.config }, authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
+    const server = nodeHttp.createServer(async (req, res) => {
+      try {
+        if (!await handleAgentRoutes(req, res, new URL(req.url, runtime.config.agentApiOrigin), runtime)) { res.writeHead(404); res.end("{}"); }
+      } catch (error) { res.writeHead(error.status ?? 500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ code: error.code ?? "internal_error" })); }
+    });
+    server.listen(0, "localhost"); await once(server, "listening");
+    const origin = `http://localhost:${server.address().port}`; runtime.config.agentApiOrigin = origin;
+    const fetchJson = async (method, path, value, owner = false) => {
+      const body = value === undefined ? undefined : JSON.stringify(value);
+      const headers = { authorization: owner ? `Bearer ${token}` : `DPoP ${credential.token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) };
+      if (!owner) {
+        const nonce = await fetch(`${origin}/v2/agent/nonces`, { method: "POST", headers: { authorization: headers.authorization, "content-type": "application/json" }, body: "{}" });
+        headers.dpop = proof((await nonce.json()).nonce, {}, key.privateKey, { method, url: `${origin}${path}`, body: Buffer.from(body ?? "") });
+      }
+      const response = await fetch(`${origin}${path}`, { method, headers, body });
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      const first = await fetchJson("POST", "/v2/agent/provider-payments", input);
+      assert.equal(first.status, 201); const proposal = first.body.proposals[0];
+      assert.equal(proposal.status, "awaiting_owner_approval");
+      assert.ok(!JSON.stringify(proposal).includes("instrument_fixture"));
+      assert.ok(!JSON.stringify(proposal).includes("account_fixture"));
+      assert.deepEqual((await fetchJson("POST", "/v2/agent/provider-payments", input)).body, first.body);
+      assert.equal((await fetchJson("POST", "/v2/agent/provider-payments", { ...input, amountMinor: 101 })).status, 409);
+      assert.equal((await fetchJson("POST", "/v2/agent/provider-payments", { ...input, instrumentRef: "attacker_selected" })).status, 422);
+      const ownerPath = `/v2/agents/${agent.agentId}/provider-payments`;
+      const pending = (await fetchJson("GET", ownerPath, undefined, true)).body.proposals[0];
+      assert.equal(pending.binding.instrumentRef, "instrument_fixture");
+      const permission = await consent(pending.consentFingerprint);
+      const approval = { requestFingerprint: pending.requestFingerprint, grantToken: permission.grantToken };
+      const approved = await fetchJson("POST", `${ownerPath}/${pending.operationId}/authorize`, approval, true);
+      assert.equal(approved.status, 200); assert.equal(approved.body.payment.status, "reserved");
+      assert.deepEqual((await fetchJson("POST", `${ownerPath}/${pending.operationId}/authorize`, approval, true)).body, approved.body);
+      assert.equal((await fetchJson("GET", "/v2/agent/provider-payments")).body.proposals[0].status, "reserved");
+      assert.equal((await pool.query("SELECT reserved_budget_minor FROM rail_shared_budgets WHERE budget_id=$1", [budget.budgetId])).rows[0].reserved_budget_minor, "100");
+      assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payment_history")).rows[0].count, "1");
+      assert.equal((await pool.query("SELECT count(*) FROM outbox WHERE work_kind='provider_payment'")).rows[0].count, "0");
+      assert.equal((await pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
+      await runMigrations(pool);
+      await assert.rejects(pool.query("UPDATE rail_provider_proposals SET target_snapshot='{}'"), { code: "23514" });
+    } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+  });
+});
+
+test("target revocation and substitution block new consent or dispatch, not historical reads or reconciliation", { skip: !databaseUrl }, async () => {
+  await providerProposalFixture(async ({ http, context, input, strict, owner, agent, consent, replacement, pool }) => {
+    await http("POST", "/v2/agent/provider-payments", input, { signed: true });
+    const proposal = (await strict.listOwnerProviderProposals(owner.walletId, agent.agentId, owner))[0];
+    const permission = await consent(proposal.consentFingerprint);
+    const approve = { requestFingerprint: proposal.requestFingerprint, grantToken: permission.grantToken };
+    const changedTarget = { ...providerTargetFixture, instrumentRef: "changed_instrument", revision: 2 };
+    const changed = replacement(changedTarget), revoked = replacement({ ...providerTargetFixture, status: "revoked" });
+    await assert.rejects(changed.authorizeProviderProposal(owner.walletId, agent.agentId, proposal.operationId, approve, owner), { code: "provider_target_changed" });
+    await assert.rejects(revoked.authorizeProviderProposal(owner.walletId, agent.agentId, proposal.operationId, approve, owner), { code: "provider_target_denied" });
+    const admitted = await strict.authorizeProviderProposal(owner.walletId, agent.agentId, proposal.operationId, approve, owner);
+    const identity = { ownerWalletId: owner.walletId, operationId: proposal.operationId, fingerprint: proposal.requestFingerprint };
+    await assert.rejects(providerTransaction(pool, client => advanceProviderPaymentInTransaction(client, identity,
+      { type: "begin_submission", idempotencyWindowMs: 60000 }, new ProviderTargetRegistry(JSON.stringify([changedTarget])))), { code: "provider_target_changed" });
+    assert.deepEqual(await revoked.authorizeProviderProposal(owner.walletId, agent.agentId, proposal.operationId, approve, owner), admitted);
+    const started = await providerTransaction(pool, client => advanceProviderPaymentInTransaction(client, identity,
+      { type: "begin_submission", idempotencyWindowMs: 60000 }, new ProviderTargetRegistry(JSON.stringify([providerTargetFixture]))));
+    const resolved = await providerTransaction(pool, client => advanceProviderPaymentInTransaction(client, identity, { type: "provider_observed",
+      observation: { operationId: proposal.operationId, fingerprint: proposal.requestFingerprint, provider: "simulator", providerAccountRef: "account_fixture",
+        providerRef: "test_provider_object", amountMinor: 100, currency: "INR", status: "failed", final: true } }));
+    assert.equal(started.status, "submitting"); assert.equal(resolved.status, "failed");
+    assert.equal((await http("GET", "/v2/agent/provider-payments", undefined, { signed: true, context: { ...context, agentStore: changed } })).body.proposals[0].status, "failed");
+  });
+});
+
+test("provider proposal claims cannot cross agents, reuse proof objects or survive failed admission commits", { skip: !databaseUrl }, async () => {
+  await providerProposalFixture(async ({ pool, proofs, credential, proof, key, input, strict, owner, agent, http, context, replacement }) => {
+    const spec = { method: "POST", url: "https://rail.example/v2/agent/provider-payments", body: Buffer.from(JSON.stringify(input)) };
+    const nonce = await proofs.issueNonce(credential.token);
+    const admitted = await proofs.authenticate(credential.token, proof(nonce.nonce, {}, key.privateKey, spec), spec);
+    await assert.rejects(strict.createProviderProposal(credential.token, input, { ...admitted }), { code: "invalid_agent_proof" });
+    await pool.query(`CREATE FUNCTION reject_provider_proposal_fixture() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'provider_proposal_write_failed'; END $$;
+      CREATE TRIGGER reject_provider_proposal_fixture BEFORE INSERT ON rail_provider_proposals
+      FOR EACH ROW EXECUTE FUNCTION reject_provider_proposal_fixture()`);
+    await assert.rejects(strict.createProviderProposal(credential.token, input, admitted), /provider_proposal_write_failed/);
+    assert.equal((await pool.query("SELECT dispatched_at FROM rail_agent_proof_nonces WHERE proof_id=$1", [admitted.proofId])).rows[0].dispatched_at, null);
+    await pool.query("DROP TRIGGER reject_provider_proposal_fixture ON rail_provider_proposals");
+    await strict.createProviderProposal(credential.token, input, admitted);
+    await assert.rejects(strict.createProviderProposal(credential.token, input, admitted), { code: "invalid_agent_proof" });
+    const foreign = await strict.createAgent("other_wallet", { name: "Other owner agent" });
+    assert.deepEqual(await strict.listOwnerProviderProposals("other_wallet", foreign.agentId, { ...owner, walletId: "other_wallet", userId: "other_user" }), []);
+    await assert.rejects(strict.listOwnerProviderProposals("other_wallet", agent.agentId, { ...owner, walletId: "other_wallet", userId: "other_user" }), { code: "agent_not_found" });
+    await assert.rejects(http("POST", "/v2/agent/provider-payments", { ...input, clientRequestId: "foreign_target_fixture" }, { signed: true,
+      context: { ...context, agentStore: replacement({ ...providerTargetFixture, ownerWalletId: "other_wallet", merchantWalletId: "merchant_other" }) } }), { code: "provider_target_denied" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_proposals")).rows[0].count, "1");
+    assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payments")).rows[0].count, "0");
+  });
+});
 
 function replacement(scope = "payments:propose") {
   const key = generateKeyPairSync("ed25519");

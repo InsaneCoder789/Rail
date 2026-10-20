@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import { createHash, randomUUID } from "node:crypto";
 import { advanceProviderPayment, createProviderPayment, parseProviderPaymentBinding, providerBudgetDisposition, providerPaymentConsentPayload,
   providerPaymentConsentFingerprint,
   providerPaymentFingerprint, type ProviderPayment, type ProviderPaymentBinding, type ProviderPaymentEvent } from "../domain/providerPayment.js";
@@ -7,6 +8,9 @@ import type { AgentEvidenceStore } from "./agentEvidence.js";
 import type { OwnerPrincipal } from "../server/types.js";
 import { requireSharedBudget } from "./sharedBudgets.js";
 import { withTransactionSavepoint } from "./transaction.js";
+import { ProviderTargetRegistry, parseProviderTarget, providerTargetFingerprint } from "../domain/providerTargets.js";
+import { RequestError } from "../server/http.js";
+import { isCurrency, isRecord, isSafeText, isValidAmountMinor } from "../server/validation.js";
 
 export interface ProviderPaymentRecord extends ProviderPayment {
   readonly revision: number;
@@ -59,7 +63,7 @@ export async function createProviderPaymentInTransaction(client: PoolClient, val
 /** No network I/O belongs inside this function or its caller's financial transaction. */
 export async function advanceProviderPaymentInTransaction(client: PoolClient, identity: {
   readonly operationId: string; readonly ownerWalletId: string; readonly fingerprint: string;
-}, event: ProviderPaymentEvent): Promise<ProviderPaymentRecord> {
+}, event: ProviderPaymentEvent, targets?: ProviderTargetRegistry): Promise<ProviderPaymentRecord> {
   const { operationId, ownerWalletId, fingerprint } = identity;
   const snapshot = structuredClone(event);
   return withTransactionSavepoint(client, async () => {
@@ -67,6 +71,10 @@ export async function advanceProviderPaymentInTransaction(client: PoolClient, id
     if (lookup.rows[0]?.authorization_required) {
       const binding = parseProviderPaymentBinding(lookup.rows[0].binding);
       await lockProviderAuthority(client, binding, snapshot.type === "begin_submission" || snapshot.type === "retry_submission");
+      if (snapshot.type === "begin_submission" || snapshot.type === "retry_submission") {
+        const proposal = await client.query("SELECT target_snapshot FROM rail_provider_proposals WHERE operation_id=$1", [operationId]);
+        if (proposal.rows[0]) (targets ?? new ProviderTargetRegistry()).requireCurrent(parseProviderTarget(proposal.rows[0].target_snapshot));
+      }
     }
     const found = await client.query("SELECT * FROM rail_provider_payments WHERE operation_id=$1 AND owner_wallet_id=$2 FOR UPDATE",
       [operationId, ownerWalletId]);
@@ -172,4 +180,79 @@ export async function readProviderPaymentInTransaction(client: PoolClient, owner
   const found = await client.query("SELECT * FROM rail_provider_payments WHERE operation_id=$1 AND owner_wallet_id=$2", [operationId, ownerWalletId]);
   if (!found.rows[0]) throw new Error("PROVIDER_PAYMENT_NOT_FOUND");
   return restore(found.rows[0]);
+}
+
+export interface ProviderProposalRequest {
+  readonly mandateId: string; readonly clientRequestId: string; readonly targetId: string;
+  readonly amountMinor: number; readonly currency: string; readonly ttlSeconds: number;
+}
+
+export function parseProviderProposalRequest(value: unknown): ProviderProposalRequest {
+  if (!isRecord(value) || Object.keys(value).some(key => !["mandateId", "clientRequestId", "targetId", "amountMinor", "currency", "ttlSeconds"].includes(key)) ||
+      typeof value.mandateId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.mandateId) ||
+      !isSafeText(value.clientRequestId, 8, 128) || typeof value.targetId !== "string" || !/^[A-Za-z0-9_.:-]{3,128}$/.test(value.targetId) ||
+      !isValidAmountMinor(value.amountMinor) || !isCurrency(value.currency)) throw new RequestError(422, "invalid_provider_proposal", "invalid provider proposal");
+  const seconds = value.ttlSeconds ?? 300;
+  if (typeof seconds !== "number" || !Number.isSafeInteger(seconds) || seconds < 60 || seconds > 900)
+    throw new RequestError(422, "invalid_provider_proposal", "invalid provider proposal lifetime");
+  return Object.freeze({ mandateId: value.mandateId, clientRequestId: value.clientRequestId, targetId: value.targetId,
+    amountMinor: value.amountMinor, currency: value.currency, ttlSeconds: seconds });
+}
+
+export function providerProposalView(row: Record<string, unknown>, owner = false) {
+  const binding = parseProviderPaymentBinding(row.binding), target = parseProviderTarget(row.target_snapshot);
+  if (providerPaymentFingerprint(binding) !== row.binding_fingerprint || providerTargetFingerprint(target) !== row.target_fingerprint)
+    throw new Error("PROVIDER_PROPOSAL_CORRUPT");
+  return { operationId: binding.operationId, intentId: binding.intentId, agentId: binding.agentId, mandateId: binding.mandateId,
+    clientRequestId: String(row.client_request_id), targetId: target.targetId, targetRevision: target.revision,
+    amountMinor: binding.amountMinor, currency: binding.currency, requestFingerprint: String(row.binding_fingerprint),
+    expiresAt: binding.authorizationExpiresAt, status: row.operation_status ? String(row.operation_status) : "awaiting_owner_approval",
+    ...(owner ? { binding, merchantWalletId: target.merchantWalletId,
+      consentFingerprint: providerPaymentConsentFingerprint(binding, target.merchantWalletId) } : {}) };
+}
+
+/** Credential/proof admission must already be claimed by the caller in this transaction. No budget is held yet. */
+export async function prepareProviderProposalInTransaction(client: PoolClient, input: ProviderProposalRequest, identity: {
+  readonly agentId: string; readonly ownerWalletId: string; readonly credentialId: string; readonly proofId: string; readonly keyThumbprint: string;
+}, targets: ProviderTargetRegistry, evidence: AgentEvidenceStore, stepUpRequired: boolean) {
+  const request = parseProviderProposalRequest(input), agent = { ...identity };
+  const proposalFingerprint = createHash("sha256").update(JSON.stringify(["rail:provider-request:v1", agent.agentId, request.mandateId,
+    request.clientRequestId, request.targetId, request.amountMinor, request.currency, request.ttlSeconds])).digest("hex");
+  const previous = await client.query("SELECT * FROM rail_provider_proposals WHERE agent_id=$1 AND client_request_id=$2", [agent.agentId, request.clientRequestId]);
+  if (previous.rows[0]) {
+    if (previous.rows[0].proposal_fingerprint !== proposalFingerprint) throw new RequestError(409, "provider_request_reused", "request ID is bound to different provider terms");
+    const status = await client.query("SELECT status AS operation_status FROM rail_provider_payments WHERE operation_id=$1", [previous.rows[0].operation_id]);
+    return providerProposalView({ ...previous.rows[0], ...status.rows[0] });
+  }
+  const target = targets.resolve(request.targetId, agent.ownerWalletId, request.currency);
+  const policy = await client.query("SELECT *,expires_at>clock_timestamp() AS valid FROM rail_agent_mandates WHERE mandate_id=$1 AND agent_id=$2 AND owner_wallet_id=$3 FOR UPDATE",
+    [request.mandateId, agent.agentId, agent.ownerWalletId]);
+  const mandate = policy.rows[0];
+  if (!mandate?.valid || mandate.revoked_at || !mandate.shared_budget_id || mandate.currency !== request.currency ||
+      Number(mandate.per_payment_limit_minor) < request.amountMinor || !mandate.allowed_receiver_wallet_ids.includes(target.merchantWalletId))
+    throw new RequestError(403, "provider_policy_denied", "provider proposal is outside the current mandate");
+  const consent = await evidence.verifyMandateConsent(client, request.mandateId);
+  if ((consent.record.authentication as OwnerPrincipal | undefined)?.stepUp?.method !== "passkey")
+    throw new RequestError(409, "provider_mandate_consent_required", "fresh owner mandate consent required");
+  const budget = await requireSharedBudget(client, { budgetId: mandate.shared_budget_id, owner: agent.ownerWalletId,
+    agentId: agent.agentId, currency: request.currency, stepUpRequired });
+  const count = await client.query("SELECT count(*) FROM rail_provider_proposals WHERE agent_id=$1", [agent.agentId]);
+  if (Number(count.rows[0].count) >= 1000) throw new RequestError(409, "provider_proposal_capacity", "retained provider proposal capacity reached");
+  const time = await client.query("SELECT LEAST(clock_timestamp()+$1*interval '1 second',$2::timestamptz,$3::timestamptz) AS expires_at",
+    [request.ttlSeconds, mandate.expires_at, budget.expires_at]);
+  const operationId = randomUUID();
+  const binding: ProviderPaymentBinding = { version: 1, operationId, intentId: randomUUID(), ownerWalletId: agent.ownerWalletId,
+    agentId: agent.agentId, mandateId: request.mandateId, sharedBudgetId: mandate.shared_budget_id, provider: target.provider,
+    providerAccountRef: target.providerAccountRef, instrumentRef: target.instrumentRef, merchantRef: target.merchantRef,
+    amountMinor: request.amountMinor, currency: request.currency, requestFingerprint: proposalFingerprint,
+    authorizationExpiresAt: new Date(time.rows[0].expires_at).toISOString() };
+  if (Date.parse(binding.authorizationExpiresAt) <= await databaseTime(client))
+    throw new RequestError(409, "provider_proposal_expired", "provider proposal expired before persistence");
+  const row = await client.query(`INSERT INTO rail_provider_proposals(operation_id,agent_id,owner_wallet_id,mandate_id,shared_budget_id,
+      client_request_id,proposal_fingerprint,binding,binding_fingerprint,target_snapshot,target_fingerprint,credential_id,proof_id,key_thumbprint)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,$11,$12,$13,$14) RETURNING *`,
+  [operationId, agent.agentId, agent.ownerWalletId, request.mandateId, mandate.shared_budget_id, request.clientRequestId, proposalFingerprint,
+    JSON.stringify(binding), providerPaymentFingerprint(binding), JSON.stringify(target), providerTargetFingerprint(target),
+    agent.credentialId, agent.proofId, agent.keyThumbprint]);
+  return providerProposalView(row.rows[0]);
 }

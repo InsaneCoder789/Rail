@@ -7,13 +7,69 @@ This is a C2 implementation in progress, not a deployed payment integration.
 `src/persistence/providerPayments.ts` persists operations and transition history,
 and now composes exact owner passkey consent with mandate/shared-allowance holds.
 Neither module submits payments, authenticates callbacks, leases workers or moves
-internal wallet balances for external payments. Latest local acceptance passed:
-436 backend tests and three Chromium journeys, zero failures/skips, dependency
-audit zero known vulnerabilities. A further selected regression passed repeat
-migration with admitted holds and direct counter-tampering checks (other cases
-were intentionally filtered, not counted as a fresh full run). Provider/account selection, trusted target
-registry integration, agent-proof admission, the durable worker, real adapter and
+internal wallet balances for external payments. Latest local acceptance passed
+443 backend tests and three Chromium journeys, zero failures/skips; dependency
+audit reported zero known vulnerabilities. The disposable local PostgreSQL database
+was removed after verification. Trusted target configuration and
+proof-bound proposal admission are now implemented as described below. Provider/account selection,
+execution-proof admission, the durable worker, real adapter and
 actual sandbox acceptance remain open.
+
+## Operator Targets And Proof-Bound Proposals
+
+The 21 October 2026 increment lets an agent propose external terms, not submit a
+payment. `RAIL_PROVIDER_TARGETS` is an optional JSON array, limited to 100 entries
+and 64 KiB. Every entry has exactly these fields:
+
+```json
+[{"version":1,"targetId":"demo_target","revision":1,"ownerWalletId":"owner_wallet","provider":"simulator","providerAccountRef":"account_demo","instrumentRef":"instrument_demo","merchantWalletId":"merchant_wallet","merchantRef":"merchant_demo","currency":"INR","status":"active"}]
+```
+
+Use existing owner and merchant wallet identities. Status is `active` or `revoked`.
+These are operator-declared mappings, not verified provider ownership or funding.
+Never store provider credentials, URLs or raw card data here. Invalid configuration
+fails startup; empty configuration denies new proposals. Each instance loads an
+immutable snapshot: changing or revoking a mapping requires a coordinated rollout
+and draining old instances. This is not a shared live revocation control plane.
+
+| Route | Authority and result |
+| --- | --- |
+| `POST /v2/agent/provider-payments` | DPoP-bound credential; creates or replays one immutable proposal |
+| `GET /v2/agent/provider-payments` | DPoP-bound credential; only this agent's sanitized proposals |
+| `GET /v2/agents/:agentId/provider-payments` | Owner session; exact terms for the owned agent |
+| `POST /v2/agents/:agentId/provider-payments/:operationId/authorize` | Owner session plus exact-payment passkey grant; admits the stored terms |
+
+Proposal input contains only `mandateId`, `clientRequestId`, `targetId`,
+`amountMinor`, `currency` and optional `ttlSeconds` (60-900; default 300).
+Owner, provider account, instrument and merchant references cannot be injected.
+Server-generated operation/intent IDs, a canonical request fingerprint and the
+target fingerprint freeze the terms. Reusing the client request ID with different
+terms fails; identical replay returns the original snapshot. At most 1,000 proposals
+are retained per agent; this bounded version has no proposal archival interface.
+
+Proposal admission requires a genuine dispatched proof, current mandate and shared
+budget, recipient/currency/amount checks and protected authority evidence. It does
+not reserve money. Agent responses hide account/instrument/merchant references;
+owner responses include the binding and exact `provider_payment` consent fingerprint.
+Owner authorization accepts only `requestFingerprint` and `grantToken` and reserves
+allowance through the existing transactional consent coordinator. The request
+fingerprint returned for approval identifies the frozen operation binding.
+
+Changed/revoked targets deny fresh authorization and beginning/retrying submission.
+Historical reads, original admitted replay and reconciliation remain available so
+configuration changes cannot erase outstanding financial liability. Database guards
+reject proposal rewrites, proof reuse and attaching a proposal after an operation.
+Routes retain existing quotas/body limits and return `Cache-Control: no-store`.
+
+There is deliberately no external execute endpoint, payment-job producer, provider
+SDK call or settlement claim. The proof admitted here authorizes a proposal, not
+future execution. Worker leases/fencing, execution authority, authenticated callbacks,
+protected outcome receipts and real sandbox acceptance are separate remaining work.
+
+New regression coverage includes strict configuration/input parsing, a real loopback
+HTTP journey with DPoP and WebAuthn assertions, exact owner consent, substitution,
+revocation, rollback, proof reuse, owner isolation and repeat migrations. These are
+local software tests, not physical authenticator or real provider acceptance.
 
 The internal wallet path remains separate and unchanged. An internal ledger entry
 is not evidence that a card, bank or UPI payment settled.

@@ -36,6 +36,7 @@ import { handlePaymentRoutes } from "./routes/paymentRoutes.js";
 import type { ServerContext } from "./types.js";
 import { AgentEvidenceStore, loadAgentAuthorityKeyRing } from "../persistence/agentEvidence.js";
 import { MerchantQuoteRegistry } from "../crypto/merchantQuotes.js";
+import { ProviderTargetRegistry } from "../domain/providerTargets.js";
 import { OwnerPasskeyStore, loadOwnerPasskeyConfig } from "../persistence/ownerPasskeys.js";
 import { handlePasskeyRoutes } from "./routes/passkeyRoutes.js";
 
@@ -62,6 +63,7 @@ export async function createServerContext(options: {
   const authorityEvidence = process.env.RAIL_AGENT_AUTHORITY_KEY_RING
     ? new AgentEvidenceStore(loadAgentAuthorityKeyRing(process.env.RAIL_AGENT_AUTHORITY_KEY_RING, [paymentKeys, riskKeys])) : undefined;
   const merchantQuotes = new MerchantQuoteRegistry(process.env.RAIL_MERCHANT_QUOTE_KEYS);
+  const providerTargets = new ProviderTargetRegistry(process.env.RAIL_PROVIDER_TARGETS);
   const passkeyConfig = loadOwnerPasskeyConfig(process.env.RAIL_WEBAUTHN_RP_ID, process.env.RAIL_WEBAUTHN_ORIGIN);
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const ownerPasskeys = passkeyConfig ? new OwnerPasskeyStore(pool, passkeyConfig) : undefined;
@@ -122,7 +124,7 @@ export async function createServerContext(options: {
     evidenceStore,
     riskProtection,
     auditStore: new AuditBatchStore(pool, evidenceStore, riskProtection),
-    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes, { required: true, store: ownerPasskeys }, { required: true, ready: Boolean(config.agentApiOrigin) }),
+    agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes, { required: true, store: ownerPasskeys }, { required: true, ready: Boolean(config.agentApiOrigin) }, providerTargets),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,

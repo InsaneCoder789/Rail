@@ -5,9 +5,11 @@ import type { ServerContext } from "../types.js";
 export async function handleAgentRoutes(req: http.IncomingMessage, res: http.ServerResponse, url: URL, context: ServerContext): Promise<boolean> {
   const execution = req.method === "POST" ? /^\/v2\/agent\/intents\/([^/]+)\/execute$/.exec(url.pathname) : null;
   const nonceRoute = req.method === "POST" && url.pathname === "/v2/agent/nonces";
+  const providerRoute = (req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/provider-payments";
   const proofRoute = nonceRoute || execution || ((req.method === "GET" || req.method === "POST") && url.pathname === "/v2/agent/intents") ||
-    (req.method === "GET" && url.pathname === "/v2/agent/identity");
+    (req.method === "GET" && url.pathname === "/v2/agent/identity") || providerRoute;
   if (proofRoute) {
+    res.setHeader("Cache-Control", "no-store");
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_proof_source", limit: 30, windowMs: 60_000,
       trustProxyHeaders: context.config.trustProxyHeaders });
     if (!context.agentProofs || !context.config.agentApiOrigin) throw new RequestError(503, "agent_proof_unavailable", "configure the agent proof service and public API origin");
@@ -33,10 +35,29 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     }
     const admission = await context.agentProofs.authenticate(token, req.headers.dpop, { method: req.method as "GET" | "POST", url: `${context.config.agentApiOrigin}${url.pathname}`, body: raw });
     await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_intents", identity: admission.agentId, limit: 20, windowMs: 60_000 });
-    if (url.pathname === "/v2/agent/identity") json(res, 200, { identity: await context.agentStore.resolveCredential(token, admission) });
+    if (providerRoute) json(res, req.method === "GET" ? 200 : 201, { proposals: req.method === "GET"
+      ? await context.agentStore.listAgentProviderProposals(token, admission)
+      : [await context.agentStore.createProviderProposal(token, body, admission)] });
+    else if (url.pathname === "/v2/agent/identity") json(res, 200, { identity: await context.agentStore.resolveCredential(token, admission) });
     else if (req.method === "GET") json(res, 200, { intents: await context.agentStore.listAgentIntents(token, admission) });
     else if (execution) json(res, 200, await context.agentStore.executeIntent(token, execution[1], body, admission));
     else json(res, 200, { intent: await context.agentStore.createIntent(token, body, admission) });
+    return true;
+  }
+  const ownerProviderRoute = /^\/v2\/agents\/([^/]+)\/provider-payments(?:\/([^/]+)\/authorize)?$/.exec(url.pathname);
+  if (ownerProviderRoute && ((!ownerProviderRoute[2] && req.method === "GET") || (ownerProviderRoute[2] && req.method === "POST"))) {
+    res.setHeader("Cache-Control", "no-store");
+    await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_control_source", limit: 30,
+      windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
+    if (!context.authResolver.resolveOwnerPrincipal) throw new RequestError(401, "owner_authentication_required", "owner session required");
+    const principal = await context.authResolver.resolveOwnerPrincipal(req);
+    await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_control", identity: principal.walletId, limit: 20, windowMs: 60_000 });
+    if (req.method === "GET") json(res, 200, { proposals: await context.agentStore.listOwnerProviderProposals(principal.walletId, ownerProviderRoute[1], principal) });
+    else {
+      if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
+      const body = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);
+      json(res, 200, { payment: await context.agentStore.authorizeProviderProposal(principal.walletId, ownerProviderRoute[1], ownerProviderRoute[2], body, principal) });
+    }
     return true;
   }
   const budgetRoot = url.pathname === "/v2/budgets";
