@@ -1,0 +1,12 @@
+Generated with the built-in image generation tool on 21 October 2026.
+Asset: rail-banner-v3.png, 2172 x 724 pixels.
+Brand illustration, not an implementation diagram or settlement claim.
+The existing v2 banner is preserved.
+
+Direction: preserve warm ivory, ink navy and restrained teal/cobalt. Wide editorial
+engineering composition, subtle grid and generous whitespace. Exact headline:
+"Agent payments. Owner authority." Two incoming rails pass through a control
+checkpoint and connected modules, with a return loop suggesting reconciliation.
+Labels: "PROPOSE / AUTHORIZE / EXECUTE / RECONCILE". Small supporting line:
+"Human + agent flows / Explicit permissions / Failure-safe processing".
+No robots, coins, blockchain symbols, production-ready claims or watermarks.

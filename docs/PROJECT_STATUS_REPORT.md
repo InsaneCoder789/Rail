@@ -38,6 +38,21 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Repository Presentation, 21 October 2026
+
+Added a new README banner under `docs/assets/rail-banner-v3.png`, preserving the
+previous asset. The illustration communicates owner authority and controlled
+execution; it is not a literal architecture diagram or certification. The root
+README now explains independent owner controls, exact-term approval and failure-safe
+processing, with a compact capability table and separate internal/simulator paths.
+Human and agent flows now have separate, equally prominent explanations: exact
+human authorization and retry-safe execution, device-bound offline tokens requiring
+usable stored authorization at synchronization, and policy-bound signed agent
+requests. Provider integration gaps and advisory ML remain explicit.
+Detailed setup/security evidence stays in the linked guides rather than repeating
+the full project report. This changes documentation and presentation, not runtime
+behavior or previously recorded test acceptance.
+
 ### GitHub CI Metrics, 21 October 2026
 
 CI now records backend/browser test totals, passes, failures, skips and wall-clock

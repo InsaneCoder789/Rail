@@ -1,38 +1,72 @@
 # Rail
 
+![Rail: Agent payments. Owner authority.](docs/assets/rail-banner-v3.png)
+
 [![Rail CI](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml/badge.svg)](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
 
-**Owner-controlled payment execution for AI agents and people.**
+**A payment-governance backend for AI agents and people.**
 
-Rail lets an owner delegate limited payment authority without handing an agent
-unrestricted access to money. Agents make requests; the backend checks their
-identity, mandate, recipient, currency, shared allowance and any required exact
-owner approval before executing an internal wallet transfer. People and the
-existing offline-token flow use the same financial consistency foundations.
+Rail separates requesting a payment from having permission to execute it. People
+authorize their own transfers; agents act within owner-defined permissions. Both
+paths use the same accounting, replay protection and audit foundations.
 
-The important distinction: **a committed Rail wallet transfer is internal accounting
-success, not confirmation of bank, card, UPI or payment-provider settlement.**
-The external-provider lifecycle is being built; no real sandbox integration or
-production deployment is claimed. ML remains advisory/shadow evaluation, and
-audit commitments are not proof of on-chain settlement.
+## Human And Agent Payments
+
+**For people:** an authenticated user requests an exact payment authorization,
+then executes the matching transfer. Retry protection prevents the same request
+from moving money twice. The offline-aware path adds pre-issued, device-bound
+spending tokens and reconnect synchronization. It still requires a valid stored
+payment authorization; an offline attempt is not confirmed bank or UPI settlement.
+
+**For agents:** a scoped credential and signed proof identify the requester. Rail
+checks the owner's mandate, permitted recipient, currency and shared allowance,
+with exact passkey approval where required. Internal wallet transfers use the
+transaction engine; provider proposals require exact owner approval and a separate
+signed execution request. That provider path currently runs against a local
+simulator, not a real bank or payment provider.
+
+## Our Approach
+
+- **Authority stays with the owner.** Scoped credentials, merchant restrictions,
+  shared budgets and passkey approvals are enforced outside the AI model.
+- **Approval binds the actual payment.** Frozen terms and request fingerprints prevent
+  an approved amount, recipient or funding reference from being silently substituted.
+- **Failures must not invent financial outcomes.** Internal transfers commit atomically;
+  uncertain simulated provider submissions retain their holds and are reconciled
+  against the original operation rather than blindly submitted again.
+
+Rail builds on existing payment infrastructure; it does not claim to invent agent
+payments or replace banks, UPI or card networks.
 
 ```mermaid
 flowchart LR
-    Owner[Owner: session and passkey controls] --> Policy[Mandates and shared budgets]
-    Human[Human or offline-token request] --> API[Authenticated API]
-    Agent[Agent: scoped token and signed proof] --> API
-    Policy --> API
-    API --> Checks[Binding, approval, risk and funds checks]
-    Checks --> DB[(PostgreSQL transaction)]
-    DB --> Ledger[Wallets and balanced ledger]
-    DB --> Replay[Idempotent result and protected evidence]
-    DB --> Events[Transactional outbox]
+    Owner[Owner permissions and approvals] --> Checks[Agent identity, terms and allowance checks]
+    Agent[Signed agent request] --> Checks
+    Human[Human or offline-token request] --> HumanChecks[Human and offline authorization checks]
+    HumanChecks --> Internal[Atomic internal wallet transfer]
+    Checks --> Internal[Atomic internal wallet transfer]
+    Checks --> Approved[Owner-approved provider proposal]
+    Approved --> Queue[Durable execution queue]
+    Queue --> Simulator[Local provider simulator]
+    Simulator --> Outcome[Reconcile outcome and allowance]
 ```
+
+## What Works Today
+
+| Area | Current Scope |
+| --- | --- |
+| Internal execution | PostgreSQL transactions coordinate wallet balances, ledger entries, replay results and protected evidence |
+| Provider execution | Opt-in local simulator with durable jobs, lease-fenced outcomes and crash/reply-loss recovery |
+| Still ahead | Real provider sandbox, authenticated callbacks and protected external outcome receipts |
+
+**An internal ledger entry or simulated success is not bank, card or UPI settlement.**
+ML remains advisory/shadow evaluation; audit commitments do not establish on-chain
+settlement. Unknown simulated outcomes may remain held pending investigation.
 
 ## Local Setup
 
 Use Node.js 22 or 24, npm, and a disposable PostgreSQL 16+ development database.
-Run commands from this repository's root. Do not point demos or tests at live funds.
+Do not point demos or tests at live funds.
 
 ```sh
 npm ci
@@ -43,70 +77,40 @@ npm run migrate
 npm test
 ```
 
-The Compose credentials are local development defaults only. If port 5432 is
-already occupied, use a separate local database or adjust the Compose port and
-connection URL together. Database integration tests need `DATABASE_URL`; skipped
-database tests are not acceptance evidence. `npm test` builds the TypeScript code.
+Compose credentials are development defaults. Database tests need `DATABASE_URL`;
+skipped integration tests are not acceptance evidence. `npm test` builds the code.
+For server secrets, key rings, origins and passkeys, follow the
+[deployment guide](docs/DEPLOYMENT.md). `.env_example` contains placeholders.
 
-Starting the HTTP server needs additional independently generated evidence/risk
-key rings, authentication secrets and allowed origins. Follow the
-[configuration and migration guide](docs/DEPLOYMENT.md) rather than treating the
-placeholder `.env_example` as working credentials. Agents additionally need
-owner passkeys, an authority key ring and a canonical proof API origin.
+## Try The Flow
 
-## See The Failure-Safety Mechanism
-
-For a self-cleaning internal-wallet example using an isolated temporary schema:
+Run a self-cleaning internal-wallet example in an isolated temporary schema:
 
 ```sh
 RAIL_DEMO_MODE=true npm run demo
 ```
 
-This executes and replays one synthetic transfer, checks that the results match,
-reconciles wallet totals, and removes only the schema it created. It is not a
-live payment or a measured throughput benchmark.
+The [three-agent walkthrough](docs/AGENT_SIMULATORS.md) demonstrates shared-budget
+contention and replay. The [provider lifecycle guide](docs/PROVIDER_PAYMENTS.md)
+explains simulator queueing, crash recovery and its deliberate safety limits.
+The opt-in [owner console](docs/OWNER_CONSOLE.md) uses real APIs and passkey
+ceremonies at `/demo/owner` outside production.
 
-The [three-agent walkthrough](docs/AGENT_SIMULATORS.md) covers shared-budget
-contention, exact owner approval and retrying original payment identities.
-Its HTTP/PostgreSQL acceptance case deliberately discards an execution reply
-after commit, inspects the original intent and replays it without extra ledger
-effects. Changed-payload retries must be rejected rather than interpreted as
-the original purchase. The simulator's TTL mismatch has been corrected. On
-16 October 2026, the direct local backend regression and all three Chromium
-journeys passed; the dependency audit found no known vulnerabilities and the
-disposable database was removed. The host used Node 20.19.6; the published CI
-matrix targets Node 22/24. Do not interpret these local results or the CI link
-as a claim that uncommitted changes have passed remotely.
+## Verification And Documentation
 
-The opt-in [owner console](docs/OWNER_CONSOLE.md) is served by this backend at
-`/demo/owner` outside production. It uses real APIs and passkey ceremonies, not
-fake balances. Native browser verification uses an isolated database and Chromium:
-
-```sh
-npx playwright install chromium
-npm run test:browser
-```
-
-## Documentation And Evidence
-
-Each Node 22/24 CI job publishes full-suite test counts, failures/skips, duration and
-informational backend coverage in its job summary. Download TAP, JUnit, LCOV and
-JSON reports from that run's artifacts (retained for 14 days). Coverage describes
-observed compiled modules, not every file or real-provider acceptance; no arbitrary
-coverage threshold is used to imply correctness. Focused diagnostic re-runs are
-not double-counted in these totals.
+Node 22/24 CI jobs publish full-suite results, duration and informational coverage.
+TAP, JUnit, LCOV and JSON artifacts are retained for 14 days. Coverage describes
+observed compiled modules, not production readiness or real-provider acceptance.
 
 - [CI workflow and published runs](https://github.com/InsaneCoder789/Rail/actions/workflows/ci.yml)
-- [Detailed project README](docs/README.md)
-- [Living project report and acceptance boundaries](docs/PROJECT_STATUS_REPORT.md)
+- [Detailed technical overview](docs/README.md)
+- [Living project report](docs/PROJECT_STATUS_REPORT.md)
 - [Agent proof-of-possession contract](docs/AGENT_PROOF_OF_POSSESSION.md)
 - [Shared budget controls](docs/SHARED_BUDGETS.md)
-- [Provider lifecycle and unfinished integration](docs/PROVIDER_PAYMENTS.md)
 - [Security review and remaining risks](docs/SECURITY_REVIEW.md)
 
-Rail is a student-built payment-governance prototype, not a licensed settlement
-rail or a production security certification. There are no claimed customer,
-volume, uptime or ML-accuracy metrics without measured evidence.
+Rail is a student-built engineering project, not a licensed settlement service
+or a production security certification.
 
 ## License
 
