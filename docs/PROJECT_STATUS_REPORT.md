@@ -38,6 +38,60 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Simulator Execution Queue And Recovery, 21 October 2026
+
+Added an explicitly enabled local-simulator execution path for owner-approved
+external proposals. A fresh DPoP proof from a `payments:execute` credential binds
+the original operation fingerprint. Admission claims that proof and inserts one
+immutable payment-lane outbox job in the same transaction, without another hold.
+Proposal-only credentials cannot execute, and default/production runtime execution
+remains disabled. No provider account, SDK, deployment or real charge was added.
+
+The finite worker claims jobs with leases, rechecks current authority, target and
+execution credential, commits the submission boundary, then invokes the simulator
+outside financial transactions. Stable idempotency identifies the stored simulated
+effect. Confirmed success converts held allowance to spent; confirmed failure or
+definitely unsubmitted cancellation releases it once. Lease tokens/expiry fence
+stale outcome writes. Unknown outcomes preserve holds and are lookup-only, never
+blindly resubmitted or dead-lettered. A pre-call crash can remain unresolved: this
+is a deliberate safety limit, not full automatic recovery or cross-system ACID.
+
+`npm run provider:simulate` runs one bounded batch; it is not a deployed scheduler.
+The internal wallet ledger remains separate. See [the lifecycle contract](PROVIDER_PAYMENTS.md)
+for flags, API and limitations. Verification includes real worker-process kills
+before/after simulated effects, concurrent workers, revoked credentials/targets,
+timeouts, proof rollback and original operation replay. The test command now bounds
+file-level parallelism to two to reduce local/CI database connection contention;
+explicit concurrent financial/worker scenarios still run unchanged. An unrestricted
+run exposed an existing one-second connection-wait timeout, not a failed accounting
+assertion. Final acceptance: `npm test` passed all 458 backend tests with zero
+failures/skips; all three existing Chromium journeys passed; dependency audit found
+zero known vulnerabilities. The disposable local PostgreSQL database was removed.
+This increment is locally verified, not a completed remote CI run or real-provider
+acceptance. New loopback HTTP and software-authenticator coverage does not establish
+physical-device or hosted production acceptance.
+
+### Agentic Payment Risk Coverage Review, 21 October 2026
+
+Mapped the existing C2/C3 plan to prompt-injected requests, wrong-purchase consent,
+purchase splitting, revocation races, duplicate/uncertain payments, agent contention,
+dispute evidence and bypass through external credentials. Existing independent
+policy checks, exact passkey consent, shared allowance transactions, immutable
+proposal snapshots and provider journal address parts of these risks; they do not
+prove safe external execution or eliminate model manipulation and owner deception.
+
+The existing private plan now orders the remaining acceptance work: execution and
+credential boundaries, independent owner review, adversarial/shared-budget tests,
+durable worker, one sandbox adapter with verified callbacks/reconciliation, protected
+outcome receipts and end-to-end sign-off. These remain C2/C3, not new services or
+automatic blockchain/ML expansion. Provider choice/account is still an owner gate.
+An external network call cannot share one ACID transaction with PostgreSQL; unknown
+outcomes require retained holds and reconciliation. Target configuration still needs
+coordinated instance rollout. Rolling velocity limits are not claimed implemented.
+
+This was a source/test inventory and documentation update, not a fresh application
+QA run. The acceptance counts below belong to the preceding implemented increment.
+
 ### C2 Trusted Targets And Signed Proposals, 21 October 2026
 
 Agents can now propose external payment terms using an operator-configured target

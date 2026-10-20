@@ -1,11 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { ProviderTargetRegistry, parseProviderTarget, providerTargetFingerprint } from "../dist/domain/providerTargets.js";
 import { parseProviderProposalRequest } from "../dist/persistence/providerPayments.js";
 
 const target = () => ({ version: 1, targetId: "fixture_trip", revision: 1, ownerWalletId: "owner_fixture", provider: "simulator",
   providerAccountRef: "account_fixture", instrumentRef: "instrument_fixture", merchantWalletId: "merchant_fixture",
   merchantRef: "merchant_provider_fixture", currency: "INR", status: "active" });
+
+test("simulator worker CLI rejects production and missing explicit demo flags before connecting", () => {
+  for (const changes of [{ NODE_ENV: "production" }, { RAIL_DEMO_MODE: "false" }, { RAIL_PROVIDER_SIMULATOR: "false" }]) {
+    const child = spawnSync(process.execPath, ["dist/persistence/runProviderWorker.js"], { timeout: 3000, encoding: "utf8", env: {
+      ...process.env, DATABASE_URL: "postgresql://invalid:invalid@127.0.0.1:1/rail_guard", NODE_ENV: "test",
+      RAIL_DEMO_MODE: "true", RAIL_PROVIDER_SIMULATOR: "true", ...changes } });
+    assert.equal(child.status, 1); assert.match(child.stderr, /LOCAL_PROVIDER_SIMULATOR_CONFIGURATION_REQUIRED/);
+    assert.ok(!child.stdout.includes("[DB]"));
+  }
+});
 
 test("provider targets snapshot exact operator mappings and enforce owner, currency and status", () => {
   const value = target(), registry = new ProviderTargetRegistry(JSON.stringify([value]));

@@ -8,12 +8,68 @@ This is a C2 implementation in progress, not a deployed payment integration.
 and now composes exact owner passkey consent with mandate/shared-allowance holds.
 Neither module submits payments, authenticates callbacks, leases workers or moves
 internal wallet balances for external payments. Latest local acceptance passed
-443 backend tests and three Chromium journeys, zero failures/skips; dependency
+458 backend tests and three Chromium journeys, zero failures/skips; dependency
 audit reported zero known vulnerabilities. The disposable local PostgreSQL database
 was removed after verification. Trusted target configuration and
 proof-bound proposal admission are now implemented as described below. Provider/account selection,
-execution-proof admission, the durable worker, real adapter and
+real provider execution admission, the real adapter and
 actual sandbox acceptance remain open.
+
+## Local Simulator Execution Increment
+
+This increment adds an execution-scope proof admission route and a finite durable
+worker for the local simulator only. It is not a real provider integration.
+
+1. Create a proposal and approve its frozen terms with the owner's passkey.
+2. An agent with `payments:execute` issues a fresh nonce/DPoP request to
+   `POST /v2/agent/provider-payments/:operationId/execute` containing only
+   `{ "requestFingerprint": "<original proposal fingerprint>" }`.
+3. Rail checks agent/owner, current authority, expiry and mapping, then atomically
+   claims the execution proof and creates one isolated outbox job. No second hold
+   is taken. An exact request replay with a fresh proof returns the existing job.
+4. The worker leases one job at a time, rechecks consent/authority and the original
+   execution credential, then commits `submitting` before invoking the simulator.
+5. Confirmed success consumes allowance; confirmed final failure releases it.
+   Lost replies, timeouts and crashes preserve the hold until lookup resolves it.
+
+Enable explicitly with `RAIL_PROVIDER_SIMULATOR=true`, `RAIL_DEMO_MODE=true` and a
+non-production `NODE_ENV`; configure targets, authority keys, passkeys and the agent
+API origin as for proposal admission. The server otherwise denies this execute
+route. Run migrations first, then start the server and perform proposal/approval/
+execution requests. Run `npm run provider:simulate` to process at most ten jobs.
+This command runs once, not a daemon or an automatically scheduled deployment job.
+Pending or lost-lease work gives a nonzero exit code for operational visibility.
+
+Jobs contain operation/credential/proof identifiers, not raw credentials or arbitrary
+instructions. Database guards freeze their binding, require genuine admitted proofs
+and reject deletion/dead-lettering of linked payment jobs. Ordinary notification
+workers and event readers still exclude the payment lane. Simulator effects live
+in `rail_simulator_effects`, separate from the internal ledger and allowance state;
+one stable idempotency key produces one stored simulated effect. No actual payment
+credentials, external network request or real charge is involved.
+
+Lease ownership and expiry fence outcome writes. After a worker has committed the
+submission boundary, recovery performs lookup only: it never resubmits, even when
+lookup finds no effect. A crash before the call can therefore leave an unresolved
+hold that requires investigation. This is deliberately conservative, not automatic
+recovery of every liveness failure. Unknown work retries lookup with bounded batches
+and delay, has no attempt-limit release, and can remain pending indefinitely.
+Database/adapter errors are recorded generically without leaking secret data.
+
+Revocation ordered before the submission boundary prevents dispatch. Revocation
+after that committed boundary does not guarantee cancellation of a call about to
+happen; leases cannot fence an external provider's network side effect. Stable
+provider idempotency and reconciliation remain essential for the future adapter.
+Reconciliation remains available after credential, policy or target revocation.
+
+Regression coverage includes actual worker subprocess kills before/after simulator
+effects, restart lookup, competing leases, stale-result fencing, timeout/late reply,
+decline, proof rollback, immutable job bindings and unchanged internal ledger data.
+This is simulator/process evidence, not real-provider or production acceptance.
+The full `npm test` run uses two concurrent files to avoid connection starvation;
+explicit financial and worker concurrency tests remain concurrent. All 458 backend
+tests and three existing Chromium journeys passed, with zero failures/skips and
+zero known dependency vulnerabilities. Remote CI for this increment is not claimed.
 
 ## Operator Targets And Proof-Bound Proposals
 
@@ -61,10 +117,10 @@ configuration changes cannot erase outstanding financial liability. Database gua
 reject proposal rewrites, proof reuse and attaching a proposal after an operation.
 Routes retain existing quotas/body limits and return `Cache-Control: no-store`.
 
-There is deliberately no external execute endpoint, payment-job producer, provider
-SDK call or settlement claim. The proof admitted here authorizes a proposal, not
-future execution. Worker leases/fencing, execution authority, authenticated callbacks,
-protected outcome receipts and real sandbox acceptance are separate remaining work.
+The proposal proof alone does not authorize execution. The simulator-only route above
+requires a separate execution proof. There is no real-provider execute integration,
+provider SDK call or settlement claim. Authenticated callbacks, real-provider recovery,
+protected outcome receipts and actual sandbox acceptance remain separate work.
 
 New regression coverage includes strict configuration/input parsing, a real loopback
 HTTP journey with DPoP and WebAuthn assertions, exact owner consent, substitution,
@@ -87,9 +143,10 @@ dead-letter payment jobs. Customer polling and SSE history also exclude payment
 jobs, even if their payload contains the customer's wallet ID. A database trigger
 rejects category changes; a payment job cannot be relabelled as a notification.
 
-This is routing isolation within one existing outbox, not a second queue platform,
-a new worker or a payment adapter. No runtime payment producer writes these jobs
-yet. Application producers must choose the correct category when inserting work;
+This original increment provided routing isolation within one existing outbox,
+not a second queue platform, worker or payment adapter. At that checkpoint no runtime
+payment producer wrote these jobs; the simulator increment above now creates
+proof-bound linked jobs. Application producers must choose the correct category;
 this is not isolation against a privileged database administrator. Future payment
 workers must retain unknown financial liabilities rather than inherit notification
 dead-letter/retry semantics. Verified public payment-status events will be separate

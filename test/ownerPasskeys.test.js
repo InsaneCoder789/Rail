@@ -38,6 +38,7 @@ import { spawn } from "node:child_process";
 import { runAgentSimulation } from "../dist/demo/runAgentSimulator.js";
 import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
 import { providerPaymentConsentFingerprint } from "../dist/domain/providerPayment.js";
+import { dispatchProviderBatch, LocalPaymentSimulator } from "../dist/persistence/providerWorker.js";
 import { authorizeProviderPaymentInTransaction, advanceProviderPaymentInTransaction, createProviderPaymentInTransaction,
   readProviderPaymentInTransaction } from "../dist/persistence/providerPayments.js";
 
@@ -67,14 +68,14 @@ async function fixture(work, ownerBalance = 0) {
   }
 }
 
-function agentStores(pool, passkeys, targets) {
+function agentStores(pool, passkeys, targets, simulatorExecution = false) {
   const key = id => ({ keyId: id, encryptionKey: randomBytes(32), authenticationKey: randomBytes(32) });
   const authorityKey = key("stepped_authority"), paymentKey = key("stepped_payment");
   const authority = new AgentEvidenceStore(new TransactionKeyRing(authorityKey.keyId, [authorityKey]));
   const engine = new PaymentPipelineEngine({ idempotency: new PostgresIdempotencyStore(pool), tracer: noopTracer,
     dlq: new MemoryDeadLetterQueue(), pipeline: buildHardenedPaymentPipeline(noopTracer),
     evidence: new TransactionEvidenceStore(new TransactionKeyRing(paymentKey.keyId, [paymentKey])) });
-  return { authority, engine, strict: new AgentAuthorityStore(pool, engine, authority, undefined, { required: true, store: passkeys }, undefined, targets),
+  return { authority, engine, strict: new AgentAuthorityStore(pool, engine, authority, undefined, { required: true, store: passkeys }, undefined, targets, simulatorExecution),
     legacy: new AgentAuthorityStore(pool, engine, authority) };
 }
 const mandatePolicy = { mode: "approval_required", currency: "INR", perPaymentLimitMinor: 100,
@@ -602,9 +603,9 @@ async function consume(pool, store, token, operation = "agent_approval", expecte
   finally { client.release(); }
 }
 
-async function proofFixture(work, scope = "payments:propose", balance = 0, targets) {
+async function proofFixture(work, scope = "payments:propose", balance = 0, targets, simulatorExecution = false) {
   return fixture(async ({ pool, store }) => {
-    const ownerKey = await enroll(store), { strict, authority, engine } = agentStores(pool, store, targets);
+    const ownerKey = await enroll(store), { strict, authority, engine } = agentStores(pool, store, targets, simulatorExecution);
     const agent = await strict.createAgent(principal.walletId, { name: "proof_agent" });
     const key = generateKeyPairSync("ed25519"), publicKey = key.publicKey.export({ format: "jwk" });
     const terms = { publicKey, scope, ttlSeconds: 120 };
@@ -643,7 +644,7 @@ async function proofFixture(work, scope = "payments:propose", balance = 0, targe
 const providerTargetFixture = { version: 1, targetId: "fixture_trip", revision: 1, ownerWalletId: "owner_wallet", provider: "simulator",
   providerAccountRef: "account_fixture", instrumentRef: "instrument_fixture", merchantWalletId: "other_wallet", merchantRef: "merchant_fixture", currency: "INR", status: "active" };
 
-async function providerProposalFixture(work) {
+async function providerProposalFixture(work, scope = "payments:propose", simulatorExecution = false) {
   const previous = process.env.JWT_SECRET;
   process.env.JWT_SECRET = "provider_http_fixture_jwt_secret_01234567890123456789";
   try {
@@ -662,11 +663,237 @@ async function providerProposalFixture(work) {
         new ProviderTargetRegistry(JSON.stringify([value])));
       const input = { mandateId: mandate.mandateId, clientRequestId: "signed_provider_fixture", targetId: "fixture_trip", amountMinor: 100, currency: "INR" };
       await work({ ...fixture, input, budget, owner, token, consent, replacement });
-    }, "payments:propose", 0, new ProviderTargetRegistry(JSON.stringify([providerTargetFixture])));
+    }, scope, 0, new ProviderTargetRegistry(JSON.stringify([providerTargetFixture])), simulatorExecution);
   } finally { if (previous === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = previous; }
 }
 
-test("provider proposals cross real loopback HTTP with DPoP and exact owner consent, never provider submission", { skip: !databaseUrl }, async () => {
+async function queuedProviderFixture(work, fault = "none") {
+  await providerProposalFixture(async f => {
+    await f.http("POST", "/v2/agent/provider-payments", f.input, { signed: true });
+    const proposal = (await f.strict.listOwnerProviderProposals(f.owner.walletId, f.agent.agentId, f.owner))[0];
+    const permission = await f.consent(proposal.consentFingerprint);
+    await f.strict.authorizeProviderProposal(f.owner.walletId, f.agent.agentId, proposal.operationId,
+      { requestFingerprint: proposal.requestFingerprint, grantToken: permission.grantToken }, f.owner);
+    const path = `/v2/agent/provider-payments/${proposal.operationId}/execute`;
+    const body = { requestFingerprint: proposal.requestFingerprint };
+    const queue = () => f.http("POST", path, body, { signed: true });
+    const targets = new ProviderTargetRegistry(JSON.stringify([providerTargetFixture]));
+    const simulator = new LocalPaymentSimulator(f.pool, fault);
+    const drain = (adapter = simulator, registry = targets, options = {}) => dispatchProviderBatch(f.pool, registry, adapter, { batchSize: 1, ...options });
+    const ready = () => f.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
+    const state = async () => (await f.pool.query(`SELECT payment.status,budget.reserved_budget_minor,budget.spent_budget_minor
+      FROM rail_provider_payments payment JOIN rail_shared_budgets budget ON budget.budget_id=payment.shared_budget_id
+      WHERE operation_id=$1`, [proposal.operationId])).rows[0];
+    await work({ ...f, proposal, path, body, queue, targets, simulator, drain, ready, state });
+    assert.equal((await f.pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
+  }, "payments:execute", true);
+}
+
+test("simulator execution requires execution scope and explicit enablement, never just proposal authority", { skip: !databaseUrl }, async () => {
+  await providerProposalFixture(async ({ http }) => {
+    await assert.rejects(http("POST", `/v2/agent/provider-payments/${randomUUID()}/execute`, { requestFingerprint: fingerprint }, { signed: true }),
+      { code: "provider_execution_unavailable" });
+  });
+  await providerProposalFixture(async ({ http, pool }) => {
+    await assert.rejects(http("POST", `/v2/agent/provider-payments/${randomUUID()}/execute`, { requestFingerprint: fingerprint }, { signed: true }),
+      { code: "agent_execution_scope_required" });
+    assert.equal((await pool.query("SELECT count(*) FROM outbox WHERE provider_operation_id IS NOT NULL")).rows[0].count, "0");
+  }, "payments:propose", true);
+});
+
+test("simulator queue admits exact signed approved terms once and rejects changed terms, raw fields and unapproved operations", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, http, path, body, drain, state, proposal, input }) => {
+    await assert.rejects(http("POST", path, { ...body, requestFingerprint: fingerprint }, { signed: true }), { code: "provider_execution_binding_mismatch" });
+    await assert.rejects(http("POST", path, { ...body, instrumentRef: "injected" }, { signed: true }), { code: "invalid_agent_request" });
+    await assert.rejects(http("POST", `/v2/agent/provider-payments/${randomUUID()}/execute`, body, { signed: true }), { code: "provider_payment_not_found" });
+    const unapproved = (await http("POST", "/v2/agent/provider-payments", { ...input, clientRequestId: "unapproved_execution_request" }, { signed: true })).body.proposals[0];
+    await assert.rejects(http("POST", `/v2/agent/provider-payments/${unapproved.operationId}/execute`,
+      { requestFingerprint: unapproved.requestFingerprint }, { signed: true }), { code: "provider_payment_not_found" });
+    assert.equal((await queue()).status, 202); assert.equal((await queue()).status, 202);
+    assert.equal((await pool.query("SELECT count(*) FROM outbox WHERE provider_operation_id=$1", [proposal.operationId])).rows[0].count, "1");
+    assert.deepEqual(await drain(), { resolved: 1, pending: 0, lostLease: 0 });
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+    assert.equal((await queue()).status, 202);
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+    await runMigrations(pool); await ensureOutboxSchema(pool);
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+    await assert.rejects(pool.query("UPDATE outbox SET provider_proof_id='changed' WHERE provider_operation_id IS NOT NULL"), /provider_job_binding_is_immutable/);
+    await assert.rejects(pool.query("UPDATE outbox SET delivery_status='dead_letter' WHERE provider_operation_id IS NOT NULL"), /invalid_provider_job/);
+    await assert.rejects(pool.query("DELETE FROM outbox WHERE provider_operation_id IS NOT NULL"), /provider_job_is_durable/);
+  });
+});
+
+test("simulator queue insertion failure rolls back the execution proof and leaves allowance unchanged", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ pool, proofs, credential, proof, key, strict, path, body, proposal, state }) => {
+    const spec = { method: "POST", url: `https://rail.example${path}`, body: Buffer.from(JSON.stringify(body)) };
+    const nonce = await proofs.issueNonce(credential.token);
+    const admission = await proofs.authenticate(credential.token, proof(nonce.nonce, {}, key.privateKey, spec), spec);
+    await pool.query(`CREATE FUNCTION fail_payment_queue() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.provider_operation_id IS NOT NULL THEN RAISE EXCEPTION 'queue_fault'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER fail_payment_queue BEFORE INSERT ON outbox FOR EACH ROW EXECUTE FUNCTION fail_payment_queue()`);
+    await assert.rejects(strict.executeProviderProposal(credential.token, proposal.operationId, body, admission), /queue_fault/);
+    assert.deepEqual(await state(), { status: "reserved", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await pool.query("DROP TRIGGER fail_payment_queue ON outbox");
+    assert.equal((await strict.executeProviderProposal(credential.token, proposal.operationId, body, admission)).queued, true);
+    await assert.rejects(strict.executeProviderProposal(credential.token, proposal.operationId, body, admission), { code: "invalid_agent_proof" });
+  });
+});
+
+test("simulator concurrent workers create one durable effect and consume shared allowance once", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, drain, state }) => {
+    await queue();
+    const results = await Promise.all([drain(), drain(), drain()]);
+    assert.equal(results.reduce((sum, result) => sum + result.resolved, 0), 1);
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+  });
+});
+
+test("simulator target change before dispatch cancels definitely unsubmitted work and releases once", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, drain, state }) => {
+    await queue();
+    const changed = new ProviderTargetRegistry(JSON.stringify([{ ...providerTargetFixture, revision: 2 }]));
+    assert.equal((await drain(undefined, changed)).resolved, 1);
+    assert.deepEqual(await state(), { status: "cancelled", reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.equal((await drain()).resolved, 0);
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "0");
+  });
+});
+
+test("simulator withdrawn execution credential prevents submission even after owner approved the proposal", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, strict, owner, agent, credential, drain, state }) => {
+    await queue(); await strict.revokeCredential(owner.walletId, agent.agentId, credential.credentialId);
+    assert.equal((await drain()).resolved, 1);
+    assert.deepEqual(await state(), { status: "cancelled", reserved_budget_minor: "0", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "0");
+  });
+});
+
+test("simulator agent revocation cancels unsubmitted work but preserves and reconciles an already uncertain liability", { skip: !databaseUrl }, async () => {
+  for (const fault of ["none", "lose_reply"]) {
+    await queuedProviderFixture(async ({ queue, pool, strict, owner, agent, drain, ready, state }) => {
+      await queue();
+      if (fault === "lose_reply") assert.equal((await drain()).pending, 1);
+      await strict.revokeAgent(owner.walletId, agent.agentId);
+      assert.deepEqual(await state(), fault === "lose_reply"
+        ? { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" }
+        : { status: "cancelled", reserved_budget_minor: "0", spent_budget_minor: "0" });
+      await ready(); assert.equal((await drain(new LocalPaymentSimulator(pool))).resolved, 1);
+      assert.equal((await state()).status, fault === "lose_reply" ? "succeeded" : "cancelled");
+      assert.equal(Number((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count), fault === "lose_reply" ? 1 : 0);
+    }, fault);
+  }
+});
+
+test("simulator lost response retains hold then a fresh worker process reconciles despite target revocation", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, drain, ready, state }) => {
+    await queue(); assert.equal((await drain()).pending, 1);
+    assert.deepEqual(await state(), { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await ready();
+    const schema = (await pool.query("SELECT current_schema() AS name")).rows[0].name;
+    const child = spawn(process.execPath, ["dist/persistence/runProviderWorker.js"], { env: { ...process.env,
+      DATABASE_URL: databaseUrl, PGOPTIONS: `-c search_path=${schema}`, RAIL_DEMO_MODE: "true", RAIL_PROVIDER_SIMULATOR: "true",
+      NODE_ENV: "test", RAIL_PROVIDER_TARGETS: JSON.stringify([{ ...providerTargetFixture, status: "revoked" }]) }, stdio: ["ignore", "pipe", "pipe"] });
+    let output = ""; child.stdout.on("data", data => { output += data; }); child.stderr.on("data", data => { output += data; });
+    assert.equal(await new Promise(resolve => child.on("close", resolve)), 0, output);
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+  }, "lose_reply");
+});
+
+test("simulator failed transport with no known effect never resubmits or releases an uncertain hold", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, drain, ready, state }) => {
+    await queue(); assert.equal((await drain()).pending, 1);
+    await ready(); assert.equal((await drain(new LocalPaymentSimulator(pool))).pending, 1);
+    assert.deepEqual(await state(), { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "0");
+    assert.equal((await pool.query("SELECT attempt_number FROM rail_provider_payments")).rows[0].attempt_number, 1);
+    assert.equal((await pool.query("SELECT delivery_status FROM outbox WHERE provider_operation_id IS NOT NULL")).rows[0].delivery_status, "pending");
+  }, "no_effect");
+});
+
+test("simulator confirmed decline releases allowance without creating an internal wallet transfer", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, drain, state }) => {
+    await queue(); assert.equal((await drain()).resolved, 1);
+    assert.deepEqual(await state(), { status: "failed", reserved_budget_minor: "0", spent_budget_minor: "0" });
+  }, "decline");
+});
+
+test("simulator stale worker cannot write outcome after a replacement lease reconciles its durable effect", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, drain, simulator, state }) => {
+    await queue(); let release, reached;
+    const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { reached = resolve; });
+    class PausedSimulator extends LocalPaymentSimulator {
+      async submit(payment) { const result = await simulator.submit(payment); reached(); await gate; return result; }
+    }
+    const first = drain(new PausedSimulator(pool));
+    await started;
+    await pool.query("UPDATE outbox SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
+    const second = await drain(new LocalPaymentSimulator(pool));
+    release();
+    assert.equal(second.resolved, 1); assert.equal((await first).lostLease, 1);
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+    assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+  });
+});
+
+test("simulator timeout does not trust a late response and recovers the original effect by lookup", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ queue, pool, drain, simulator, ready, state }) => {
+    await queue(); let release, persisted;
+    const gate = new Promise(resolve => { release = resolve; });
+    const effectReady = new Promise(resolve => { persisted = resolve; });
+    class SlowSimulator extends LocalPaymentSimulator {
+      async submit(payment) { const result = await simulator.submit(payment); persisted(); await gate; return result; }
+    }
+    assert.equal((await drain(new SlowSimulator(pool), undefined, { timeoutMs: 20 })).pending, 1);
+    await effectReady;
+    assert.equal((await state()).status, "unknown"); release(); await ready();
+    assert.equal((await drain()).resolved, 1);
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+  });
+});
+
+for (const effectBeforeCrash of [false, true]) {
+  test(`simulator process kill ${effectBeforeCrash ? "after" : "before"} effect preserves durable recovery without resubmission`, { skip: !databaseUrl }, async () => {
+    await queuedProviderFixture(async ({ queue, pool, drain, state }) => {
+      await queue();
+      const schema = (await pool.query("SELECT current_schema() AS name")).rows[0].name;
+      const script = `import pg from 'pg';
+        import {LocalPaymentSimulator,dispatchProviderBatch} from './dist/persistence/providerWorker.js';
+        import {ProviderTargetRegistry} from './dist/domain/providerTargets.js';
+        const pool=new pg.Pool({connectionString:process.env.DATABASE_URL});
+        class CrashSimulator extends LocalPaymentSimulator {
+          async submit(payment) {
+            ${effectBeforeCrash ? "await super.submit(payment);" : ""}
+            console.log('CRASH_BOUNDARY');
+            return new Promise(()=>{});
+          }
+        }
+        await dispatchProviderBatch(pool,new ProviderTargetRegistry(process.env.RAIL_PROVIDER_TARGETS),new CrashSimulator(pool),{batchSize:1});`;
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env,
+        DATABASE_URL: databaseUrl, PGOPTIONS: `-c search_path=${schema}`, RAIL_PROVIDER_TARGETS: JSON.stringify([providerTargetFixture]) }, stdio: ["ignore", "pipe", "pipe"] });
+      let output = "", killed = false;
+      const exited = new Promise(resolve => child.on("close", (code, signal) => resolve({ code, signal })));
+      const timeout = setTimeout(() => child.kill("SIGKILL"), 10000);
+      child.stdout.on("data", data => { output += data; if (output.includes("CRASH_BOUNDARY")) { killed = true; child.kill("SIGKILL"); } });
+      child.stderr.on("data", data => { output += data; });
+      try {
+        assert.equal((await exited).signal, "SIGKILL", output); assert.equal(killed, true, output);
+      } finally { clearTimeout(timeout); child.kill("SIGKILL"); }
+      assert.equal((await state()).status, "submitting");
+      await pool.query("UPDATE outbox SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
+      const recovered = await drain(new LocalPaymentSimulator(pool));
+      assert.equal(recovered[effectBeforeCrash ? "resolved" : "pending"], 1);
+      assert.deepEqual(await state(), effectBeforeCrash
+        ? { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" }
+        : { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" });
+      assert.equal(Number((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count), effectBeforeCrash ? 1 : 0);
+      assert.equal((await pool.query("SELECT attempt_number FROM rail_provider_payments")).rows[0].attempt_number, 1);
+    });
+  });
+}
+
+test("provider proposals and simulator execution cross real loopback HTTP with DPoP and exact owner consent", { skip: !databaseUrl }, async () => {
   await providerProposalFixture(async ({ pool, context, credential, proof, key, input, agent, token, consent, budget }) => {
     const runtime = { ...context, config: { ...context.config }, authResolver: createAuthResolver({ getPool: () => pool, apiKey: "", apiKeyScopes: [] }) };
     const server = nodeHttp.createServer(async (req, res) => {
@@ -709,10 +936,20 @@ test("provider proposals cross real loopback HTTP with DPoP and exact owner cons
       assert.equal((await pool.query("SELECT count(*) FROM rail_provider_payment_history")).rows[0].count, "1");
       assert.equal((await pool.query("SELECT count(*) FROM outbox WHERE work_kind='provider_payment'")).rows[0].count, "0");
       assert.equal((await pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
+      const executePath = `/v2/agent/provider-payments/${pending.operationId}/execute`;
+      const executeBody = { requestFingerprint: pending.requestFingerprint };
+      assert.equal((await fetchJson("POST", executePath, { ...executeBody, requestFingerprint: fingerprint })).status, 409);
+      assert.equal((await fetchJson("POST", executePath, executeBody)).status, 202);
+      assert.equal((await fetchJson("POST", executePath, executeBody)).status, 202);
+      const resolved = await dispatchProviderBatch(pool, new ProviderTargetRegistry(JSON.stringify([providerTargetFixture])), new LocalPaymentSimulator(pool));
+      assert.equal(resolved.resolved, 1);
+      assert.equal((await fetchJson("GET", "/v2/agent/provider-payments")).body.proposals[0].status, "succeeded");
+      assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+      assert.equal((await pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
       await runMigrations(pool);
       await assert.rejects(pool.query("UPDATE rail_provider_proposals SET target_snapshot='{}'"), { code: "23514" });
     } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
-  });
+  }, "payments:execute", true);
 });
 
 test("target revocation and substitution block new consent or dispatch, not historical reads or reconciliation", { skip: !databaseUrl }, async () => {

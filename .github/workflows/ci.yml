@@ -70,6 +70,8 @@ jobs:
         run: node --test test/sharedBudgets.test.js
       - name: Verify provider lifecycle, durable journal and narrow agent client protocol safety
         run: node --test test/providerPayment.test.js test/providerTargets.test.js test/providerPayments.integration.test.js test/agentClient.test.js test/agentSimulator.test.js
+      - name: Verify simulator queue, lease fencing and process-crash recovery
+        run: node --test --test-name-pattern="simulator" test/ownerPasskeys.test.js
       - name: Verify owner console gating, document safety and nonce-based CSP
         run: node --test test/ownerConsole.test.js
       - name: Install Chromium for native passkey acceptance
