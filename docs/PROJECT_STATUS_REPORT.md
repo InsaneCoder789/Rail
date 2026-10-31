@@ -38,6 +38,42 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Protected Simulator Outcome Receipts, 1 November 2026
+
+The simulator worker now protects final outcome receipts with the existing
+independent authority key ring, AES-256-GCM and HMAC-SHA256 under a separate
+`provider-outcome-v1` purpose. Receipts bind the exact operation, original consent
+fingerprint/passkey challenge, merchant, amount/currency, journal revision and
+held-allowance resolution. They omit funding instrument/account references and
+explicitly say `local_simulator_outcome`; they are not settlement certificates,
+provider signatures or independently verifiable public signatures.
+
+Receipt persistence, final journal/accounting resolution and job completion share
+one database transaction. A receipt failure retains unresolved work for lookup
+recovery, not resubmission. Append-only storage references the journal revision and
+registered encryption nonce. Owner-session-only receipt reads use existing source
+and account quotas and `no-store`; agent credentials cannot read them. Nonterminal
+payments return `not_final`; old terminal records without receipts return
+`unavailable`, with no invented backfill. Verification failures return no receipt.
+The simulator worker CLI requires the same independent payment/risk/authority key
+configuration as the server. Human/internal execution is unchanged.
+
+Final local acceptance passed all 473 backend tests and three Chromium journeys,
+with zero failures/skips, on Node 20.19.6 and local PostgreSQL. The dependency audit
+reported zero known vulnerabilities; the disposable database was removed. Evidence:
+`deliverables/portfolio-maintenance/rail_receipts_1793474533321.log` (local, untracked).
+Initial verification caught missing subprocess fixture key configuration; the
+fixture now passes independent synthetic rings across the process boundary.
+Tests cover receipt tampering/replay, immutable storage, owner isolation, missing
+worker configuration, uncertain outcomes and receipt-fault accounting rollback
+followed by lookup-only recovery. These are local results, not new remote CI or
+real-provider acceptance. Prior pushed runs `39485581473` and `39486319246` were
+checked on this resumption and both completed successfully. Real-provider integration remains
+gated: the owner confirmed there is still no sandbox account. Provider callbacks,
+real sandbox acceptance and the completed external-owner walkthrough remain open.
+Receipts currently cover finalization through the simulator worker; unqueued or
+server-only legacy journal resolutions without receipts remain explicitly unavailable.
+
 ### Repository Presentation, 21 October 2026
 
 Added a new README banner under `docs/assets/rail-banner-v3.png`, preserving the

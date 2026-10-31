@@ -350,8 +350,32 @@ terminal result. Contradictory terminal outcomes raise an explicit investigation
 error rather than silently overwriting success or fabricating a refund. The durable
 integration must preserve and surface that conflict for reconciliation.
 
-Next connect the immutable journal to consented external intents, transactional
-admission/leases, pre-network authority rechecks, atomic outcome accounting and
-durable worker routing. Notification relays are already isolated from payment jobs.
-Then add verified callbacks, actual process crash/restart tests, a selected sandbox adapter
-and sandbox evidence. None of these are complete merely because unit rules pass.
+The local simulator now connects consented proposals, transactional admission,
+leases, pre-network authority rechecks, outcome accounting and durable worker
+routing. Process-crash recovery is tested at simulator scope. Verified callbacks,
+a selected real sandbox adapter and actual sandbox acceptance remain open.
+
+## Protected Simulator Outcome Receipts
+
+`GET /v2/agents/:agentId/provider-payments/:operationId/receipt` requires the owner
+session, not an agent token. It returns `{ evidence: ... }` with status `verified`,
+`not_final`, `unavailable` or `verification_unavailable`. Only `verified` includes
+the decrypted receipt and envelope commitment. Responses are not cacheable and
+use existing owner-control quotas. This endpoint does not create receipts.
+
+Receipts are written by the worker atomically with final resolution/job completion,
+using the existing independent authority ring and purpose-separated AES-256-GCM
+plus HMAC-SHA256. They record exact consent, original challenge, operation binding,
+merchant, amount/currency, journal revision, outcome and allowance disposition.
+They deliberately exclude funding/account aliases. Unknown or processing outcomes
+are not final receipts. Legacy outcomes without a protected receipt stay unavailable.
+
+Every current receipt says `local_simulator_outcome`. Protection proves consistency
+under Rail's server-held keys, not real settlement, a provider signature, public
+nonrepudiation or blockchain publication. The receipt contract rejects nonsimulator
+providers; a real adapter needs a separately reviewed evidence provenance contract.
+The CLI requires `RAIL_EVIDENCE_KEY_RING`, `RAIL_RISK_RECORD_KEY_RING` and
+`RAIL_AGENT_AUTHORITY_KEY_RING` with independent material before opening its pool.
+Trusted in-process workers must supply `options.evidence`; without it, a batch
+fails before claiming jobs or creating effects. Receipt write failures preserve holds and recover by
+lookup. A missing/retired decryption key never produces a fabricated valid receipt.

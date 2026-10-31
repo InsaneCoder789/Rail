@@ -15,7 +15,7 @@ import { dispatchAgentAdmission, type AgentAdmission } from "./agentProofs.js";
 import { isBudgetId, mapSharedBudget, parseSharedBudgetInput, requireSharedBudget, sharedBudgetOperationFingerprint,
   sharedBudgetOperationPayload, type SharedBudgetAction } from "./sharedBudgets.js";
 import { cancelUnsubmittedProviderPayments, parseProviderProposalRequest, prepareProviderProposalInTransaction,
-  providerProposalView, authorizeProviderPaymentInTransaction } from "./providerPayments.js";
+  providerProposalView, authorizeProviderPaymentInTransaction, readProviderPaymentInTransaction } from "./providerPayments.js";
 import { ProviderTargetRegistry, parseProviderTarget } from "../domain/providerTargets.js";
 import { enqueueProviderPayment } from "./providerWorker.js";
 
@@ -220,6 +220,20 @@ export class AgentAuthorityStore {
       return (await client.query(`SELECT proposal.*,payment.status AS operation_status FROM rail_provider_proposals proposal
         LEFT JOIN rail_provider_payments payment USING(operation_id) WHERE proposal.agent_id=$1 AND proposal.owner_wallet_id=$2
         ORDER BY proposal.operation_id LIMIT 1000`, [agentId, owner])).rows.map(row => providerProposalView(row, true));
+    });
+  }
+
+  async readProviderOutcome(owner: string, agentId: string, operationId: string, principal: OwnerPrincipal) {
+    if (!isAgentId(agentId) || !isAgentId(operationId)) invalid();
+    return this.transaction(async client => {
+      await this.lockOwnerContext(client, owner, principal);
+      await this.ownedAgent(client, owner, agentId, false);
+      const exists = await client.query("SELECT 1 FROM rail_provider_payments WHERE operation_id=$1 AND owner_wallet_id=$2 AND agent_id=$3", [operationId, owner, agentId]);
+      if (!exists.rowCount) throw new RequestError(404, "provider_payment_not_found", "provider payment not found");
+      const payment = await readProviderPaymentInTransaction(client, owner, operationId);
+      if (payment.binding.agentId !== agentId) throw new RequestError(404, "provider_payment_not_found", "provider payment not found");
+      if (!this.authorityEvidence) return { status: "unavailable" as const };
+      return this.authorityEvidence.readProviderOutcome(client, payment);
     });
   }
 

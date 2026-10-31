@@ -46,15 +46,17 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     else json(res, 200, { intent: await context.agentStore.createIntent(token, body, admission) });
     return true;
   }
-  const ownerProviderRoute = /^\/v2\/agents\/([^/]+)\/provider-payments(?:\/([^/]+)\/authorize)?$/.exec(url.pathname);
-  if (ownerProviderRoute && ((!ownerProviderRoute[2] && req.method === "GET") || (ownerProviderRoute[2] && req.method === "POST"))) {
+  const ownerProviderRoute = /^\/v2\/agents\/([^/]+)\/provider-payments(?:\/([^/]+)\/(authorize|receipt))?$/.exec(url.pathname);
+  if (ownerProviderRoute && ((!ownerProviderRoute[2] && req.method === "GET") ||
+      (ownerProviderRoute[3] === "receipt" && req.method === "GET") || (ownerProviderRoute[3] === "authorize" && req.method === "POST"))) {
     res.setHeader("Cache-Control", "no-store");
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_control_source", limit: 30,
       windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
     if (!context.authResolver.resolveOwnerPrincipal) throw new RequestError(401, "owner_authentication_required", "owner session required");
     const principal = await context.authResolver.resolveOwnerPrincipal(req);
     await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_control", identity: principal.walletId, limit: 20, windowMs: 60_000 });
-    if (req.method === "GET") json(res, 200, { proposals: await context.agentStore.listOwnerProviderProposals(principal.walletId, ownerProviderRoute[1], principal) });
+    if (ownerProviderRoute[3] === "receipt") json(res, 200, { evidence: await context.agentStore.readProviderOutcome(principal.walletId, ownerProviderRoute[1], ownerProviderRoute[2], principal) });
+    else if (req.method === "GET") json(res, 200, { proposals: await context.agentStore.listOwnerProviderProposals(principal.walletId, ownerProviderRoute[1], principal) });
     else {
       if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
       const body = await readAndParseJson(req, context.config.maxRequestBodyBytes, context.config.requestBodyTimeoutMs);

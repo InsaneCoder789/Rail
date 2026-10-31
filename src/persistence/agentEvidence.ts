@@ -7,6 +7,8 @@ import type { OwnerPrincipal } from "../server/types.js";
 import { RequestError } from "../server/http.js";
 import { credentialOperationFingerprint, mandateOperationFingerprint, approvalOperationFingerprint, type AgentCheckout } from "./agentAuthority.js";
 import { verifyMerchantAttestation, type MerchantAttestation } from "../crypto/merchantQuotes.js";
+import { createProviderOutcomeReceipt, providerOutcomeReceiptBinding } from "../domain/providerReceipt.js";
+import type { ProviderPaymentRecord } from "./providerPayments.js";
 
 export interface AgentAuthorityReceipt {
   readonly version: 1;
@@ -120,6 +122,50 @@ function receipt(row: AuthorityRow): AgentAuthorityReceipt {
 
 export class AgentEvidenceStore {
   constructor(private readonly ring: TransactionKeyRing) {}
+
+  private async providerOutcome(client: PoolClient, payment: ProviderPaymentRecord) {
+    if (!payment.authorizationRequired) throw new Error("provider_outcome_consent_required");
+    const result = await client.query(`SELECT consent.* FROM rail_provider_payment_consents consent
+      JOIN rail_owner_step_up_grants permission ON permission.challenge_id=consent.challenge_id
+      WHERE consent.operation_id=$1 AND permission.operation='provider_payment'
+        AND permission.operation_fingerprint=consent.operation_fingerprint
+        AND permission.consumed_at>=permission.created_at AND permission.consumed_at<permission.expires_at`, [payment.binding.operationId]);
+    const consent = result.rows[0];
+    if (!consent) throw new Error("provider_outcome_consent_required");
+    return createProviderOutcomeReceipt(payment, { merchantWalletId: consent.merchant_wallet_id,
+      consentFingerprint: consent.operation_fingerprint, challengeId: consent.challenge_id });
+  }
+
+  /** The worker calls this in the same transaction as final resolution and job completion. */
+  async persistProviderOutcome(client: PoolClient, payment: ProviderPaymentRecord) {
+    const value = await this.providerOutcome(client, payment);
+    const existing = await client.query("SELECT operation_id FROM rail_provider_outcome_evidence WHERE operation_id=$1", [value.operationId]);
+    if (existing.rowCount) {
+      const result = await this.readProviderOutcome(client, payment);
+      if (result.status !== "verified") throw new Error("provider_outcome_verification_failed");
+      return;
+    }
+    const expected = providerOutcomeReceiptBinding(value.operationId, value.paymentFingerprint);
+    const protectedRecord = await this.protect(client, value, expected, "provider-outcome-v1");
+    await client.query(`INSERT INTO rail_provider_outcome_evidence(operation_id,journal_revision,key_fingerprint,nonce,envelope,commitment)
+      VALUES($1,$2,$3,$4,$5::jsonb,$6)`, [value.operationId, value.journalRevision, protectedRecord.keyFingerprint,
+      protectedRecord.envelope.nonce, JSON.stringify(protectedRecord.envelope), protectedRecord.commitment]);
+  }
+
+  /** Caller must authenticate and scope the payment to the owner before reading. No lazy backfill. */
+  async readProviderOutcome(client: PoolClient, payment: ProviderPaymentRecord) {
+    if (!["succeeded", "failed", "cancelled"].includes(payment.status)) return { status: "not_final" as const };
+    const stored = (await client.query("SELECT * FROM rail_provider_outcome_evidence WHERE operation_id=$1", [payment.binding.operationId])).rows[0];
+    if (!stored) return { status: "unavailable" as const };
+    try {
+      const expected = await this.providerOutcome(client, payment);
+      const decoded = this.verify(stored, providerOutcomeReceiptBinding(expected.operationId, expected.paymentFingerprint), "provider-outcome-v1");
+      if (stored.journal_revision !== expected.journalRevision || !isDeepStrictEqual(decoded, expected)) throw new Error("provider_outcome_mismatch");
+      return { status: "verified" as const, commitment: String(stored.commitment), receipt: expected };
+    } catch {
+      return { status: "verification_unavailable" as const };
+    }
+  }
 
   private async protect(client: PoolClient, value: object, expected: { txId: string; requestFingerprint: string }, purpose: RiskEnvelope["purpose"]) {
     const key = this.ring.get(this.ring.activeKeyId), keyFingerprint = createHash("sha256").update(key.encryptionKey).digest("hex");

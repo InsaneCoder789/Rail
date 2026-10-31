@@ -1706,6 +1706,23 @@ CREATE TABLE IF NOT EXISTS rail_simulator_effects (
   fingerprint TEXT NOT NULL CHECK(fingerprint ~ '^[a-f0-9]{64}$'),
   observation JSONB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rail_provider_outcome_evidence (
+  operation_id UUID PRIMARY KEY REFERENCES rail_provider_payments(operation_id),
+  journal_revision INTEGER NOT NULL,
+  key_fingerprint TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  envelope JSONB NOT NULL,
+  commitment TEXT NOT NULL CHECK(commitment ~ '^[a-f0-9]{64}$'),
+  FOREIGN KEY(operation_id,journal_revision) REFERENCES rail_provider_payment_history(operation_id,revision),
+  FOREIGN KEY(key_fingerprint,nonce) REFERENCES rail_agent_evidence_nonces(key_fingerprint,nonce)
+);
+CREATE OR REPLACE FUNCTION rail_protect_provider_outcome() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
+  RAISE EXCEPTION 'provider_outcome_evidence_is_immutable' USING ERRCODE='23514';
+END $$;
+DROP TRIGGER IF EXISTS rail_provider_outcome_immutable ON rail_provider_outcome_evidence;
+CREATE TRIGGER rail_provider_outcome_immutable BEFORE UPDATE OR DELETE ON rail_provider_outcome_evidence
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_outcome();
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {

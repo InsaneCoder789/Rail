@@ -17,7 +17,7 @@ export interface RiskRecord {
 interface Binding { readonly txId: string; readonly requestFingerprint: string; }
 export interface RiskEnvelope extends Binding {
   readonly version: 1;
-  readonly purpose: "risk-v1" | "agent-authority-v1" | "agent-mandate-v1" | "agent-approval-v1" | "agent-rejection-v1";
+  readonly purpose: "risk-v1" | "agent-authority-v1" | "agent-mandate-v1" | "agent-approval-v1" | "agent-rejection-v1" | "provider-outcome-v1";
   readonly keyId: string;
   readonly payloadHash: string;
   readonly nonce: string;
@@ -67,7 +67,7 @@ export function protectRecord(value: object, expected: Binding, keys: Transactio
   if (!expected.txId || expected.txId.length > 128 || !/^[a-f0-9]{64}$/.test(expected.requestFingerprint)) throw new Error("invalid_risk_binding");
   const payload = JSON.stringify(value);
   if (!payload || Buffer.byteLength(payload) > 65536) throw new Error("risk_record_size_limit");
-  if (!["risk-v1", "agent-authority-v1", "agent-mandate-v1", "agent-approval-v1", "agent-rejection-v1"].includes(purpose)) throw new Error("invalid_record_purpose");
+  if (!["risk-v1", "agent-authority-v1", "agent-mandate-v1", "agent-approval-v1", "agent-rejection-v1", "provider-outcome-v1"].includes(purpose)) throw new Error("invalid_record_purpose");
   const base = { version: 1 as const, purpose, keyId: keys.keyId, ...expected, payloadHash: hash(payload) };
   const nonce = randomBytes(12), cipher = createCipheriv("aes-256-gcm", keys.encryptionKey, nonce, { authTagLength: 16 });
   cipher.setAAD(Buffer.from(aad(base)));
@@ -79,7 +79,7 @@ export function decryptRecord(envelope: RiskEnvelope, expected: Binding, keys: T
   purpose: RiskEnvelope["purpose"] = "risk-v1"): Record<string, unknown> {
   try {
     new TransactionKeyRing(keys.keyId, [keys]);
-    if (!["risk-v1", "agent-authority-v1", "agent-mandate-v1", "agent-approval-v1", "agent-rejection-v1"].includes(purpose) || !envelope || envelope.version !== 1 || envelope.purpose !== purpose || envelope.keyId !== keys.keyId ||
+    if (!["risk-v1", "agent-authority-v1", "agent-mandate-v1", "agent-approval-v1", "agent-rejection-v1", "provider-outcome-v1"].includes(purpose) || !envelope || envelope.version !== 1 || envelope.purpose !== purpose || envelope.keyId !== keys.keyId ||
         envelope.txId !== expected.txId || envelope.requestFingerprint !== expected.requestFingerprint ||
         !/^[a-f0-9]{64}$/.test(envelope.payloadHash) || !/^[a-f0-9]{64}$/.test(expected.requestFingerprint)) throw new Error();
     const mac = decode(envelope.mac, 32), expectedMac = createHmac("sha256", keys.authenticationKey).update(bytes(envelope)).digest();

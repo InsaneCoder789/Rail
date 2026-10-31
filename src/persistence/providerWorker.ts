@@ -5,6 +5,7 @@ import { ProviderTargetRegistry } from "../domain/providerTargets.js";
 import { advanceProviderPaymentInTransaction, readProviderPaymentInTransaction, requireProviderSubmission } from "./providerPayments.js";
 import { withTransactionSavepoint } from "./transaction.js";
 import { RequestError } from "../server/http.js";
+import type { AgentEvidenceStore } from "./agentEvidence.js";
 
 async function transaction<T>(pool: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
@@ -80,8 +81,10 @@ const denied = (error: unknown) => error instanceof Error && ["PROVIDER_AUTHORIT
 
 /** A finite simulator-only batch. Unknown outcomes are lookup-only and never dead-lettered or resubmitted. */
 export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetRegistry, simulator: LocalPaymentSimulator,
-  options: { batchSize?: number; leaseMs?: number; timeoutMs?: number; retryDelayMs?: number } = {}) {
-  const policy = { batchSize: 10, leaseMs: 30000, timeoutMs: 5000, retryDelayMs: 1000, ...options };
+  options: { batchSize?: number; leaseMs?: number; timeoutMs?: number; retryDelayMs?: number; evidence?: AgentEvidenceStore } = {}) {
+  const { evidence, ...timings } = options;
+  if (!evidence) throw new Error("PROVIDER_OUTCOME_EVIDENCE_REQUIRED");
+  const policy = { batchSize: 10, leaseMs: 30000, timeoutMs: 5000, retryDelayMs: 1000, ...timings };
   if (Object.values(policy).some(value => !Number.isSafeInteger(value) || value < 1) || policy.batchSize > 100 ||
       policy.leaseMs > 300000 || policy.timeoutMs >= policy.leaseMs) throw new Error("INVALID_PROVIDER_WORKER_POLICY");
   const stats = { resolved: 0, pending: 0, lostLease: 0 };
@@ -113,7 +116,11 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
         if (!row) throw new Error("PROVIDER_ADMITTED_PROPOSAL_REQUIRED");
         identity.ownerWalletId = row.owner_wallet_id; identity.fingerprint = row.fingerprint;
         let payment = await readProviderPaymentInTransaction(client, identity.ownerWalletId, identity.operationId);
-        if (terminal(payment.status)) { await updateJob(client, true); return { payment, submit: false, done: true }; }
+        if (terminal(payment.status)) {
+          if (!evidence) throw new Error("PROVIDER_OUTCOME_EVIDENCE_REQUIRED");
+          await evidence.persistProviderOutcome(client, payment);
+          await updateJob(client, true); return { payment, submit: false, done: true };
+        }
         if (payment.status === "reserved") {
           try {
             await withTransactionSavepoint(client, async () => {
@@ -129,6 +136,8 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
           } catch (error) {
             if (!denied(error)) throw error;
             payment = await advanceProviderPaymentInTransaction(client, identity, { type: "cancel_before_submission" });
+            if (!evidence) throw new Error("PROVIDER_OUTCOME_EVIDENCE_REQUIRED");
+            await evidence.persistProviderOutcome(client, payment);
             await updateJob(client, true); return { payment, submit: false, done: true };
           }
           return { payment, submit: true, done: false };
@@ -152,6 +161,10 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
         if (observed) payment = await advanceProviderPaymentInTransaction(client, identity, { type: "provider_observed", observation: observed });
         else if (payment.status === "submitting") payment = await advanceProviderPaymentInTransaction(client, identity, { type: "submission_uncertain" });
         const done = terminal(payment.status);
+        if (done) {
+          if (!evidence) throw new Error("PROVIDER_OUTCOME_EVIDENCE_REQUIRED");
+          await evidence.persistProviderOutcome(client, payment);
+        }
         if ((await updateJob(client, done)).rowCount !== 1) throw new Error("PROVIDER_LEASE_LOST");
         return done;
       });
