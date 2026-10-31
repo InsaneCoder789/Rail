@@ -25,6 +25,7 @@ const SCRIPT = String.raw`
   'use strict';
   const el = id => document.getElementById(id);
   let token = null, epoch = 0, busy = false, budgets = [], agents = [], intents = [], reviewed = null;
+  let providerPayments = [], providerReviewed = null, historyCursor = null;
   const requests = new Set();
   const message = (text, error = false) => { el('message').textContent = text; el('message').dataset.error = String(error); };
   const ensure = expected => { if (expected !== epoch) throw new Error('session_cleared'); };
@@ -46,6 +47,17 @@ const SCRIPT = String.raw`
     el('withdraw').disabled = busy || !selectedBudget() || !el('member').value || selectedBudget().status !== 'active';
     el('load-intents').disabled = busy || !el('agent').value;
     el('revoke-agent').disabled = busy || !el('agent').value;
+    el('load-provider').disabled = busy || !el('agent').value;
+    el('provider-approve').disabled = busy || !providerReviewed || providerReviewed.status !== 'awaiting_owner_approval';
+    el('provider-history').disabled = busy || !providerReviewed || providerReviewed.status === 'awaiting_owner_approval';
+    el('provider-next').disabled = busy || !providerReviewed || historyCursor === null;
+    el('provider-verify').disabled = busy || !providerReviewed || providerReviewed.status === 'awaiting_owner_approval';
+  }
+  function resetProvider() {
+    providerPayments = []; providerReviewed = null; historyCursor = null;
+    el('provider-rows').replaceChildren();
+    for (const id of ['provider-detail','provider-fingerprint','provider-receipt','provider-timeline']) el(id).textContent = '';
+    el('provider-review').hidden = true; el('provider-empty').hidden = false;
   }
   function clearSession() {
     epoch++; token = null; budgets = []; agents = []; intents = []; reviewed = null;
@@ -53,7 +65,7 @@ const SCRIPT = String.raw`
     ['password','enrollment-password','codes','receipt','review-detail','fingerprint','new-limit','budget-state'].forEach(id => { const node = el(id); if (node.tagName === 'INPUT') node.value = ''; else node.textContent = ''; });
     ['total','reserved','spent','available'].forEach(id => { el(id).textContent = 'Not loaded'; });
     ['budget','agent','member'].forEach(id => el(id).replaceChildren());
-    el('intent-rows').replaceChildren(); el('recovery').close(); el('session-label').textContent = 'Not signed in';
+    el('intent-rows').replaceChildren(); resetProvider(); el('recovery').close(); el('session-label').textContent = 'Not signed in';
     el('review-empty').hidden = false; el('review-body').hidden = true;
     message('Session cleared from this page. Existing server sessions are not revoked.'); sync();
   }
@@ -133,6 +145,47 @@ const SCRIPT = String.raw`
       '\nAgent: ' + reviewed.agentId + '\nShared budget: ' + (reviewed.sharedBudgetId || 'No shared envelope') + '\nStatus: ' + reviewed.status + '\nDeadline: ' + reviewed.expiresAt;
     el('fingerprint').textContent = reviewed.requestFingerprint;
   }
+  const providerPath = payment => '/v2/agents/' + encodeURIComponent(payment.agentId) + '/provider-payments/' + encodeURIComponent(payment.operationId);
+  function renderProvider() {
+    el('provider-rows').replaceChildren(); el('provider-empty').hidden = providerPayments.length > 0;
+    for (const payment of providerPayments) {
+      const row = document.createElement('tr');
+      for (const text of [payment.merchantWalletId,money(payment.amountMinor,payment.currency),payment.status]) {
+        const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+      }
+      const cell = document.createElement('td'), button = document.createElement('button'); button.textContent = 'Review payment';
+      button.onclick = () => { providerReviewed = { ...payment }; historyCursor = null; renderProviderReview(); sync(); };
+      cell.append(button); row.append(cell); el('provider-rows').append(row);
+    }
+  }
+  function renderProviderReview() {
+    el('provider-review').hidden = !providerReviewed;
+    for (const id of ['provider-receipt','provider-timeline']) el(id).textContent = '';
+    if (!providerReviewed) return;
+    const value = providerReviewed, binding = value.binding;
+    el('provider-detail').textContent = 'Operator-configured provider: ' + binding.provider + '\nMerchant: ' + value.merchantWalletId +
+      '\nMerchant reference: ' + binding.merchantRef + '\nFunding account alias: ' + binding.providerAccountRef + '\nInstrument alias: ' + binding.instrumentRef +
+      '\nAmount: ' + money(value.amountMinor,value.currency) + '\nAgent: ' + value.agentId + '\nShared budget: ' + binding.sharedBudgetId +
+      '\nStatus: ' + value.status + '\nAuthorization deadline: ' + value.expiresAt + '\nTarget: ' + value.targetId + ' / revision ' + value.targetRevision;
+    el('provider-fingerprint').textContent = value.requestFingerprint;
+  }
+  async function loadProvider(expected) {
+    const id = el('agent').value; if (!id) throw new Error('select_an_agent');
+    const [payments, currentBudgets] = await Promise.all([
+      api('/v2/agents/' + encodeURIComponent(id) + '/provider-payments',undefined,'GET',expected),
+      api('/v2/budgets',undefined,'GET',expected)
+    ]);
+    providerPayments = payments.proposals; budgets = currentBudgets.budgets;
+    options(el('budget'),budgets,item=>item.budgetId,item=>item.name); renderBudget();
+    providerReviewed = null; historyCursor = null; renderProvider(); renderProviderReview();
+  }
+  async function providerHistory(after, expected) {
+    const payment = { ...providerReviewed };
+    const value = (await api(providerPath(payment) + '/history?limit=25&afterRevision=' + after,undefined,'GET',expected)).history;
+    historyCursor = value.nextAfterRevision;
+    el('provider-timeline').textContent = JSON.stringify(value,null,2);
+    message('Server journal history loaded. This is not a provider attestation or settlement record.');
+  }
   async function refresh(expected) {
     const [ownedAgents, ownedBudgets] = await Promise.all([api('/v2/agents',undefined,'GET',expected),api('/v2/budgets',undefined,'GET',expected)]);
     agents = ownedAgents.agents; budgets = ownedBudgets.budgets;
@@ -165,8 +218,27 @@ const SCRIPT = String.raw`
   el('recovery').addEventListener('close',()=>{ el('codes').textContent = ''; });
   el('refresh').onclick = () => run(async expected => { await refresh(expected); message('Owner data refreshed.'); });
   el('budget').onchange = () => { renderBudget(); sync(); };
-  el('agent').onchange = () => { reviewed = null; intents = []; renderIntents(); renderReview(); sync(); };
+  el('agent').onchange = () => { reviewed = null; intents = []; resetProvider(); renderIntents(); renderReview(); sync(); };
   el('load-intents').onclick = () => run(async expected => { await loadIntents(expected); message('Agent intents loaded.'); });
+  el('load-provider').onclick = () => run(async expected => { await loadProvider(expected); message('Provider proposals loaded. Operator aliases do not verify external account ownership.'); });
+  el('provider-approve').onclick = () => run(async expected => {
+    if (!providerReviewed) throw new Error('select_a_provider_payment');
+    const payment = { ...providerReviewed };
+    const grantToken = await stepUp('provider_payment',payment.consentFingerprint,expected);
+    const result = await api(providerPath(payment) + '/authorize',{ requestFingerprint: payment.requestFingerprint,grantToken },'POST',expected);
+    providerReviewed = { ...payment,status: result.payment.status }; historyCursor = null;
+    providerPayments = providerPayments.map(item => item.operationId === payment.operationId ? providerReviewed : item);
+    renderProvider(); renderProviderReview();
+    await refresh(expected);
+    message('Exact payment approved; allowance reserved. The agent must separately request execution. No funds were settled by this approval.');
+  });
+  el('provider-history').onclick = () => run(expected => providerHistory(0,expected));
+  el('provider-next').onclick = () => run(expected => providerHistory(historyCursor,expected));
+  el('provider-verify').onclick = () => run(async expected => {
+    const value = (await api(providerPath(providerReviewed) + '/receipt',undefined,'GET',expected)).evidence;
+    el('provider-receipt').textContent = JSON.stringify(value,null,2);
+    message('Receipt status: ' + value.status + '. Simulator evidence is not a real payment or blockchain confirmation.');
+  });
   for (const decision of ['approve','reject']) el(decision).onclick = () => run(async expected => {
     if (!reviewed) throw new Error('select_an_intent'); const intent = { ...reviewed };
     const grantToken = decision === 'approve' ? await stepUp('agent_approval',await hashTuple(['rail:owner-operation:v1','agent_approval',intent.agentId,intent.intentId,intent.requestFingerprint]),expected) : undefined;
@@ -211,7 +283,7 @@ const SCRIPT = String.raw`
 export function ownerConsoleHtml(nonce: string): string {
   if (!/^[A-Za-z0-9_-]{24}$/.test(nonce)) throw new Error("INVALID_CONSOLE_NONCE");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rail / Owner console</title><style nonce="${nonce}">${STYLE}</style></head>
-<body><main><header><div class="brand">Rail</div><h1>Owner console</h1><p>Internal wallet demo / external provider unavailable</p></header><p id="message" role="status" aria-live="polite">Sign in with an existing owner account. No synthetic balances are generated by this page.</p>
+<body><main><header><div class="brand">Rail</div><h1>Owner console</h1><p>Internal wallet + local simulator demo / real external provider unavailable</p></header><p id="message" role="status" aria-live="polite">Sign in with an existing owner account. No synthetic balances are generated by this page.</p>
 <div class="layout"><aside><section><h2>Owner session</h2><p id="session-label">Not signed in</p><form id="login"><label for="user-id">User ID</label><input id="user-id" autocomplete="username" required maxlength="128"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required><button id="signin" class="primary">Sign in</button></form><button id="clear-session">Clear session</button></section>
 <section data-auth hidden><h3>Passkey</h3><label for="enrollment-password">Current password for first enrollment</label><input id="enrollment-password" type="password" autocomplete="current-password"><button id="enroll">Enroll passkey</button><p class="small">Existing factors require passkey approval. Recovery codes appear once and are never saved here.</p></section>
 <section data-auth hidden><h2>Shared budget</h2><label for="budget">Budget</label><select id="budget"></select><p id="budget-state" class="small"></p><dl class="amounts"><dt>Total limit</dt><dd id="total">Not loaded</dd><dt>Reserved</dt><dd id="reserved">Not loaded</dd><dt>Spent</dt><dd id="spent">Not loaded</dd><dt class="available">Available</dt><dd class="available" id="available">Not loaded</dd></dl><button id="refresh">Refresh</button>
@@ -219,6 +291,8 @@ export function ownerConsoleHtml(nonce: string): string {
 <div><section class="panel" data-auth hidden><h2>Agent</h2><div class="row"><div><label class="sr-only" for="agent">Agent</label><select id="agent"></select></div><button id="load-intents" class="primary">Load intents</button></div><button id="revoke-agent">Revoke selected agent</button></section>
 <section class="panel" data-auth hidden><h2>Payment intents</h2><p id="intents-empty" class="empty">Select an agent and load its intents.</p><div class="table-wrap"><table><caption class="sr-only">Owner-visible agent payment intents</caption><thead><tr><th scope="col">Recipient</th><th scope="col">Amount</th><th scope="col">Status</th><th scope="col">Review</th></tr></thead><tbody id="intent-rows"></tbody></table></div></section>
 <section class="panel" data-auth hidden><h2>Exact payment review</h2><p id="review-empty" class="empty">Select Review on an intent. Changed terms cannot reuse approval.</p><div id="review-body" class="review" hidden><div><pre id="review-detail"></pre><label for="fingerprint">Request fingerprint</label><code id="fingerprint" class="fingerprint"></code><button id="approve" class="primary">Approve with passkey</button><button id="reject">Reject</button></div><div class="receipt"><h3>Verify receipt</h3><pre id="receipt" class="small"></pre><button id="verify">Verify receipt</button><p class="small">Server-observed authority only. No blockchain attestation or provider settlement is claimed.</p></div></div><p class="small">No bank, card or UPI settlement. Synthetic funds belong only in an isolated demo database.</p></section>
+<section class="panel" data-auth hidden><h2>Provider payments</h2><p>Separate from internal transfers. Local simulator only; no bank, UPI or card settlement.</p><button id="load-provider">Load provider payments</button><p id="provider-empty" class="empty">Select an agent and load its proposals.</p><div class="table-wrap"><table><caption class="sr-only">Owner-visible provider proposals</caption><thead><tr><th scope="col">Merchant</th><th scope="col">Amount</th><th scope="col">Status</th><th scope="col">Review</th></tr></thead><tbody id="provider-rows"></tbody></table></div>
+<div id="provider-review" hidden><h3>Exact provider payment review</h3><pre id="provider-detail"></pre><p class="small">These are operator-configured aliases, not verified external ownership. Approval reserves allowance only. Execution requires a separate signed agent request.</p><code id="provider-fingerprint" class="fingerprint"></code><button id="provider-approve" class="primary">Approve provider payment with passkey</button><button id="provider-history">Load payment history</button><pre id="provider-timeline" class="small"></pre><button id="provider-next">Next history page</button><button id="provider-verify">Verify provider receipt</button><pre id="provider-receipt" class="small"></pre></div></section>
 <section class="panel" id="welcome"><h2>Owner-controlled payments</h2><p>Agents can request payments, but cannot approve their own exceptions or change shared limits.</p><p class="small">Use preconfigured agents and mandates. This console does not execute agent code, store signing keys or provision payment instruments. Refresh manually; request quotas remain enforced.</p></section></div></div></main>
 <dialog id="recovery" aria-labelledby="recovery-title"><h2 id="recovery-title">Recovery codes: keep offline</h2><p>These one-use codes are shown once. Store them securely outside this browser, then dismiss. Clearing the session also removes this display.</p><pre id="codes"></pre><button id="dismiss-codes">Dismiss and clear codes</button></dialog><script nonce="${nonce}">${SCRIPT}</script></body></html>`;
 }

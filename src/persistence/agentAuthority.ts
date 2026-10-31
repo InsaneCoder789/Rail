@@ -237,6 +237,28 @@ export class AgentAuthorityStore {
     });
   }
 
+  async listProviderHistory(owner: string, agentId: string, operationId: string, principal: OwnerPrincipal,
+    page: { afterRevision?: number; limit?: number } = {}) {
+    const after = page.afterRevision ?? 0, limit = page.limit ?? 25;
+    if (!isAgentId(agentId) || !isAgentId(operationId) || !Number.isSafeInteger(after) || after < 0 || after > 2147483647 ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 100 || Object.keys(page).some(key => !["afterRevision", "limit"].includes(key))) invalid();
+    return this.transaction(async client => {
+      await this.lockOwnerContext(client, owner, principal);
+      await this.ownedAgent(client, owner, agentId, false);
+      const owned = await client.query("SELECT 1 FROM rail_provider_payments WHERE operation_id=$1 AND owner_wallet_id=$2 AND agent_id=$3", [operationId, owner, agentId]);
+      if (!owned.rowCount) throw new RequestError(404, "provider_payment_not_found", "provider payment not found");
+      const payment = await readProviderPaymentInTransaction(client, owner, operationId);
+      const rows = (await client.query(`SELECT revision,status,event_type,attempt_number,recorded_at_ms
+        FROM rail_provider_payment_history WHERE operation_id=$1 AND revision>$2 ORDER BY revision LIMIT $3`,
+      [operationId, after, limit + 1])).rows;
+      const entries = rows.slice(0, limit).map(row => ({ revision: Number(row.revision), status: String(row.status),
+        event: String(row.event_type), attemptNumber: Number(row.attempt_number), recordedAt: new Date(Number(row.recorded_at_ms)).toISOString() }));
+      return { operationId, status: payment.status, entries,
+        nextAfterRevision: rows.length > limit ? entries[entries.length - 1].revision : null,
+        assurance: "server_journal_history" as const };
+    });
+  }
+
   async authorizeProviderProposal(owner: string, agentId: string, operationId: string, value: unknown, principal: OwnerPrincipal) {
     if (!isAgentId(agentId) || !isAgentId(operationId) || !isRecord(value) || Object.keys(value).some(key => !["requestFingerprint", "grantToken"].includes(key)) ||
         typeof value.requestFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.requestFingerprint)) invalid();

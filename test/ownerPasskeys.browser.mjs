@@ -12,6 +12,10 @@ import { credentialOperationFingerprint, credentialRotationFingerprint, mandateO
 import { ENROLLMENT_FINGERPRINT, RECOVERY_CODES_FINGERPRINT, revokePasskeyFingerprint } from "../dist/persistence/ownerPasskeys.js";
 import { sharedBudgetOperationFingerprint } from "../dist/persistence/sharedBudgets.js";
 import { mkdir } from "node:fs/promises";
+import { dispatchProviderBatch, LocalPaymentSimulator } from "../dist/persistence/providerWorker.js";
+import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
+import { AgentEvidenceStore } from "../dist/persistence/agentEvidence.js";
+import { loadTransactionKeyRing } from "../dist/crypto/transactionProtection.js";
 
 dotenv.config();
 const agentKeys = new Map();
@@ -95,7 +99,11 @@ async function browserFixture(work, options = {}) {
       RAIL_EVIDENCE_KEY_RING: ring("browser_payment"), RAIL_RISK_RECORD_KEY_RING: ring("browser_risk"), RAIL_AGENT_AUTHORITY_KEY_RING: ring("browser_authority"),
       RAIL_WEBAUTHN_RP_ID: "localhost", RAIL_WEBAUTHN_ORIGIN: origin, RAIL_AGENT_API_ORIGIN: origin, RAIL_MERCHANT_QUOTE_KEYS: undefined,
       RAIL_RISK_MODEL_PATH: undefined, RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: undefined,
-      RAIL_PKCS11_MODULE_PATH: undefined, RAIL_KMS_KEY_ID: undefined, RAIL_DEMO_MODE: options.console ? "true" : undefined };
+      RAIL_PKCS11_MODULE_PATH: undefined, RAIL_KMS_KEY_ID: undefined, RAIL_DEMO_MODE: options.console ? "true" : undefined,
+      RAIL_PROVIDER_SIMULATOR: options.provider ? "true" : undefined,
+      RAIL_PROVIDER_TARGETS: options.provider ? JSON.stringify([{ version: 1, targetId: "browser_provider", revision: 1,
+        ownerWalletId: "browser_owner", provider: "simulator", providerAccountRef: "browser_account", instrumentRef: "browser_instrument",
+        merchantWalletId: "browser_receiver", merchantRef: "browser_merchant", currency: "INR", status: "active" }]) : undefined };
     for (const [key, value] of Object.entries(environment)) { oldEnvironment.set(key, process.env[key]); if (value === undefined) delete process.env[key]; else process.env[key] = value; }
     context = await createServerContext({ initializeDatabase: true, startBackgroundJobs: false });
     const password = `browser_fixture_${randomUUID()}`, newPassword = `browser_recovered_${randomUUID()}`;
@@ -307,4 +315,84 @@ test("Chromium owner console: actual sign-in, passkeys, exact approval, budget c
     assert.equal(await page.locator("#review-body").isVisible(), false);
     assert.deepEqual(errors, []);
   }, { console: true });
+});
+
+test("Chromium provider console: exact approval, lost reply, journal history, recovery and protected simulator receipt", { timeout: 60000 }, async () => {
+  await browserFixture(async ({ context, page, addAuthenticator, password }) => {
+    await addAuthenticator();
+    const errors = []; page.on("pageerror", error => errors.push(error.message));
+    const { token } = await api(page, undefined, "/auth/login", { userId: "browser_owner", password });
+    const registration = await api(page, token, "/auth/passkeys/register/options", { password });
+    await api(page, token, "/auth/passkeys/register/verify", { challengeId: registration.challengeId, response: await ceremony(page, registration, true) });
+    const { agent } = await api(page, token, "/v2/agents", { name: "Provider walkthrough agent" }, 201);
+    const pair = generateKeyPairSync("ed25519"), terms = { scope: "payments:execute", ttlSeconds: 3600, publicKey: pair.publicKey.export({ format: "jwk" }) };
+    const credentialGrant = await stepUp(page, token, "agent_credential", credentialOperationFingerprint(agent.agentId, terms));
+    const { credential } = await api(page, token, `/v2/agents/${agent.agentId}/credentials`, { ...terms, grantToken: credentialGrant }, 201);
+    agentKeys.set(credential.token, pair);
+    const budgetTerms = { name: "Provider walkthrough budget", currency: "INR", totalBudgetMinor: 1000, ttlSeconds: 3600, agentIds: [agent.agentId] };
+    const budgetGrant = await stepUp(page, token, "shared_budget", sharedBudgetOperationFingerprint("create", null, budgetTerms));
+    const { budget } = await api(page, token, "/v2/budgets", { ...budgetTerms, grantToken: budgetGrant }, 201);
+    const policy = { mode: "budgeted", currency: "INR", perPaymentLimitMinor: 100, totalBudgetMinor: 1000,
+      allowedReceiverWalletIds: ["browser_receiver"], ttlSeconds: 3600, sharedBudgetId: budget.budgetId };
+    const mandateGrant = await stepUp(page, token, "agent_mandate", mandateOperationFingerprint(agent.agentId, policy));
+    const { mandate } = await api(page, token, `/v2/agents/${agent.agentId}/mandates`, { ...policy, grantToken: mandateGrant }, 201);
+    const proposal = (await api(page, credential.token, "/v2/agent/provider-payments", { mandateId: mandate.mandateId,
+      clientRequestId: "browser_provider_walkthrough", targetId: "browser_provider", amountMinor: 100, currency: "INR" }, 201)).proposals[0];
+
+    await page.goto(new URL("/demo/owner", page.url()).toString());
+    await page.locator("#user-id").fill("browser_owner"); await page.locator("#password").fill(password); await page.locator("#signin").click();
+    await page.waitForFunction(() => !document.getElementById("load-provider").disabled);
+    const load = async status => {
+      await page.locator("#load-provider").click();
+      await page.waitForFunction(status => document.getElementById("provider-rows").textContent.includes(status) && !document.getElementById("load-provider").disabled, status);
+      await page.locator("#provider-rows button").click();
+    };
+    await load("awaiting_owner_approval");
+    assert.equal(await page.locator("#provider-fingerprint").textContent(), proposal.requestFingerprint);
+    assert.ok((await page.locator("#provider-detail").textContent()).includes("Instrument alias: browser_instrument"));
+    await page.locator("#provider-approve").click();
+    await page.waitForFunction(() => document.getElementById("provider-detail").textContent.includes("Status: reserved") && !document.getElementById("load-provider").disabled);
+    assert.equal((await context.pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "0");
+    const path = `/v2/agent/provider-payments/${proposal.operationId}/execute`, body = { requestFingerprint: proposal.requestFingerprint };
+    await api(page, credential.token, path, body, 202); await api(page, credential.token, path, body, 202);
+    const targets = new ProviderTargetRegistry(process.env.RAIL_PROVIDER_TARGETS);
+    const evidence = new AgentEvidenceStore(loadTransactionKeyRing(process.env.RAIL_AGENT_AUTHORITY_KEY_RING));
+    const drain = simulator => dispatchProviderBatch(context.pool, targets, simulator, { batchSize: 1, evidence });
+    assert.equal((await drain(new LocalPaymentSimulator(context.pool, "lose_reply"))).pending, 1);
+    await load("unknown");
+    await page.locator("#provider-verify").click();
+    await page.waitForFunction(() => document.getElementById("provider-receipt").textContent.includes('"status": "not_final"') && !document.getElementById("load-provider").disabled);
+    await page.locator("#provider-history").click();
+    await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes("submission_uncertain") && !document.getElementById("load-provider").disabled);
+    assert.deepEqual((await context.pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows[0],
+      { reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await context.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
+    assert.equal((await drain(new LocalPaymentSimulator(context.pool))).resolved, 1);
+    await load("succeeded");
+    assert.ok((await page.locator("#spent").textContent()).includes("1.00"));
+    assert.ok((await page.locator("#reserved").textContent()).includes("0.00"));
+    await page.locator("#provider-history").click();
+    await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes("succeeded") && !document.getElementById("load-provider").disabled);
+    await page.locator("#provider-verify").click();
+    await page.waitForFunction(() => document.getElementById("provider-receipt").textContent.includes('"status": "verified"') && !document.getElementById("load-provider").disabled);
+    assert.ok((await page.locator("#provider-receipt").textContent()).includes("local_simulator_outcome"));
+    assert.equal((await context.pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+    assert.equal((await context.pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
+    assert.deepEqual((await context.pool.query("SELECT balance FROM wallets WHERE wallet_id='browser_owner'")).rows[0], { balance: "1000" });
+    assert.deepEqual((await context.pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows[0],
+      { reserved_budget_minor: "0", spent_budget_minor: "100" });
+    await mkdir("deliverables/rail-owner-console", { recursive: true });
+    await page.setViewportSize({ width: 1440, height: 1080 });
+    await page.screenshot({ path: "deliverables/rail-owner-console/provider-desktop.png", fullPage: true });
+    for (const width of [320, 390, 768]) {
+      await page.setViewportSize({ width, height: 844 });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, `Provider console overflows at ${width}px`);
+    }
+    await page.screenshot({ path: "deliverables/rail-owner-console/provider-mobile.png", fullPage: true });
+    await page.locator("#clear-session").click();
+    for (const id of ["provider-receipt", "provider-timeline", "provider-detail", "provider-fingerprint", "provider-rows"])
+      assert.equal(await page.locator(`#${id}`).textContent(), "");
+    assert.equal(await page.evaluate(() => localStorage.length + sessionStorage.length), 0);
+    assert.deepEqual(errors, []);
+  }, { console: true, provider: true });
 });

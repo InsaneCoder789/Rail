@@ -38,6 +38,33 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Owner Payment History And Simulator Walkthrough, 1 November 2026
+
+Added owner/agent-scoped keyset pagination over the existing append-only provider
+journal, with bounded pages, strict query validation, existing quotas and no caching.
+History contains lifecycle revisions, attempts and timestamps, not credentials or
+funding aliases; it is explicitly server journal history, not a settlement receipt.
+
+The backend-hosted owner console now separates provider payments from internal
+intents, displays exact frozen terms, obtains fresh provider-payment passkey consent
+and lets the owner inspect history and protected receipts. It holds no agent key
+and cannot submit payments as an agent. Loading provider operations refreshes budget
+totals as well, preventing stale held/spent displays after worker resolution.
+Session cleanup removes all provider review/history/receipt content.
+
+Final local acceptance passed all 474 backend tests and four Chromium journeys,
+zero failures/skips, using isolated data on Node 20.19.6. The new actual-console
+lost-reply/lookup-recovery journey verifies final held/spent displays, native virtual
+passkey consent, session cleanup and mobile overflow. Full dependency audit found
+zero known vulnerabilities. Disposable database `rail_owner_history_1793475246683`
+was removed; the log is retained locally at
+`deliverables/portfolio-maintenance/rail_owner_history_1793475246683.log`.
+Screenshots are under `deliverables/rail-owner-console/provider-*.png` (untracked).
+No new remote CI, physical-authenticator, hosting or real-provider acceptance is
+claimed. This is simulator acceptance only. Real-provider selection/account access,
+authenticated callbacks, real sandbox recovery and external outcome provenance
+remain unimplemented; C2/C3 are not fully complete.
+
 ### Protected Simulator Outcome Receipts, 1 November 2026
 
 The simulator worker now protects final outcome receipts with the existing

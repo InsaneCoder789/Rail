@@ -754,6 +754,28 @@ test("simulator outcome receipts bind consent and final accounting, survive repl
   });
 });
 
+test("owner provider history paginates immutable revisions and isolates owners and agents", { skip: !databaseUrl }, async () => {
+  await queuedProviderFixture(async ({ strict, owner, agent, proposal, queue, drain, ready, pool }) => {
+    const history = page => strict.listProviderHistory(owner.walletId, agent.agentId, proposal.operationId, owner, page);
+    assert.deepEqual((await history()).entries.map(entry => entry.revision), [1]);
+    await queue(); await drain(); await ready(); await drain(new LocalPaymentSimulator(pool));
+    const first = await history({ limit: 2 }), second = await history({ limit: 2, afterRevision: first.nextAfterRevision });
+    assert.equal(first.assurance, "server_journal_history"); assert.equal(first.status, "succeeded");
+    assert.deepEqual(first.entries.map(entry => entry.revision), [1, 2]);
+    assert.deepEqual(second.entries.map(entry => entry.revision), [3, 4]);
+    assert.equal(second.nextAfterRevision, null);
+    assert.deepEqual((await history({ afterRevision: 4 })).entries, []);
+    assert.ok(!JSON.stringify(first).includes("instrument_fixture"));
+    assert.ok(!JSON.stringify(first).includes("providerAccountRef"));
+    for (const page of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { afterRevision: -1 }, { afterRevision: 2147483648 }, { afterRevision: "1" }, { other: 1 }])
+      await assert.rejects(history(page), { code: "invalid_agent_request" });
+    await assert.rejects(strict.listProviderHistory(owner.walletId, randomUUID(), proposal.operationId, owner));
+    const otherOwner = { ...owner, walletId: "other_wallet", userId: "other_user" };
+    await assert.rejects(strict.listProviderHistory(otherOwner.walletId, agent.agentId, proposal.operationId, otherOwner));
+    await assert.rejects(strict.listProviderHistory(owner.walletId, agent.agentId, randomUUID(), owner), { code: "provider_payment_not_found" });
+  }, "lose_reply");
+});
+
 test("receipt write faults roll back final accounting and recover through lookup without resubmission", { skip: !databaseUrl }, async () => {
   await queuedProviderFixture(async ({ pool, queue, drain, ready, state, strict, owner, agent, proposal }) => {
     await pool.query(`CREATE FUNCTION fail_outcome_receipt() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN
@@ -1007,6 +1029,10 @@ test("provider proposals and simulator execution cross real loopback HTTP with D
       const outcome = await fetchJson("GET", receiptPath, undefined, true);
       assert.equal(outcome.status, 200); assert.equal(outcome.body.evidence.status, "verified");
       assert.equal(outcome.body.evidence.receipt.assurance, "local_simulator_outcome");
+      const history = await fetchJson("GET", `${ownerPath}/${pending.operationId}/history?limit=1`, undefined, true);
+      assert.equal(history.status, 200); assert.equal(history.body.history.entries.length, 1);
+      assert.equal(history.body.history.nextAfterRevision, 1);
+      assert.equal((await fetchJson("GET", `${ownerPath}/${pending.operationId}/history?limit=1&limit=2`, undefined, true)).status, 422);
       assert.equal((await pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
       assert.equal((await pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
       await runMigrations(pool);

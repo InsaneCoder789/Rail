@@ -1,5 +1,10 @@
 # Owner Console (C3 In Progress)
 
+Latest local acceptance, 1 November 2026: all 474 backend tests and four Chromium
+journeys passed with zero failures/skips, including the provider simulator page.
+The disposable database was removed. This is not real-provider/hosted acceptance;
+earlier test counts below describe historical checkpoints.
+
 ## Purpose And Availability
 
 `GET /demo/owner` serves a small backend-hosted owner console when
@@ -41,6 +46,10 @@ children and native selects explicit shrink boundaries. The rerun passed 320,
   and inspect server-verified authority receipt summaries.
 - Change a shared limit with revision-bound passkey consent; revoke a budget,
   withdraw a member or revoke a selected agent using existing emergency controls.
+- Load an owned agent's provider proposals separately from internal intents, inspect
+  frozen target/funding aliases and exact terms, and approve with a fresh passkey.
+- Inspect a paginated provider journal and verify protected simulator outcome
+  receipts. Loading provider payments also refreshes current budget totals.
 
 Approval does not execute a payment. The independently authenticated agent client
 must still request execution and pass live financial checks. Integer limit inputs
@@ -92,7 +101,44 @@ Desktop/mobile screenshots in `deliverables/rail-owner-console` were inspected
 against the concept: paper/ink/teal, serif hierarchy, bounded panels and complete
 fingerprints remain; authenticated data and additional safety controls intentionally
 replace illustrative content. A later change additionally clears hidden totals and
-fingerprints on session cleanup and awaits combined browser regression. Dedicated
-simulator code now exists; its updated three-process integration test and external
-timeout/recovery demonstration remain acceptance gates. This console does not
-complete C2 or C3.
+fingerprints on session cleanup passed combined browser regression. The local
+three-process integration and external-simulator timeout/recovery walkthrough now
+have acceptance coverage. A real external provider, provider-authenticated outcomes
+and actual sandbox acceptance are still unavailable; this does not complete C2/C3.
+
+## Local Provider Walkthrough
+
+Use an isolated demo database, synthetic accounts and the non-production flags
+from [the provider guide](PROVIDER_PAYMENTS.md#local-simulator-execution-increment).
+Keep provider targets and the three independent key rings identical between the
+server and the finite worker. Provision the owner, agent, execution credential,
+passkey-consented mandate and shared allowance through the existing authenticated
+APIs. Never configure this walkthrough against live customer data.
+
+1. The external agent proposes payment terms with a fresh DPoP proof. No payment
+   or allowance reservation happens at proposal creation.
+2. Sign in at `/demo/owner`, select the agent and choose **Load provider payments**.
+   Review merchant, amount/currency, funding aliases, target revision, deadline and
+   fingerprint. Operator-configured aliases do not prove external account ownership.
+3. Choose **Approve provider payment with passkey**. This reserves policy allowance
+   only; it does not execute or settle a payment.
+4. The independently authenticated agent signs an execution request for the
+   original operation/fingerprint. The page deliberately has no agent-execute
+   control, private signing key or automatic payment retry.
+5. Run `npm run provider:simulate` in the matching demo environment. It processes
+   one finite batch. Reload provider payments and select **Review payment** again
+   to see current status and refreshed budget totals.
+6. Use **Load payment history** to inspect ordered revisions, and **Next history
+   page** when present. Use **Verify provider receipt** for protected final evidence.
+   Unknown outcomes have no final receipt and retain allowance holds. Simulator
+   success spends policy allowance but does not move internal-wallet balances.
+7. Clear the page session. Proposal details, history, receipts and budget totals
+   are removed; this is not global server-side session revocation.
+
+The fourth native Chromium journey exercises this actual page through login,
+passkey approval, signed agent execution, simulated response loss, held allowance,
+lookup-only recovery and receipt verification. Fault injection is confined to the
+trusted test adapter, not a public request parameter. It asserts one simulated
+effect, no internal ledger writes, final budget totals and session cleanup, and
+checks overflow at 320/390/768 pixels. Browser execution uses a virtual authenticator,
+not a physical-device or deployed-provider acceptance test.

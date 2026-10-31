@@ -15,6 +15,11 @@ proof-bound proposal admission are now implemented as described below. Provider/
 real provider execution admission, the real adapter and
 actual sandbox acceptance remain open.
 
+The 1 November owner-history increment adds the console walkthrough described in
+[Owner Console](OWNER_CONSOLE.md#local-provider-walkthrough). Earlier test counts in
+this guide are historical checkpoints; current acceptance is recorded in the
+[project report](PROJECT_STATUS_REPORT.md#latest-status).
+
 ## Local Simulator Execution Increment
 
 This increment adds an execution-scope proof admission route and a finite durable
@@ -379,3 +384,25 @@ The CLI requires `RAIL_EVIDENCE_KEY_RING`, `RAIL_RISK_RECORD_KEY_RING` and
 Trusted in-process workers must supply `options.evidence`; without it, a batch
 fails before claiming jobs or creating effects. Receipt write failures preserve holds and recover by
 lookup. A missing/retired decryption key never produces a fabricated valid receipt.
+
+## Owner-Readable Journal History
+
+`GET /v2/agents/:agentId/provider-payments/:operationId/history?afterRevision=0&limit=25`
+requires the authenticated owner of both agent and payment. It uses the existing
+owner/source quotas and returns `Cache-Control: no-store`. The route rejects unknown
+or duplicate query fields. `limit` is an integer from 1 to 100; `afterRevision` is
+an integer from 0 to 2147483647. Invalid or foreign operation identifiers do not
+permit cross-owner/agent reads.
+
+The response contains `{ history: { operationId, status, assurance, entries,
+nextAfterRevision } }`. Entries have revision, lifecycle status, event, attempt
+number and recorded timestamp in ascending revision order. `nextAfterRevision` is
+the last returned revision when another page exists, otherwise `null`. Reading
+does not advance state, execute payments, create receipts or release holds. New
+events may be appended between requests; refresh from revision zero to reload the
+timeline. Current status and timeline are ordinary journal reads, not a frozen
+multi-request snapshot. They exclude funding aliases, proof tokens and key material.
+
+`assurance` is `server_journal_history`, not a protected receipt or authenticated
+external settlement assertion. Use the receipt endpoint for final protected evidence.
+Unapproved proposals have no admitted payment journal and therefore no history yet.

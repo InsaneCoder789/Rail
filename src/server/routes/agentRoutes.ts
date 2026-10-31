@@ -46,16 +46,24 @@ export async function handleAgentRoutes(req: http.IncomingMessage, res: http.Ser
     else json(res, 200, { intent: await context.agentStore.createIntent(token, body, admission) });
     return true;
   }
-  const ownerProviderRoute = /^\/v2\/agents\/([^/]+)\/provider-payments(?:\/([^/]+)\/(authorize|receipt))?$/.exec(url.pathname);
+  const ownerProviderRoute = /^\/v2\/agents\/([^/]+)\/provider-payments(?:\/([^/]+)\/(authorize|receipt|history))?$/.exec(url.pathname);
   if (ownerProviderRoute && ((!ownerProviderRoute[2] && req.method === "GET") ||
-      (ownerProviderRoute[3] === "receipt" && req.method === "GET") || (ownerProviderRoute[3] === "authorize" && req.method === "POST"))) {
+      (["receipt", "history"].includes(ownerProviderRoute[3]) && req.method === "GET") || (ownerProviderRoute[3] === "authorize" && req.method === "POST"))) {
     res.setHeader("Cache-Control", "no-store");
     await applyRateLimit({ req, res, rateLimiter: context.rateLimiter, scope: "agent_control_source", limit: 30,
       windowMs: 60_000, trustProxyHeaders: context.config.trustProxyHeaders });
     if (!context.authResolver.resolveOwnerPrincipal) throw new RequestError(401, "owner_authentication_required", "owner session required");
     const principal = await context.authResolver.resolveOwnerPrincipal(req);
     await applyIdentityRateLimit({ res, rateLimiter: context.rateLimiter, scope: "agent_control", identity: principal.walletId, limit: 20, windowMs: 60_000 });
-    if (ownerProviderRoute[3] === "receipt") json(res, 200, { evidence: await context.agentStore.readProviderOutcome(principal.walletId, ownerProviderRoute[1], ownerProviderRoute[2], principal) });
+    if (ownerProviderRoute[3] === "history") {
+      if ([...url.searchParams.keys()].some(key => !["afterRevision", "limit"].includes(key)) ||
+          [...url.searchParams.keys()].some(key => url.searchParams.getAll(key).length !== 1) ||
+          [...url.searchParams.values()].some(value => !/^(0|[1-9][0-9]{0,9})$/.test(value)))
+        throw new RequestError(422, "invalid_history_page", "invalid history page");
+      json(res, 200, { history: await context.agentStore.listProviderHistory(principal.walletId, ownerProviderRoute[1], ownerProviderRoute[2], principal,
+        Object.fromEntries([...url.searchParams].map(([key, value]) => [key, Number(value)]))) });
+    }
+    else if (ownerProviderRoute[3] === "receipt") json(res, 200, { evidence: await context.agentStore.readProviderOutcome(principal.walletId, ownerProviderRoute[1], ownerProviderRoute[2], principal) });
     else if (req.method === "GET") json(res, 200, { proposals: await context.agentStore.listOwnerProviderProposals(principal.walletId, ownerProviderRoute[1], principal) });
     else {
       if (!requireJsonContentType(req, res, context.config.requireJsonContentType)) return true;
