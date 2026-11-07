@@ -30,7 +30,7 @@ const failure = (message: string): never => { throw new Error(message); };
 export class StripeTestProvider {
   readonly provider = "stripe" as const;
   private readonly client: Client;
-  private readonly accountId: string;
+  readonly accountId: string;
   private readonly instruments = new Map<string, { readonly ownerWalletId: string; readonly customerId: string }>();
 
   constructor(config: StripeTestConfiguration, client?: Client) {
@@ -140,6 +140,21 @@ export class StripeTestProvider {
   /** Signature verification only. The eventual handler must deduplicate and retrieve current state. */
   verifyWebhook(rawBody: Buffer, signature: unknown, webhookSecret: string) {
     return verifyStripeTestWebhook(rawBody, signature, webhookSecret);
+  }
+
+  /** Read-only callback correlation. Raw snapshots/client secrets never leave this closure. */
+  async callbackSnapshot(paymentIntentId: string) {
+    if (!id(paymentIntentId, "pi")) failure("INVALID_STRIPE_CALLBACK_REFERENCE");
+    await this.requireAccount();
+    try {
+      const intent = await this.client.paymentIntents.retrieve(paymentIntentId);
+      if (intent.id !== paymentIntentId || intent.object !== "payment_intent" || intent.livemode !== false) failure("STRIPE_OBSERVATION_MISMATCH");
+      const operationId = intent.metadata?.rail_operation_id, fingerprint = intent.metadata?.rail_fingerprint;
+      if (!operationId && !fingerprint) return null;
+      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(operationId) || !/^[a-f0-9]{64}$/.test(fingerprint))
+        failure("STRIPE_CALLBACK_CORRELATION_CONFLICT");
+      return Object.freeze({ operationId, fingerprint, observe: (payment: ProviderPayment) => this.normalize(payment, intent) });
+    } catch { return failure("STRIPE_CALLBACK_LOOKUP_UNAVAILABLE"); }
   }
 }
 

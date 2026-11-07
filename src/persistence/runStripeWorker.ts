@@ -6,6 +6,7 @@ import { StripeTestProvider, loadStripeTestConfiguration } from "../rail/stripeP
 import { AgentEvidenceStore, loadAgentAuthorityKeyRing } from "./agentEvidence.js";
 import { loadTransactionKeyRing } from "../crypto/transactionProtection.js";
 import { loadRiskKeyRing } from "./riskProtection.js";
+import { processStripeCallbacks } from "./stripeCallbacks.js";
 
 dotenv.config({ quiet: true });
 const configuration = loadStripeTestConfiguration();
@@ -16,7 +17,9 @@ const riskKeys = loadRiskKeyRing(process.env.RAIL_RISK_RECORD_KEY_RING, paymentK
 const evidence = new AgentEvidenceStore(loadAgentAuthorityKeyRing(process.env.RAIL_AGENT_AUTHORITY_KEY_RING ?? "", [paymentKeys, riskKeys]));
 const pool = createPool(process.env.DATABASE_URL, 2);
 try {
-  const result = await dispatchProviderBatch(pool, targets, new StripeTestProvider(configuration), { evidence, leaseMs: 60000, timeoutMs: 20000 });
-  console.log(JSON.stringify({ stripeTestOnly: true, ...result }));
-  if (result.pending || result.lostLease) process.exitCode = 1;
+  const provider = new StripeTestProvider(configuration);
+  const callbacks = await processStripeCallbacks(pool, provider, { leaseMs: 60000 });
+  const payments = await dispatchProviderBatch(pool, targets, provider, { evidence, leaseMs: 60000, timeoutMs: 20000 });
+  console.log(JSON.stringify({ stripeTestOnly: true, callbacks, payments }));
+  if (callbacks.pending || callbacks.lostLease || payments.pending || payments.lostLease) process.exitCode = 1;
 } finally { await pool.end(); }

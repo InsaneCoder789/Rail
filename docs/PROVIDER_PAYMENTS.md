@@ -13,7 +13,7 @@ audit reported zero known vulnerabilities. The disposable local PostgreSQL datab
 was removed after verification. Trusted target configuration and
 proof-bound proposal admission are now implemented as described below. Stripe is
 now owner-selected. Its test adapter boundary and optional callback inbox are implemented as described below;
-account access, callback consumption and actual sandbox acceptance
+account access and actual sandbox acceptance
 remain open.
 
 The 1 November owner-history increment adds the console walkthrough described in
@@ -414,7 +414,8 @@ The owner selected Stripe. `src/rail/stripeProvider.ts` adds an isolated test-mo
 adapter using pinned `stripe@23.1.0` and API version `2026-10-28.endive`. It is
 now wired to the public execute route and provider-isolated worker behind a separate
 test-only flag described below. The optional callback inbox below only admits
-events; it does not resolve them. Nothing is enabled by default, and adding the
+events; the consumer described below verifies and forwards hints without posting
+money. Nothing is enabled by default, and adding the
 dependency alone does not enable charges. There is still no real Stripe acceptance evidence.
 
 The supported model is one configured Stripe test merchant charging a configured
@@ -461,13 +462,12 @@ state before resolving anything. It currently accepts the documented snapshot
 PaymentIntent event family; thin event handling is not claimed.
 [Stripe webhook guidance](https://docs.stripe.com/webhooks)
 
-Eighteen isolated boundary tests cover exact parameters, account/instrument/mode
+Nineteen isolated boundary tests cover exact parameters, account/instrument/mode
 substitution, outcome states, ambiguity, transport failure and webhook tampering.
 One uses the real SDK's HTTP serialization against an in-process fake transport;
 webhook tests use synthetic signatures. These are local contract tests, not Stripe
-network, sandbox or deployed callback acceptance. Callback consumption and actual
-sandbox acceptance remain required. The current
-worker and protected Stripe outcome contract are described below.
+network, sandbox or deployed callback acceptance. Actual sandbox acceptance remains
+required. The current worker and protected Stripe outcome contract are described below.
 
 ## Durable Stripe Test Callback Inbox
 
@@ -496,24 +496,24 @@ The default pending limit is 10000 events/account. At capacity, new events retur
 503 while known duplicates remain acknowledgeable. Database failures roll back
 admission, so Stripe can retry. A normal notification relay cannot consume this
 separate inbox. `processed_at` is reserved for transactional consumer completion;
-the current endpoint never sets it. There is no automatic deletion or silent
+the HTTP endpoint never sets it. There is no automatic deletion or silent
 dead-lettering of financial hints.
 
 HTTP 200 means **received**, not processed, paid, settled or reconciled. Snapshot
 amount/status fields never update money, allowance or the payment journal. A
 signature proves possession of the configured endpoint secret, not the configured
 account's identity by itself; the subsequent authenticated API retrieval must also
-verify account/object/operation bindings. The durable consumer is still required
-before enabling callback-driven recovery. Until then, this opt-in
-test inbox accumulates pending events and eventually backpressures at its cap.
+verify account/object/operation bindings. The durable consumer below implements
+this verification step. Without running that worker, the opt-in inbox still
+accumulates pending events and eventually backpressures at its cap.
 
 Tests use disposable PostgreSQL schemas, concurrent clients, a real loopback HTTP
 server and synthetic SDK signatures. They cover retries, conflicts, failed inserts,
 capacity races, repeat migrations, immutable fields, disabled/production settings,
 forged credentials, JSON/raw-byte/body limits and unchanged financial tables.
 They do not establish delivery from a registered Stripe endpoint or real sandbox
-acceptance. Never enable a real event source and assume an unfinished consumer is
-processing it.
+acceptance. A configured callback endpoint is not evidence that its worker is
+scheduled, healthy or processing the backlog.
 
 ## Explicit Stripe Test Execution And Protected Outcomes
 
@@ -572,4 +572,58 @@ The native owner-console walkthrough also runs with a fake Stripe SDK transport,
 including lost replies, shared allowance holds, lookup recovery and version-2
 receipt verification. Database tests cover provider isolation, revocation before
 and after submission, replay and receipt-fault rollback. Actual test-account
-execution/webhook delivery and durable callback consumption still gate C2/C3.
+execution and webhook delivery still gate C2/C3.
+
+## Callback-Driven Lookup Recovery
+
+`npm run provider:stripe` now consumes one bounded callback batch before processing
+one payment batch. Callback admission needs only its endpoint secret; the consumer
+requires the configured Stripe test API key to retrieve current state. It never
+uses an incoming snapshot amount/status as a financial outcome.
+
+Each consumer leases pending events for its configured account, releases the
+database connection, then authenticates the account and retrieves the exact
+PaymentIntent. Unrelated objects without Rail metadata are marked `unrelated`;
+valid-looking Rail metadata with missing or conflicting operation state remains
+pending. Matching requires the immutable fingerprint/account/customer/instrument/
+amount/currency bindings, a genuinely admitted payment job and a committed original
+submission boundary. A signed callback cannot start a payment or authorize a new
+attempt. Reconciliation remains possible after agent/owner authority withdrawal.
+
+The completion transaction records an immutable `matched` operation/fingerprint
+hint and wakes the existing pending outbox job. These commit together; failure
+rolls both back. It does not change the ledger, allowance, journal outcome or
+protected receipt. `processed_at` means the callback hint was consumed, not that
+the payment succeeded. Payment resolution still requires the payment worker's
+fresh authenticated retrieval and its existing atomic evidence/accounting commit.
+
+Verified hints let the worker retrieve a lost PaymentIntent ID directly, avoiding
+the bounded customer-list fallback. Hints from multiple distinct objects for the
+same operation are conflicts, not permission to choose a preferred outcome.
+Callback rows and outbox jobs use separate expiring leases; stale consumers cannot
+finish a reclaimed event. Neither kind of lease can fence remote side effects.
+No database locks are held across Stripe requests, and lock order matches the
+payment worker rather than introducing an authority/outbox inversion.
+
+Transient errors and mismatches preserve pending work with a 30-second retry delay
+by default. Contradictory terminal observations retain the original financial
+result and expose the sanitized `conflicting_provider_outcome` investigation code.
+Other bounded diagnostic codes distinguish lookup, correlation and timeout issues,
+without persisting provider error bodies, credentials or client secrets. There is
+no automatic dead-letter release, refund or resubmission. Original configuration
+must remain available for unresolved history; key/config removal can block recovery.
+
+Default callback batches handle at most 10 events; options are capped at 100. The
+CLI uses a 60-second callback lease and 15-second retrieval timeout, followed by the
+separate payment batch. Its JSON report has `callbacks` and `payments` counters and
+returns nonzero for pending/lost-lease work in either group. This is a finite worker,
+not a hosted scheduler, alerting system or proof of real event delivery.
+
+Local tests cover stale/duplicate snapshots, immutable hints, lost-ID recovery when
+customer listing is unavailable, lease reclaim after revocation, transactional hint/
+wakeup rollback, unsubmitted-operation rejection, fingerprint substitution and
+contradictory terminal outcomes. The Stripe-enabled Chromium journey calls the
+real HTTP callback route with a synthetic SDK signature, consumes the hint, then
+resolves the job through a fake Stripe API transport and verifies the owner receipt.
+No test here establishes actual account access, Stripe network behavior or hosted
+webhook delivery. Those remain explicit final acceptance gates.

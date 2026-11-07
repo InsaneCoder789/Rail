@@ -40,6 +40,8 @@ import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
 import { providerPaymentConsentFingerprint } from "../dist/domain/providerPayment.js";
 import { dispatchProviderBatch, LocalPaymentSimulator } from "../dist/persistence/providerWorker.js";
 import { StripeTestProvider } from "../dist/rail/stripeProvider.js";
+import Stripe from "stripe";
+import { StripeCallbackInbox, processStripeCallbacks } from "../dist/persistence/stripeCallbacks.js";
 import { authorizeProviderPaymentInTransaction, advanceProviderPaymentInTransaction, createProviderPaymentInTransaction,
   readProviderPaymentInTransaction } from "../dist/persistence/providerPayments.js";
 
@@ -729,7 +731,7 @@ async function stripeQueuedFixture(work, fault = "none", enabled = true) {
     const ready = () => f.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
     const state = async () => (await f.pool.query(`SELECT payment.status,budget.reserved_budget_minor,budget.spent_budget_minor
       FROM rail_provider_payments payment JOIN rail_shared_budgets budget ON budget.budget_id=payment.shared_budget_id`)).rows[0];
-    await work({ ...f, proposal, queue, drain, ready, state, adapter, creates: () => creates });
+    await work({ ...f, proposal, queue, drain, ready, state, adapter, client, creates: () => creates });
     assert.equal((await f.pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
   }, "payments:execute", { simulator: !enabled, stripe: enabled }, target);
 }
@@ -781,6 +783,106 @@ test("Stripe revocation before submission creates a cancellation receipt without
     assert.equal(result.status, "verified"); assert.equal(result.receipt.assurance, "server_cancelled_before_submission");
     assert.equal(result.receipt.provenance, undefined);
   });
+});
+
+async function stripeCallback(f, eventId = `evt_${randomUUID().replaceAll("-", "")}`) {
+  const intent = (await f.pool.query("SELECT intent FROM stripe_test_effects")).rows[0].intent;
+  const raw = Buffer.from(JSON.stringify({ id: eventId, type: "payment_intent.payment_failed", livemode: false,
+    data: { object: { object: "payment_intent", id: intent.id, status: "failed", amount: 1 } } }));
+  const webhookSecret = `whsec_${"c".repeat(32)}`;
+  const inbox = new StripeCallbackInbox(f.pool, { accountId: "acct_fixture", webhookSecret });
+  await inbox.accept(raw, Stripe.webhooks.generateTestHeaderString({ payload: raw.toString(), secret: webhookSecret }));
+  return eventId;
+}
+
+test("Stripe callbacks validate current API state and recover lost IDs without trusting snapshot amounts or posting money", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async f => {
+    await f.queue(); await f.drain();
+    const eventId = await stripeCallback(f);
+    f.client.paymentIntents.list = async () => { throw new Error("customer_list_unavailable"); };
+    assert.equal((await processStripeCallbacks(f.pool, f.adapter())).processed, 1);
+    assert.deepEqual(await f.state(), { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    const event = (await f.pool.query("SELECT * FROM rail_stripe_callback_inbox WHERE event_id=$1", [eventId])).rows[0];
+    assert.equal(event.processing_result, "matched"); assert.equal(event.operation_id, f.proposal.operationId);
+    assert.equal(event.request_fingerprint, f.proposal.requestFingerprint);
+    assert.equal((await f.drain()).resolved, 1); assert.equal(f.creates(), 1);
+    assert.deepEqual(await f.state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+    await assert.rejects(f.pool.query("UPDATE rail_stripe_callback_inbox SET operation_id=NULL"), { code: "23514" });
+  }, "lose_reply");
+});
+
+test("Stripe callback hint failure rolls back job wakeup and retries without losing liability", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async f => {
+    await f.queue(); await f.drain(); await stripeCallback(f);
+    await f.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()+interval '1 hour' WHERE provider_operation_id IS NOT NULL");
+    await f.pool.query(`CREATE FUNCTION fail_callback_hint() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.processed_at IS NOT NULL THEN RAISE EXCEPTION 'hint_fault'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER fail_callback_hint BEFORE UPDATE ON rail_stripe_callback_inbox FOR EACH ROW EXECUTE FUNCTION fail_callback_hint()`);
+    assert.equal((await processStripeCallbacks(f.pool, f.adapter(), { batchSize: 1 })).pending, 1);
+    assert.equal((await f.pool.query("SELECT operation_id FROM rail_stripe_callback_inbox")).rows[0].operation_id, null);
+    assert.equal((await f.pool.query("SELECT next_attempt_at>clock_timestamp() AS delayed FROM outbox WHERE provider_operation_id IS NOT NULL")).rows[0].delayed, true);
+    await f.pool.query("DROP TRIGGER fail_callback_hint ON rail_stripe_callback_inbox");
+    await f.pool.query("UPDATE rail_stripe_callback_inbox SET next_attempt_at=clock_timestamp()-interval '1 second'");
+    assert.equal((await processStripeCallbacks(f.pool, f.adapter())).processed, 1);
+    assert.equal((await f.drain()).resolved, 1); assert.equal(f.creates(), 1);
+  }, "lose_reply");
+});
+
+test("Stripe callback processing survives revocation and stale consumers cannot overwrite a reclaimed lease", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async f => {
+    await f.queue(); await f.drain(); await stripeCallback(f);
+    await f.strict.revokeAgent(f.owner.walletId, f.agent.agentId, f.owner);
+    let entered, release;
+    const reached = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+    const actual = f.adapter();
+    const paused = { accountId: actual.accountId, callbackSnapshot: async id => {
+      const value = await actual.callbackSnapshot(id); entered(); await gate; return value;
+    } };
+    const old = processStripeCallbacks(f.pool, paused, { batchSize: 1, leaseMs: 30000, timeoutMs: 15000 });
+    await reached;
+    await f.pool.query("UPDATE rail_stripe_callback_inbox SET lease_expires_at=clock_timestamp()-interval '1 second'");
+    assert.equal((await processStripeCallbacks(f.pool, actual)).processed, 1);
+    release(); assert.equal((await old).lostLease, 1);
+    assert.equal((await f.drain()).resolved, 1); assert.equal(f.creates(), 1);
+  }, "lose_reply");
+});
+
+test("contradictory Stripe callback outcomes remain pending investigation and preserve original receipts", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async f => {
+    await f.queue(); await f.drain();
+    const original = await f.strict.readProviderOutcome(f.owner.walletId, f.agent.agentId, f.proposal.operationId, f.owner);
+    await f.pool.query(`UPDATE stripe_test_effects SET intent=jsonb_set(jsonb_set(intent,'{status}','"canceled"'),'{amount_received}','0')`);
+    await stripeCallback(f);
+    assert.equal((await processStripeCallbacks(f.pool, f.adapter(), { batchSize: 1 })).pending, 1);
+    const row = (await f.pool.query("SELECT processed_at,last_error FROM rail_stripe_callback_inbox")).rows[0];
+    assert.equal(row.processed_at, null); assert.equal(row.last_error, "conflicting_provider_outcome");
+    assert.deepEqual(await f.strict.readProviderOutcome(f.owner.walletId, f.agent.agentId, f.proposal.operationId, f.owner), original);
+    assert.deepEqual(await f.state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+  });
+});
+
+test("Stripe callbacks cannot turn an approved but unsubmitted operation into execution authority", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async f => {
+    await f.queue();
+    // Model an out-of-band provider object, not a Rail-authorized submission.
+    await f.client.paymentIntents.create({ amount: 100, currency: "inr", customer: "cus_fixture", payment_method: "pm_fixture",
+      metadata: { rail_operation_id: f.proposal.operationId, rail_fingerprint: f.proposal.requestFingerprint } });
+    await stripeCallback(f);
+    assert.equal((await processStripeCallbacks(f.pool, f.adapter(), { batchSize: 1 })).pending, 1);
+    assert.deepEqual(await f.state(), { status: "reserved", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    assert.equal((await f.pool.query("SELECT processed_at FROM rail_stripe_callback_inbox")).rows[0].processed_at, null);
+  });
+});
+
+test("Stripe callback operation fingerprints cannot substitute another financial request", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async f => {
+    await f.queue(); await f.drain();
+    await f.pool.query(`UPDATE stripe_test_effects SET intent=jsonb_set(intent,'{metadata,rail_fingerprint}',to_jsonb(repeat('b',64)))`);
+    await stripeCallback(f);
+    assert.equal((await processStripeCallbacks(f.pool, f.adapter(), { batchSize: 1 })).pending, 1);
+    assert.deepEqual(await f.state(), { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    assert.equal((await f.pool.query("SELECT last_error FROM rail_stripe_callback_inbox")).rows[0].last_error, "stripe_callback_correlation_conflict");
+  }, "lose_reply");
 });
 
 test("Stripe execution stays disabled when only simulator permission is enabled", { skip: !databaseUrl }, async () => {

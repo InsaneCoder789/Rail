@@ -58,6 +58,11 @@ receipts identify server-observed test API outcomes, not live settlement. The
 additional Chromium acceptance journey uses a fake SDK transport; a real sandbox
 walkthrough is still a separate gate.
 
+That test journey now includes a synthetic signed callback sent through the actual
+HTTP endpoint and durable callback consumption before job recovery. Callback
+acknowledgment and hint processing are not shown as payment success; the page only
+shows the independently resolved journal and verified outcome receipt.
+
 Approval does not execute a payment. The independently authenticated agent client
 must still request execution and pass live financial checks. Integer limit inputs
 are minor units, not decimal currency amounts. Provider settlement and blockchain

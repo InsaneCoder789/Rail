@@ -38,6 +38,33 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Stripe Callback Consumption And Durable Lookup Hints
+
+The Stripe worker now consumes authenticated callback hints before its payment
+batch. Consumers lease events, retrieve current Stripe state outside database
+transactions, validate the original admitted operation and record a scoped lookup
+hint while waking the existing job. They cannot authorize new work or post money.
+The payment worker independently retrieves current state again and performs the
+existing atomic journal/allowance/protected-receipt resolution. Verified hints
+recover lost object IDs even when the bounded customer-list fallback is unavailable.
+
+Lease loss, transaction faults, unsubmitted operations and correlation conflicts
+leave work pending. Contradictory terminal outcomes preserve the original receipt
+and report a sanitized investigation code. Unrelated authenticated provider objects
+can be consumed without creating operations. Indexed immutable correlation hints
+and bounded retry batches avoid arbitrary searches or hidden resubmission.
+
+Focused checks passed for these paths, and the Stripe browser journey now traverses
+the real callback HTTP endpoint, synthetic signature, consumer, fake API retrieval,
+worker and owner receipt. Final local acceptance passed all 511 backend tests and
+five Chromium journeys with zero failures/skips on Node 20.19.6 and isolated
+PostgreSQL data. Dependency audit found zero known vulnerabilities. Disposable
+database `rail_callback_consumer_1794043468768` was removed; untracked evidence is
+retained at `deliverables/portfolio-maintenance/rail_callback_consumer_1794043468768.log`.
+No new remote CI or registered Stripe webhook delivery is claimed.
+Actual Stripe account access, test-network execution and real webhook delivery
+remain unverified, so C2/C3 are not signed off as complete.
+
 ### Stripe Test Worker And Versioned Outcome Evidence
 
 Integrated the Stripe adapter with existing proof-bound execution admission and

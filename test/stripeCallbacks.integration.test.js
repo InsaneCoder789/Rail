@@ -6,7 +6,8 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import Stripe from "stripe";
 import { runMigrations } from "../dist/persistence/migrate.js";
-import { StripeCallbackInbox, loadStripeCallbackConfiguration } from "../dist/persistence/stripeCallbacks.js";
+import { StripeCallbackInbox, loadStripeCallbackConfiguration, processStripeCallbacks } from "../dist/persistence/stripeCallbacks.js";
+import { StripeTestProvider } from "../dist/rail/stripeProvider.js";
 import { handleStripeRoutes } from "../dist/server/routes/stripeRoutes.js";
 import { PostgresRateLimiter } from "../dist/persistence/postgresRateLimiter.js";
 
@@ -91,6 +92,21 @@ test("Stripe callback insert failure rolls back admission and the signed event c
     await pool.query("DROP TRIGGER fail_callback ON rail_stripe_callback_inbox");
     assert.equal((await inbox.accept(raw, signature(raw))).duplicate, false);
   });
+});
+
+test("unrelated authenticated Stripe objects are consumed without creating operations and free pending capacity", options, async () => {
+  await fixture(async ({ pool, inbox }) => {
+    const raw = body(); await inbox.accept(raw, signature(raw));
+    const provider = new StripeTestProvider({ secretKey: `sk_test_${"a".repeat(32)}`, accountId: "acct_fixture",
+      instruments: [{ ownerWalletId: "owner_fixture", paymentMethodId: "pm_fixture", customerId: "cus_fixture" }] }, {
+      accounts: { retrieve: async () => ({ id: "acct_fixture" }) },
+      paymentIntents: { retrieve: async () => ({ id: "pi_fixture", object: "payment_intent", livemode: false, metadata: {} }) }
+    });
+    assert.equal((await processStripeCallbacks(pool, provider)).ignored, 1);
+    assert.equal((await pool.query("SELECT processing_result FROM rail_stripe_callback_inbox")).rows[0].processing_result, "unrelated");
+    const next = body("evt_next"); assert.equal((await inbox.accept(next, signature(next))).duplicate, false);
+    assert.equal((await inbox.accept(raw, signature(raw))).duplicate, true);
+  }, 1);
 });
 
 test("Stripe HTTP callback route verifies raw bytes, requires JSON and never substitutes owner or agent credentials", options, async () => {

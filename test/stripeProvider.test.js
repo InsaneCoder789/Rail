@@ -179,6 +179,18 @@ test("Stripe lookup with a known reference retrieves current state without mutat
   assert.deepEqual(calls.map(call => call[0]), ["account", "retrieve"]);
 });
 
+test("Stripe callback correlation returns a private API snapshot validator, not raw secrets or mutation authority", async () => {
+  const { provider, payment, state, calls } = fixture(); state.intent.client_secret = "never_return_this";
+  const snapshot = await provider.callbackSnapshot("pi_fixture");
+  assert.deepEqual(Object.keys(snapshot).sort(), ["operationId", "fingerprint", "observe"].sort());
+  assert.ok(!JSON.stringify(snapshot).includes("never_return_this"));
+  assert.equal(snapshot.observe(payment).status, "succeeded");
+  state.intent.metadata = {}; assert.equal(await provider.callbackSnapshot("pi_fixture"), null);
+  state.intent.livemode = true;
+  await assert.rejects(provider.callbackSnapshot("pi_fixture"), { message: "STRIPE_CALLBACK_LOOKUP_UNAVAILABLE" });
+  assert.equal(calls.filter(call => call[0] === "create").length, 0);
+});
+
 test("Stripe lost-reference lookup correlates one exact operation; absence remains unresolved", async () => {
   const { provider, payment, state, calls } = fixture();
   assert.equal((await provider.lookup({ ...payment, status: "unknown" })).status, "succeeded");

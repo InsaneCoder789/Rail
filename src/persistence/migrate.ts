@@ -1737,13 +1737,31 @@ CREATE TABLE IF NOT EXISTS rail_stripe_callback_inbox (
   PRIMARY KEY(stripe_account_id,event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_stripe_callback_pending ON rail_stripe_callback_inbox(stripe_account_id,received_at,event_id) WHERE processed_at IS NULL;
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS operation_id UUID REFERENCES rail_provider_payments(operation_id);
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS request_fingerprint TEXT;
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS processing_result TEXT CHECK(processing_result IN ('matched','unrelated'));
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS lease_id UUID;
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0 CHECK(delivery_attempts>=0);
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp();
+ALTER TABLE rail_stripe_callback_inbox ADD COLUMN IF NOT EXISTS last_error TEXT;
+CREATE INDEX IF NOT EXISTS idx_stripe_callback_lookup ON rail_stripe_callback_inbox(stripe_account_id,operation_id,request_fingerprint,payment_intent_id)
+  WHERE processing_result='matched' AND processed_at IS NOT NULL;
 CREATE OR REPLACE FUNCTION rail_protect_stripe_callback() RETURNS TRIGGER
 LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'stripe_callback_is_durable' USING ERRCODE='23514'; END IF;
   IF ROW(NEW.stripe_account_id,NEW.event_id,NEW.payment_intent_id,NEW.body_hash,NEW.received_at)
     IS DISTINCT FROM ROW(OLD.stripe_account_id,OLD.event_id,OLD.payment_intent_id,OLD.body_hash,OLD.received_at)
-    OR (OLD.processed_at IS NOT NULL AND NEW.processed_at IS DISTINCT FROM OLD.processed_at) THEN
+    OR (OLD.processed_at IS NOT NULL AND ROW(NEW.processed_at,NEW.operation_id,NEW.request_fingerprint,NEW.processing_result)
+      IS DISTINCT FROM ROW(OLD.processed_at,OLD.operation_id,OLD.request_fingerprint,OLD.processing_result)) THEN
     RAISE EXCEPTION 'stripe_callback_binding_is_immutable' USING ERRCODE='23514';
+  END IF;
+  IF (NEW.lease_id IS NULL)<>(NEW.lease_expires_at IS NULL)
+    OR (NEW.processed_at IS NOT NULL AND NEW.lease_id IS NOT NULL)
+    OR (NEW.processed_at IS DISTINCT FROM OLD.processed_at AND NOT COALESCE((
+      (NEW.processing_result='matched' AND NEW.operation_id IS NOT NULL AND NEW.request_fingerprint ~ '^[a-f0-9]{64}$')
+      OR (NEW.processing_result='unrelated' AND NEW.operation_id IS NULL AND NEW.request_fingerprint IS NULL)),FALSE)) THEN
+    RAISE EXCEPTION 'stripe_callback_state_invalid' USING ERRCODE='23514';
   END IF;
   RETURN NEW;
 END $$;

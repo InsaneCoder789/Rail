@@ -17,6 +17,8 @@ import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
 import { AgentEvidenceStore } from "../dist/persistence/agentEvidence.js";
 import { loadTransactionKeyRing } from "../dist/crypto/transactionProtection.js";
 import { StripeTestProvider } from "../dist/rail/stripeProvider.js";
+import Stripe from "stripe";
+import { processStripeCallbacks } from "../dist/persistence/stripeCallbacks.js";
 
 dotenv.config();
 const agentKeys = new Map();
@@ -102,7 +104,8 @@ async function browserFixture(work, options = {}) {
       RAIL_RISK_MODEL_PATH: undefined, RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: undefined,
       RAIL_PKCS11_MODULE_PATH: undefined, RAIL_KMS_KEY_ID: undefined, RAIL_DEMO_MODE: options.console ? "true" : undefined,
       RAIL_PROVIDER_SIMULATOR: options.provider && options.provider !== "stripe" ? "true" : undefined,
-      RAIL_STRIPE_TEST_PAYMENTS: options.provider === "stripe" ? "true" : "false", RAIL_STRIPE_TEST_WEBHOOKS: "false",
+      RAIL_STRIPE_TEST_PAYMENTS: options.provider === "stripe" ? "true" : "false", RAIL_STRIPE_TEST_WEBHOOKS: options.provider === "stripe" ? "true" : "false",
+      RAIL_STRIPE_WEBHOOK_SECRET: options.provider === "stripe" ? `whsec_${"c".repeat(32)}` : undefined,
       RAIL_STRIPE_SECRET_KEY: options.provider === "stripe" ? `sk_test_${"a".repeat(32)}` : undefined,
       RAIL_STRIPE_ACCOUNT_ID: options.provider === "stripe" ? "acct_browser" : undefined,
       RAIL_STRIPE_INSTRUMENTS: options.provider === "stripe" ? JSON.stringify([{ ownerWalletId: "browser_owner", paymentMethodId: "pm_browser", customerId: "cus_browser" }]) : undefined,
@@ -381,7 +384,8 @@ test(`Chromium ${providerName} console: exact approval, lost reply, journal hist
             if (loseReply) throw new Error("mock_stripe_lost_reply");
             return intent;
           },
-          list: async () => ({ data: (await context.pool.query("SELECT intent FROM stripe_browser_effects")).rows.map(row => row.intent), has_more: false })
+          list: async () => { throw new Error("mock_customer_list_unavailable"); },
+          retrieve: async () => (await context.pool.query("SELECT intent FROM stripe_browser_effects")).rows[0].intent
         } });
     assert.equal((await drain(adapter(true))).pending, 1);
     await load("unknown");
@@ -391,7 +395,18 @@ test(`Chromium ${providerName} console: exact approval, lost reply, journal hist
     await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes("submission_uncertain") && !document.getElementById("load-provider").disabled);
     assert.deepEqual((await context.pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows[0],
       { reserved_budget_minor: "100", spent_budget_minor: "0" });
-    await context.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
+    if (providerName === "stripe") {
+      const raw = JSON.stringify({ id: "evt_browser", type: "payment_intent.payment_failed", livemode: false,
+        data: { object: { id: "pi_browser", object: "payment_intent", status: "failed", amount: 1 } } });
+      const signature = Stripe.webhooks.generateTestHeaderString({ payload: raw, secret: process.env.RAIL_STRIPE_WEBHOOK_SECRET });
+      const response = await page.evaluate(async ({ raw, signature }) => {
+        const result = await fetch('/v2/providers/stripe/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Stripe-Signature': signature }, body: raw });
+        return { status: result.status, data: await result.json() };
+      }, { raw, signature });
+      assert.equal(response.status, 200); assert.equal(response.data.received, true);
+      assert.equal((await processStripeCallbacks(context.pool, adapter(false))).processed, 1);
+      assert.equal((await context.pool.query("SELECT spent_budget_minor FROM rail_shared_budgets")).rows[0].spent_budget_minor, "0");
+    } else await context.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
     assert.equal((await drain(adapter(false))).resolved, 1);
     await load("succeeded");
     assert.ok((await page.locator("#spent").textContent()).includes("1.00"));

@@ -3,24 +3,9 @@ import type { Pool, PoolClient } from "pg";
 import type { ProviderObservation, ProviderPayment } from "../domain/providerPayment.js";
 import { ProviderTargetRegistry } from "../domain/providerTargets.js";
 import { advanceProviderPaymentInTransaction, readProviderPaymentInTransaction, requireProviderSubmission } from "./providerPayments.js";
-import { withTransactionSavepoint } from "./transaction.js";
+import { withTransactionSavepoint, withPoolTransaction as transaction } from "./transaction.js";
 import { RequestError } from "../server/http.js";
 import type { AgentEvidenceStore } from "./agentEvidence.js";
-
-async function transaction<T>(pool: Pool, work: (client: PoolClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect();
-  let discard = false;
-  const onError = () => { discard = true; };
-  client.on("error", onError);
-  try {
-    await client.query("BEGIN");
-    await client.query("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='10s'");
-    const result = await work(client); await client.query("COMMIT"); return result;
-  } catch (error) {
-    try { await client.query("ROLLBACK"); } catch { discard = true; }
-    throw error;
-  } finally { client.release(discard); client.removeListener("error", onError); }
-}
 
 /** Only called after fresh execution-scope DPoP admission in the caller's transaction. */
 export async function enqueueProviderPayment(client: PoolClient, input: {
@@ -158,11 +143,20 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
       });
       if (!prepared) { stats.lostLease++; continue; }
       if (prepared.done) { stats.resolved++; continue; }
+      let lookupPayment = prepared.payment;
+      if (!prepared.submit && adapter.provider === "stripe" && lookupPayment.providerRef === null) {
+        const hints = await pool.query(`SELECT DISTINCT payment_intent_id FROM rail_stripe_callback_inbox
+          WHERE stripe_account_id=$1 AND operation_id=$2 AND request_fingerprint=$3
+            AND processing_result='matched' AND processed_at IS NOT NULL LIMIT 2`,
+        [lookupPayment.binding.providerAccountRef, identity.operationId, identity.fingerprint]);
+        if (hints.rows.length > 1) throw new Error("STRIPE_CALLBACK_CORRELATION_CONFLICT");
+        if (hints.rows[0]) lookupPayment = { ...lookupPayment, providerRef: String(hints.rows[0].payment_intent_id) };
+      }
       // No financial transaction is held during provider I/O.
       let timer: ReturnType<typeof setTimeout> | undefined;
       let observed: ProviderObservation | null = null;
       try {
-        observed = await Promise.race([prepared.submit ? adapter.submit(prepared.payment) : adapter.lookup(prepared.payment),
+        observed = await Promise.race([prepared.submit ? adapter.submit(prepared.payment) : adapter.lookup(lookupPayment),
           new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("PROVIDER_TIMEOUT")), policy.timeoutMs); })]);
       } catch { /* No response is not proof of failure. */ }
       finally { if (timer) clearTimeout(timer); }
@@ -180,11 +174,14 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
         return done;
       });
       if (finished === null) stats.lostLease++; else if (finished) stats.resolved++; else stats.pending++;
-    } catch {
+    } catch (error) {
       // Includes database failures: retain work and liability for later inspection/recovery.
+      const reason = error instanceof Error && ["CONFLICTING_PROVIDER_OUTCOME", "STRIPE_CALLBACK_CORRELATION_CONFLICT",
+        "PROVIDER_OBSERVATION_MISMATCH", "STRIPE_OBSERVATION_PROVENANCE_REQUIRED", "provider_outcome_verification_failed"].includes(error.message)
+        ? error.message.toLowerCase() : "provider_worker_retry";
       const result = await pool.query(`UPDATE outbox SET delivery_status='pending',lease_id=NULL,lease_expires_at=NULL,
-        next_attempt_at=clock_timestamp()+$3*interval '1 millisecond',last_delivery_error='provider_worker_retry'
-        WHERE id=$1 AND lease_id=$2 AND lease_expires_at>clock_timestamp()`, [job.id, lease, policy.retryDelayMs]);
+        next_attempt_at=clock_timestamp()+$3*interval '1 millisecond',last_delivery_error=$4
+        WHERE id=$1 AND lease_id=$2 AND lease_expires_at>clock_timestamp()`, [job.id, lease, policy.retryDelayMs, reason]);
       if (result.rowCount) stats.pending++; else stats.lostLease++;
     }
   }
