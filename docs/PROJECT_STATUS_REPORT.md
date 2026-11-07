@@ -38,6 +38,32 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Stripe Test Adapter Boundary
+
+Stripe is now owner-selected. Added `src/rail/stripeProvider.ts` and the pinned
+official SDK, with a bounded single-test-merchant/saved-card model. Test keys only,
+account and customer/method checks, exact amount/currency/metadata verification,
+stable idempotency, sanitized errors and read-only uncertain-outcome lookup are
+implemented. Recoverable Stripe states never masquerade as terminal failure.
+The webhook helper verifies raw-byte signatures and returns retrieval candidates,
+not financial outcomes. It rejects live/Connect-context events and stale/future
+signatures. Fifteen isolated contract tests and the TypeScript build passed,
+including real SDK serialization against an in-process fake HTTP transport and
+confirmed unpaid cancellation after a recoverable method failure.
+
+No Stripe credentials were requested or used, no Stripe account was opened and no
+external payment request was sent. Public execution, the existing worker and the
+owner console are still simulator-only. Durable callback ingestion, Stripe worker
+wiring and protected external outcome provenance are not implemented by this
+boundary increment. Actual sandbox account access/acceptance remain required.
+Final local regression acceptance passed all 489 backend tests and four Chromium
+journeys with zero failures/skips, using Node 20.19.6 and an isolated PostgreSQL
+database. Dependency audit found zero known vulnerabilities. Database
+`rail_stripe_boundary_1794041066044` was removed; the untracked log is retained at
+`deliverables/portfolio-maintenance/rail_stripe_boundary_1794041066044.log`.
+No new CI result or real Stripe acceptance is claimed. The previously published
+owner-history commit `25170cd` has passed GitHub Actions run `41244799003`.
+
 ### Owner Payment History And Simulator Walkthrough, 1 November 2026
 
 Added owner/agent-scoped keyset pagination over the existing append-only provider

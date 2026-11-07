@@ -11,9 +11,10 @@ internal wallet balances for external payments. Latest local acceptance passed
 458 backend tests and three Chromium journeys, zero failures/skips; dependency
 audit reported zero known vulnerabilities. The disposable local PostgreSQL database
 was removed after verification. Trusted target configuration and
-proof-bound proposal admission are now implemented as described below. Provider/account selection,
-real provider execution admission, the real adapter and
-actual sandbox acceptance remain open.
+proof-bound proposal admission are now implemented as described below. Stripe is
+now owner-selected. Its test adapter boundary is implemented as described below;
+account access, runtime execution/callback wiring and actual sandbox acceptance
+remain open.
 
 The 1 November owner-history increment adds the console walkthrough described in
 [Owner Console](OWNER_CONSOLE.md#local-provider-walkthrough). Earlier test counts in
@@ -406,3 +407,62 @@ multi-request snapshot. They exclude funding aliases, proof tokens and key mater
 `assurance` is `server_journal_history`, not a protected receipt or authenticated
 external settlement assertion. Use the receipt endpoint for final protected evidence.
 Unapproved proposals have no admitted payment journal and therefore no history yet.
+
+## Selected Stripe Test Adapter Boundary
+
+The owner selected Stripe. `src/rail/stripeProvider.ts` adds an isolated test-mode
+adapter using pinned `stripe@23.1.0` and API version `2026-10-28.endive`. It is not
+yet wired to the public execute route, worker or callback endpoint. The existing
+runtime remains simulator-only; adding this dependency does not enable Stripe
+charges. There is still no sandbox account or real Stripe acceptance evidence.
+
+The supported model is one configured Stripe test merchant charging a configured
+customer's previously saved test card. It is not arbitrary merchant purchasing,
+Connect routing, payouts, bank transfers or production support. Operators must
+provision appropriately consented saved methods through Stripe's supported setup
+flow; Rail does not collect, store or transmit PAN/CVC. PaymentIntents are used for
+this off-session model, not as a replacement for a general hosted checkout.
+[Stripe PaymentIntent creation](https://docs.stripe.com/api/payment_intents/create)
+
+The constructor accepts a test secret key, expected account ID and at most 100
+unique payment-method/customer/owner mappings. Live keys are rejected. Before a
+submission it retrieves the authenticated account and verifies the saved method's
+test mode, card type and attached customer. Both the frozen provider account and
+merchant references must equal this account; Connect fees/destination routing are
+not supported. The request uses the original operation key and frozen amount,
+currency, method/customer and operation/fingerprint metadata. SDK network retries
+are disabled and each request has a five-second timeout. Worker integration must
+budget for multiple requests and possible late responses; it is not implemented here.
+
+Normalization checks exact mode, account context, customer, instrument, metadata,
+amount, currency, capture/confirmation settings and absence of third-party routing.
+Success requires the full amount received; cancellation with any received amount
+cannot release allowance. `requires_action`, `requires_payment_method` and
+`requires_confirmation` remain `requires_owner_action`, never final failure.
+Network/SDK errors are sanitized and treated as unresolved, not instructions to
+create another payment. Stripe documents that network/server errors can leave an
+operation indeterminate. [Stripe error handling](https://docs.stripe.com/error-low-level)
+
+Recovery only reads: retrieve an already known PaymentIntent, or inspect at most
+100 recent intents for the configured customer and exact operation metadata when
+the response lost the ID. A missing result is unresolved, not proof of failure.
+Pagination, conflicting matches or mismatched fields fail closed. This bounded
+fallback can require operator investigation for high-volume customers or clock
+skew beyond its five-minute allowance; it is not an exhaustive account search.
+Retain original account/instrument mappings for unresolved historic operations.
+
+`verifyWebhook` uses the SDK's exact-byte signature verification, enforces bounded
+raw bodies and a five-minute past/future timestamp window, rejects live/Connect
+events, and returns only an event ID, PaymentIntent ID and body hash. It does not
+advance financial state or trust a snapshot status. The eventual HTTP handler must
+durably deduplicate events, correlate the immutable operation and retrieve current
+state before resolving anything. It currently accepts the documented snapshot
+PaymentIntent event family; thin event handling is not claimed.
+[Stripe webhook guidance](https://docs.stripe.com/webhooks)
+
+Fifteen isolated boundary tests cover exact parameters, account/instrument/mode
+substitution, outcome states, ambiguity, transport failure and webhook tampering.
+One uses the real SDK's HTTP serialization against an in-process fake transport;
+webhook tests use synthetic signatures. These are local contract tests, not Stripe
+network, sandbox or deployed callback acceptance. Durable callback ingestion,
+worker integration and protected Stripe-specific outcome provenance remain required.
