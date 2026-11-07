@@ -177,10 +177,15 @@ export class AgentAuthorityStore {
     private readonly ownerControl?: { readonly required: boolean; readonly store?: OwnerPasskeyStore },
     private readonly proofControl?: { readonly required: boolean; readonly ready: boolean },
     private readonly providerTargets = new ProviderTargetRegistry(),
-    private readonly simulatorExecutionEnabled = false) {}
+    private readonly providerExecution: boolean | { readonly simulator: boolean; readonly stripe: boolean } = false) {}
+
+  private get executionProviders(): readonly string[] {
+    const flags = typeof this.providerExecution === "boolean" ? { simulator: this.providerExecution, stripe: false } : this.providerExecution;
+    return [flags.simulator ? "simulator" : "", flags.stripe ? "stripe" : ""].filter(Boolean);
+  }
 
   async executeProviderProposal(token: unknown, operationId: string, value: unknown, admission?: AgentAdmission) {
-    if (!this.simulatorExecutionEnabled) throw new RequestError(503, "provider_execution_unavailable", "only explicitly enabled local simulator execution is supported");
+    if (!this.executionProviders.length) throw new RequestError(503, "provider_execution_unavailable", "test provider execution is not enabled");
     if (!isAgentId(operationId) || !isRecord(value) || Object.keys(value).length !== 1 ||
         typeof value.requestFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.requestFingerprint)) invalid();
     const fingerprint = value.requestFingerprint, proofValue = structuredClone(value);
@@ -190,7 +195,7 @@ export class AgentAuthorityStore {
       if (!admission || !this.authorityEvidence || !this.ownerControl?.required || !this.executionEnabled)
         throw new RequestError(503, "provider_execution_unavailable", "protected execution authority required");
       return enqueueProviderPayment(client, { operationId, agentId: agent.agent_id, ownerWalletId: agent.owner_wallet_id,
-        fingerprint, credentialId: agent.credentialId, proofId: admission.proofId, keyThumbprint: admission.keyThumbprint }, this.providerTargets);
+        fingerprint, credentialId: agent.credentialId, proofId: admission.proofId, keyThumbprint: admission.keyThumbprint }, this.providerTargets, this.executionProviders);
     });
   }
 

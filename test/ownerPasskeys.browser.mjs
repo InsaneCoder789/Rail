@@ -16,6 +16,7 @@ import { dispatchProviderBatch, LocalPaymentSimulator } from "../dist/persistenc
 import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
 import { AgentEvidenceStore } from "../dist/persistence/agentEvidence.js";
 import { loadTransactionKeyRing } from "../dist/crypto/transactionProtection.js";
+import { StripeTestProvider } from "../dist/rail/stripeProvider.js";
 
 dotenv.config();
 const agentKeys = new Map();
@@ -100,10 +101,15 @@ async function browserFixture(work, options = {}) {
       RAIL_WEBAUTHN_RP_ID: "localhost", RAIL_WEBAUTHN_ORIGIN: origin, RAIL_AGENT_API_ORIGIN: origin, RAIL_MERCHANT_QUOTE_KEYS: undefined,
       RAIL_RISK_MODEL_PATH: undefined, RAIL_BEHAVIOUR_MODEL_PATH: undefined, RAIL_ANOMALY_MODEL_PATH: undefined,
       RAIL_PKCS11_MODULE_PATH: undefined, RAIL_KMS_KEY_ID: undefined, RAIL_DEMO_MODE: options.console ? "true" : undefined,
-      RAIL_PROVIDER_SIMULATOR: options.provider ? "true" : undefined,
+      RAIL_PROVIDER_SIMULATOR: options.provider && options.provider !== "stripe" ? "true" : undefined,
+      RAIL_STRIPE_TEST_PAYMENTS: options.provider === "stripe" ? "true" : "false", RAIL_STRIPE_TEST_WEBHOOKS: "false",
+      RAIL_STRIPE_SECRET_KEY: options.provider === "stripe" ? `sk_test_${"a".repeat(32)}` : undefined,
+      RAIL_STRIPE_ACCOUNT_ID: options.provider === "stripe" ? "acct_browser" : undefined,
+      RAIL_STRIPE_INSTRUMENTS: options.provider === "stripe" ? JSON.stringify([{ ownerWalletId: "browser_owner", paymentMethodId: "pm_browser", customerId: "cus_browser" }]) : undefined,
       RAIL_PROVIDER_TARGETS: options.provider ? JSON.stringify([{ version: 1, targetId: "browser_provider", revision: 1,
-        ownerWalletId: "browser_owner", provider: "simulator", providerAccountRef: "browser_account", instrumentRef: "browser_instrument",
-        merchantWalletId: "browser_receiver", merchantRef: "browser_merchant", currency: "INR", status: "active" }]) : undefined };
+        ownerWalletId: "browser_owner", provider: options.provider === "stripe" ? "stripe" : "simulator",
+        providerAccountRef: options.provider === "stripe" ? "acct_browser" : "browser_account", instrumentRef: options.provider === "stripe" ? "pm_browser" : "browser_instrument",
+        merchantWalletId: "browser_receiver", merchantRef: options.provider === "stripe" ? "acct_browser" : "browser_merchant", currency: "INR", status: "active" }]) : undefined };
     for (const [key, value] of Object.entries(environment)) { oldEnvironment.set(key, process.env[key]); if (value === undefined) delete process.env[key]; else process.env[key] = value; }
     context = await createServerContext({ initializeDatabase: true, startBackgroundJobs: false });
     const password = `browser_fixture_${randomUUID()}`, newPassword = `browser_recovered_${randomUUID()}`;
@@ -317,7 +323,8 @@ test("Chromium owner console: actual sign-in, passkeys, exact approval, budget c
   }, { console: true });
 });
 
-test("Chromium provider console: exact approval, lost reply, journal history, recovery and protected simulator receipt", { timeout: 60000 }, async () => {
+for (const providerName of ["simulator", "stripe"]) {
+test(`Chromium ${providerName} console: exact approval, lost reply, journal history, recovery and protected receipt`, { timeout: 60000 }, async () => {
   await browserFixture(async ({ context, page, addAuthenticator, password }) => {
     await addAuthenticator();
     const errors = []; page.on("pageerror", error => errors.push(error.message));
@@ -349,7 +356,7 @@ test("Chromium provider console: exact approval, lost reply, journal history, re
     };
     await load("awaiting_owner_approval");
     assert.equal(await page.locator("#provider-fingerprint").textContent(), proposal.requestFingerprint);
-    assert.ok((await page.locator("#provider-detail").textContent()).includes("Instrument alias: browser_instrument"));
+    assert.ok((await page.locator("#provider-detail").textContent()).includes(`Instrument alias: ${providerName === "stripe" ? "pm_browser" : "browser_instrument"}`));
     await page.locator("#provider-approve").click();
     await page.waitForFunction(() => document.getElementById("provider-detail").textContent.includes("Status: reserved") && !document.getElementById("load-provider").disabled);
     assert.equal((await context.pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "0");
@@ -358,7 +365,25 @@ test("Chromium provider console: exact approval, lost reply, journal history, re
     const targets = new ProviderTargetRegistry(process.env.RAIL_PROVIDER_TARGETS);
     const evidence = new AgentEvidenceStore(loadTransactionKeyRing(process.env.RAIL_AGENT_AUTHORITY_KEY_RING));
     const drain = simulator => dispatchProviderBatch(context.pool, targets, simulator, { batchSize: 1, evidence });
-    assert.equal((await drain(new LocalPaymentSimulator(context.pool, "lose_reply"))).pending, 1);
+    if (providerName === "stripe") await context.pool.query("CREATE TABLE stripe_browser_effects(intent JSONB NOT NULL)");
+    const adapter = loseReply => providerName === "simulator" ? new LocalPaymentSimulator(context.pool, loseReply ? "lose_reply" : "none")
+      : new StripeTestProvider({ secretKey: process.env.RAIL_STRIPE_SECRET_KEY, accountId: "acct_browser",
+        instruments: [{ ownerWalletId: "browser_owner", paymentMethodId: "pm_browser", customerId: "cus_browser" }] }, {
+        accounts: { retrieve: async () => ({ id: "acct_browser" }) },
+        paymentMethods: { retrieve: async () => ({ id: "pm_browser", livemode: false, type: "card", customer: "cus_browser" }) },
+        paymentIntents: {
+          create: async params => {
+            const intent = { id: "pi_browser", object: "payment_intent", livemode: false, amount: params.amount, amount_received: params.amount,
+              amount_capturable: 0, currency: params.currency, customer: params.customer, payment_method: params.payment_method,
+              payment_method_types: ["card"], capture_method: "automatic", confirmation_method: "automatic", on_behalf_of: null,
+              transfer_data: null, application_fee_amount: null, metadata: params.metadata, status: "succeeded" };
+            await context.pool.query("INSERT INTO stripe_browser_effects VALUES($1::jsonb)", [JSON.stringify(intent)]);
+            if (loseReply) throw new Error("mock_stripe_lost_reply");
+            return intent;
+          },
+          list: async () => ({ data: (await context.pool.query("SELECT intent FROM stripe_browser_effects")).rows.map(row => row.intent), has_more: false })
+        } });
+    assert.equal((await drain(adapter(true))).pending, 1);
     await load("unknown");
     await page.locator("#provider-verify").click();
     await page.waitForFunction(() => document.getElementById("provider-receipt").textContent.includes('"status": "not_final"') && !document.getElementById("load-provider").disabled);
@@ -367,7 +392,7 @@ test("Chromium provider console: exact approval, lost reply, journal history, re
     assert.deepEqual((await context.pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows[0],
       { reserved_budget_minor: "100", spent_budget_minor: "0" });
     await context.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
-    assert.equal((await drain(new LocalPaymentSimulator(context.pool))).resolved, 1);
+    assert.equal((await drain(adapter(false))).resolved, 1);
     await load("succeeded");
     assert.ok((await page.locator("#spent").textContent()).includes("1.00"));
     assert.ok((await page.locator("#reserved").textContent()).includes("0.00"));
@@ -375,24 +400,25 @@ test("Chromium provider console: exact approval, lost reply, journal history, re
     await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes("succeeded") && !document.getElementById("load-provider").disabled);
     await page.locator("#provider-verify").click();
     await page.waitForFunction(() => document.getElementById("provider-receipt").textContent.includes('"status": "verified"') && !document.getElementById("load-provider").disabled);
-    assert.ok((await page.locator("#provider-receipt").textContent()).includes("local_simulator_outcome"));
-    assert.equal((await context.pool.query("SELECT count(*) FROM rail_simulator_effects")).rows[0].count, "1");
+    assert.ok((await page.locator("#provider-receipt").textContent()).includes(providerName === "stripe" ? "server_observed_stripe_test_api" : "local_simulator_outcome"));
+    assert.equal((await context.pool.query(`SELECT count(*) FROM ${providerName === "stripe" ? "stripe_browser_effects" : "rail_simulator_effects"}`)).rows[0].count, "1");
     assert.equal((await context.pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
     assert.deepEqual((await context.pool.query("SELECT balance FROM wallets WHERE wallet_id='browser_owner'")).rows[0], { balance: "1000" });
     assert.deepEqual((await context.pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows[0],
       { reserved_budget_minor: "0", spent_budget_minor: "100" });
     await mkdir("deliverables/rail-owner-console", { recursive: true });
     await page.setViewportSize({ width: 1440, height: 1080 });
-    await page.screenshot({ path: "deliverables/rail-owner-console/provider-desktop.png", fullPage: true });
+    await page.screenshot({ path: `deliverables/rail-owner-console/provider-${providerName}-desktop.png`, fullPage: true });
     for (const width of [320, 390, 768]) {
       await page.setViewportSize({ width, height: 844 });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, `Provider console overflows at ${width}px`);
     }
-    await page.screenshot({ path: "deliverables/rail-owner-console/provider-mobile.png", fullPage: true });
+    await page.screenshot({ path: `deliverables/rail-owner-console/provider-${providerName}-mobile.png`, fullPage: true });
     await page.locator("#clear-session").click();
     for (const id of ["provider-receipt", "provider-timeline", "provider-detail", "provider-fingerprint", "provider-rows"])
       assert.equal(await page.locator(`#${id}`).textContent(), "");
     assert.equal(await page.evaluate(() => localStorage.length + sessionStorage.length), 0);
     assert.deepEqual(errors, []);
-  }, { console: true, provider: true });
+  }, { console: true, provider: providerName });
 });
+}

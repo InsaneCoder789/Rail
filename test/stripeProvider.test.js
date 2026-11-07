@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import Stripe from "stripe";
-import { StripeTestProvider } from "../dist/rail/stripeProvider.js";
-import { createProviderPayment, advanceProviderPayment } from "../dist/domain/providerPayment.js";
+import { StripeTestProvider, loadStripeTestConfiguration } from "../dist/rail/stripeProvider.js";
+import { createProviderPayment, advanceProviderPayment, providerPaymentConsentFingerprint } from "../dist/domain/providerPayment.js";
+import { createProviderOutcomeReceipt } from "../dist/domain/providerReceipt.js";
 
 const secretKey = `sk_test_${"a".repeat(32)}`, webhookSecret = `whsec_${"b".repeat(32)}`;
 const sdk = new Stripe(secretKey);
@@ -40,6 +41,39 @@ test("Stripe configuration rejects live keys, ambiguous instrument ownership and
     assert.throws(() => new StripeTestProvider({ ...config, ...changes }, client), { message: "INVALID_STRIPE_TEST_CONFIGURATION" });
 });
 
+test("Stripe execution configuration is independently opt-in and production fails closed", () => {
+  const { config } = fixture();
+  assert.equal(loadStripeTestConfiguration({}), undefined);
+  const env = { RAIL_STRIPE_TEST_PAYMENTS: "true", NODE_ENV: "test", RAIL_DEMO_MODE: "true", RAIL_STRIPE_SECRET_KEY: secretKey,
+    RAIL_STRIPE_ACCOUNT_ID: config.accountId, RAIL_STRIPE_INSTRUMENTS: JSON.stringify(config.instruments) };
+  assert.deepEqual(loadStripeTestConfiguration(env), config);
+  for (const changed of [{ NODE_ENV: "production" }, { RAIL_DEMO_MODE: "false" }, { RAIL_STRIPE_SECRET_KEY: "sk_live_not_allowed" },
+    { RAIL_STRIPE_INSTRUMENTS: "malformed" }, { RAIL_STRIPE_TEST_PAYMENTS: "yes" }])
+    assert.throws(() => loadStripeTestConfiguration({ ...env, ...changed }), { message: "INVALID_STRIPE_TEST_EXECUTION_CONFIGURATION" });
+});
+
+test("Stripe test terms reject unsupported currency exponents and oversized amounts before I/O", async () => {
+  const { payment, provider, calls } = fixture();
+  for (const changed of [{ currency: "JPY" }, { amountMinor: 100000000 }]) {
+    const initial = createProviderPayment({ ...payment.binding, ...changed }, Date.now());
+    const submitting = advanceProviderPayment(initial, { type: "begin_submission", idempotencyWindowMs: 86400000 }, Date.now());
+    await assert.rejects(provider.submit(submitting), { message: "STRIPE_PAYMENT_BINDING_MISMATCH" });
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("Stripe protected outcome contracts bind API provenance and reject changed observation hashes", () => {
+  const { payment, provider, state } = fixture(), observed = provider.normalize(payment, state.intent);
+  const final = advanceProviderPayment(payment, { type: "provider_observed", observation: observed }, Date.now());
+  const consent = { merchantWalletId: "merchant_wallet", challengeId: randomUUID(),
+    consentFingerprint: providerPaymentConsentFingerprint(payment.binding, "merchant_wallet") };
+  const receipt = createProviderOutcomeReceipt({ ...final, revision: 3, provenance: observed.provenance }, consent);
+  assert.equal(receipt.version, 2); assert.equal(receipt.assurance, "server_observed_stripe_test_api");
+  assert.throws(() => createProviderOutcomeReceipt({ ...final, revision: 3 }, consent));
+  assert.throws(() => advanceProviderPayment(payment, { type: "provider_observed", observation: { ...observed,
+    provenance: { ...observed.provenance, observationHash: "a".repeat(64) } } }, Date.now()));
+});
+
 test("Stripe submission uses frozen exact terms, saved-card ownership and one stable idempotency key", async () => {
   const { config, payment, calls, provider } = fixture();
   config.instruments[0].customerId = "cus_changed_after_construction";
@@ -50,7 +84,7 @@ test("Stripe submission uses frozen exact terms, saved-card ownership and one st
   assert.deepEqual(calls[2], ["create", { amount: 500, currency: "usd", customer: "cus_fixture", payment_method: "pm_fixture",
     confirm: true, off_session: true, allowed_payment_method_types: ["card"], capture_method: "automatic", confirmation_method: "automatic",
     metadata: { rail_operation_id: payment.binding.operationId, rail_fingerprint: payment.fingerprint } }, { idempotencyKey: payment.idempotencyKey }]);
-  assert.deepEqual(Object.keys(outcome).sort(), ["operationId", "fingerprint", "provider", "providerAccountRef", "providerRef", "amountMinor", "currency", "status", "final"].sort());
+  assert.deepEqual(Object.keys(outcome).sort(), ["operationId", "fingerprint", "provider", "providerAccountRef", "providerRef", "amountMinor", "currency", "status", "final", "provenance"].sort());
 });
 
 test("Stripe submission rejects unadmitted, altered and foreign-account bindings before writes", async () => {

@@ -1,11 +1,25 @@
 import Stripe from "stripe";
 import { createHash } from "node:crypto";
-import { parseProviderPaymentBinding, providerPaymentFingerprint, type ProviderPayment, type ProviderObservation } from "../domain/providerPayment.js";
+import { parseProviderPaymentBinding, providerPaymentFingerprint, providerObservationHash, STRIPE_TEST_API_VERSION,
+  type ProviderPayment, type ProviderObservation } from "../domain/providerPayment.js";
 
 export interface StripeTestConfiguration {
   readonly secretKey: string;
   readonly accountId: string;
   readonly instruments: readonly { readonly ownerWalletId: string; readonly paymentMethodId: string; readonly customerId: string }[];
+}
+export function loadStripeTestConfiguration(env: NodeJS.ProcessEnv = process.env): StripeTestConfiguration | undefined {
+  const flag = env.RAIL_STRIPE_TEST_PAYMENTS;
+  if (flag === undefined || flag === "false") return undefined;
+  try {
+    if (flag !== "true" || env.NODE_ENV === "production" || env.RAIL_DEMO_MODE !== "true" ||
+        !env.RAIL_STRIPE_INSTRUMENTS || Buffer.byteLength(env.RAIL_STRIPE_INSTRUMENTS) > 65536) throw new Error();
+    const config = { secretKey: env.RAIL_STRIPE_SECRET_KEY ?? "", accountId: env.RAIL_STRIPE_ACCOUNT_ID ?? "",
+      instruments: JSON.parse(env.RAIL_STRIPE_INSTRUMENTS) };
+    new StripeTestProvider(config);
+    return Object.freeze({ ...config, instruments: Object.freeze(config.instruments.map((value: StripeTestConfiguration["instruments"][number]) => Object.freeze({
+      ownerWalletId: value.ownerWalletId, paymentMethodId: value.paymentMethodId, customerId: value.customerId }))) });
+  } catch { throw new Error("INVALID_STRIPE_TEST_EXECUTION_CONFIGURATION"); }
 }
 type Client = Pick<Stripe, "accounts" | "paymentMethods" | "paymentIntents">;
 const id = (value: unknown, prefix: string): value is string => typeof value === "string" && new RegExp(`^${prefix}_[A-Za-z0-9]{3,120}$`).test(value);
@@ -14,6 +28,7 @@ const failure = (message: string): never => { throw new Error(message); };
 
 /** One test merchant, configured saved cards only. No Connect, payouts, raw card data or live keys. */
 export class StripeTestProvider {
+  readonly provider = "stripe" as const;
   private readonly client: Client;
   private readonly accountId: string;
   private readonly instruments = new Map<string, { readonly ownerWalletId: string; readonly customerId: string }>();
@@ -29,14 +44,14 @@ export class StripeTestProvider {
         failure("INVALID_STRIPE_TEST_CONFIGURATION");
       this.instruments.set(instrument.paymentMethodId, Object.freeze({ ownerWalletId: instrument.ownerWalletId, customerId: instrument.customerId }));
     }
-    this.client = client ?? new Stripe(config.secretKey, { apiVersion: "2026-10-28.endive", timeout: 5000, maxNetworkRetries: 0, telemetry: false });
+    this.client = client ?? new Stripe(config.secretKey, { apiVersion: STRIPE_TEST_API_VERSION, timeout: 5000, maxNetworkRetries: 0, telemetry: false });
   }
 
   private binding(payment: ProviderPayment) {
     const binding = parseProviderPaymentBinding(payment.binding), instrument = this.instruments.get(binding.instrumentRef);
     if (binding.provider !== "stripe" || binding.providerAccountRef !== this.accountId || binding.merchantRef !== this.accountId ||
         !instrument || instrument.ownerWalletId !== binding.ownerWalletId || payment.fingerprint !== providerPaymentFingerprint(binding) ||
-        payment.idempotencyKey !== `rail_provider_v1_${binding.operationId}` || binding.amountMinor > 99999999)
+        payment.idempotencyKey !== `rail_provider_v1_${binding.operationId}` || binding.amountMinor > 99999999 || !["USD", "INR"].includes(binding.currency))
       failure("STRIPE_PAYMENT_BINDING_MISMATCH");
     return { binding, instrument: instrument! };
   }
@@ -72,9 +87,11 @@ export class StripeTestProvider {
       case "requires_action": case "requires_payment_method": case "requires_confirmation": status = "requires_owner_action"; break;
       default: return failure("UNSUPPORTED_STRIPE_PAYMENT_STATE");
     }
-    return Object.freeze({ operationId: binding.operationId, fingerprint: payment.fingerprint, provider: "stripe",
+    const observation: ProviderObservation = { operationId: binding.operationId, fingerprint: payment.fingerprint, provider: "stripe",
       providerAccountRef: this.accountId, providerRef: intent.id, amountMinor: binding.amountMinor, currency: binding.currency,
-      status, final: status === "succeeded" || status === "cancelled" });
+      status, final: status === "succeeded" || status === "cancelled" };
+    return Object.freeze({ ...observation, provenance: Object.freeze({ kind: "stripe_test_api" as const,
+      apiVersion: STRIPE_TEST_API_VERSION, observationHash: providerObservationHash(observation) }) });
   }
 
   /** Caller must have durably committed the submission boundary after checking authority. */

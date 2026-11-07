@@ -17,6 +17,7 @@
     "audit:batch": "npm run build && node dist/persistence/runAuditBatch.js",
     "outbox:dispatch": "npm run build && node dist/persistence/runOutboxWorker.js",
     "provider:simulate": "npm run build && node dist/persistence/runProviderWorker.js",
+    "provider:stripe": "npm run build && node dist/persistence/runStripeWorker.js",
     "authorizations:sweep": "npm run build && node dist/persistence/runAuthorizationSweep.js",
     "accounting:reconcile": "npm run build && node dist/persistence/runReconciliation.js",
     "demo": "npm run build && node dist/demo/runPayment.js",

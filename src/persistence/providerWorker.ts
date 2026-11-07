@@ -26,7 +26,7 @@ async function transaction<T>(pool: Pool, work: (client: PoolClient) => Promise<
 export async function enqueueProviderPayment(client: PoolClient, input: {
   operationId: string; agentId: string; ownerWalletId: string; fingerprint: string;
   credentialId: string; proofId: string; keyThumbprint: string;
-}, targets: ProviderTargetRegistry) {
+}, targets: ProviderTargetRegistry, allowedProviders: readonly string[] = ["simulator"]) {
   return withTransactionSavepoint(client, async () => {
     const owned = await client.query(`SELECT 1 FROM rail_provider_payments WHERE operation_id=$1 AND owner_wallet_id=$2
       AND agent_id=$3 AND authorization_required`, [input.operationId, input.ownerWalletId, input.agentId]);
@@ -34,11 +34,14 @@ export async function enqueueProviderPayment(client: PoolClient, input: {
     const payment = await readProviderPaymentInTransaction(client, input.ownerWalletId, input.operationId);
     if (payment.binding.agentId !== input.agentId || payment.fingerprint !== input.fingerprint || !payment.authorizationRequired)
       throw new RequestError(409, "provider_execution_binding_mismatch", "execution does not match the approved payment");
+    if (!allowedProviders.includes(payment.binding.provider) || !["simulator", "stripe"].includes(payment.binding.provider))
+      throw new RequestError(503, "provider_target_unavailable", "provider execution is not enabled");
+    if (payment.binding.provider === "stripe" && (!["USD", "INR"].includes(payment.binding.currency) || payment.binding.amountMinor > 99999999))
+      throw new RequestError(422, "stripe_terms_unsupported", "unsupported Stripe test payment terms");
     const existing = await client.query("SELECT id FROM outbox WHERE provider_operation_id=$1", [input.operationId]);
     if (existing.rowCount) return { operationId: input.operationId, queued: true };
     if (payment.status !== "reserved") throw new RequestError(409, "provider_execution_not_reserved", "payment is not reserved for execution");
     await requireProviderSubmission(client, input.operationId, targets);
-    if (payment.binding.provider !== "simulator") throw new RequestError(503, "simulator_target_required", "only local simulator targets are supported");
     await client.query(`INSERT INTO outbox(type,payload,work_kind,provider_operation_id,provider_credential_id,provider_proof_id,provider_key_thumbprint)
       VALUES('provider.execute','{}','provider_payment',$1,$2,$3,$4)`,
     [input.operationId, input.credentialId, input.proofId, input.keyThumbprint]);
@@ -48,6 +51,7 @@ export async function enqueueProviderPayment(client: PoolClient, input: {
 
 /** Durable local test double. No SDK, network payment or real money; one row is one simulated effect. */
 export class LocalPaymentSimulator {
+  readonly provider = "simulator" as const;
   constructor(private readonly pool: Pool, private readonly fault: "none" | "lose_reply" | "no_effect" | "decline" = "none") {}
 
   async submit(payment: ProviderPayment): Promise<ProviderObservation> {
@@ -79,11 +83,17 @@ const denied = (error: unknown) => error instanceof Error && ["PROVIDER_AUTHORIT
     ["provider_target_denied", "provider_target_changed", "provider_targets_unavailable", "shared_budget_not_found", "shared_budget_inactive",
       "shared_budget_currency_denied", "fresh_shared_budget_consent_required"].includes(String(error.code)));
 
-/** A finite simulator-only batch. Unknown outcomes are lookup-only and never dead-lettered or resubmitted. */
-export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetRegistry, simulator: LocalPaymentSimulator,
+export interface PaymentProvider {
+  readonly provider: "simulator" | "stripe";
+  submit(payment: ProviderPayment): Promise<ProviderObservation>;
+  lookup(payment: ProviderPayment): Promise<ProviderObservation | null>;
+}
+/** A finite provider-isolated batch. Unknown outcomes are lookup-only, never resubmitted. */
+export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetRegistry, adapter: PaymentProvider,
   options: { batchSize?: number; leaseMs?: number; timeoutMs?: number; retryDelayMs?: number; evidence?: AgentEvidenceStore } = {}) {
   const { evidence, ...timings } = options;
   if (!evidence) throw new Error("PROVIDER_OUTCOME_EVIDENCE_REQUIRED");
+  if (!["simulator", "stripe"].includes(adapter.provider)) throw new Error("INVALID_PAYMENT_PROVIDER");
   const policy = { batchSize: 10, leaseMs: 30000, timeoutMs: 5000, retryDelayMs: 1000, ...timings };
   if (Object.values(policy).some(value => !Number.isSafeInteger(value) || value < 1) || policy.batchSize > 100 ||
       policy.leaseMs > 300000 || policy.timeoutMs >= policy.leaseMs) throw new Error("INVALID_PROVIDER_WORKER_POLICY");
@@ -91,11 +101,12 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
   for (let index = 0; index < policy.batchSize; index++) {
     const lease = randomUUID();
     const claimed = await pool.query(`WITH candidate AS (
-      SELECT id FROM outbox WHERE work_kind='provider_payment' AND provider_operation_id IS NOT NULL AND
-      ((delivery_status='pending' AND next_attempt_at<=clock_timestamp()) OR
-       (delivery_status='processing' AND lease_expires_at<=clock_timestamp())) ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+      SELECT job.id FROM outbox job JOIN rail_provider_payments payment ON payment.operation_id=job.provider_operation_id
+      WHERE job.work_kind='provider_payment' AND payment.binding->>'provider'=$3 AND
+      ((job.delivery_status='pending' AND job.next_attempt_at<=clock_timestamp()) OR
+       (job.delivery_status='processing' AND job.lease_expires_at<=clock_timestamp())) ORDER BY job.id FOR UPDATE OF job SKIP LOCKED LIMIT 1)
       UPDATE outbox job SET delivery_status='processing',delivery_attempts=LEAST(delivery_attempts,2147483646)+1,lease_id=$1,
-      lease_expires_at=clock_timestamp()+$2*interval '1 millisecond' FROM candidate WHERE job.id=candidate.id RETURNING job.*`, [lease, policy.leaseMs]);
+      lease_expires_at=clock_timestamp()+$2*interval '1 millisecond' FROM candidate WHERE job.id=candidate.id RETURNING job.*`, [lease, policy.leaseMs, adapter.provider]);
     const job = claimed.rows[0]; if (!job) break;
     const live = async (client: PoolClient) => (await client.query(`SELECT id FROM outbox WHERE id=$1 AND work_kind='provider_payment'
       AND delivery_status='processing' AND lease_id=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, [job.id, lease])).rowCount === 1;
@@ -129,7 +140,7 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
                 AND proof_key_thumbprint=$3 AND scope='payments:execute' AND revoked_at IS NULL AND expires_at>clock_timestamp() FOR UPDATE`,
               [job.provider_credential_id, payment.binding.agentId, job.provider_key_thumbprint]);
               if (!credential.rowCount) throw new Error("PROVIDER_EXECUTION_CREDENTIAL_WITHDRAWN");
-              if (payment.binding.provider !== "simulator") throw new Error("SIMULATOR_TARGET_REQUIRED");
+              if (payment.binding.provider !== adapter.provider) throw new Error("PROVIDER_WORKER_MISMATCH");
               payment = await advanceProviderPaymentInTransaction(client, identity, { type: "begin_submission", idempotencyWindowMs: 86400000 }, targets);
               if (!await live(client)) throw new Error("PROVIDER_LEASE_LOST");
             });
@@ -147,11 +158,11 @@ export async function dispatchProviderBatch(pool: Pool, targets: ProviderTargetR
       });
       if (!prepared) { stats.lostLease++; continue; }
       if (prepared.done) { stats.resolved++; continue; }
-      // No financial transaction is held during the simulated external effect.
+      // No financial transaction is held during provider I/O.
       let timer: ReturnType<typeof setTimeout> | undefined;
       let observed: ProviderObservation | null = null;
       try {
-        observed = await Promise.race([prepared.submit ? simulator.submit(prepared.payment) : simulator.lookup(prepared.payment),
+        observed = await Promise.race([prepared.submit ? adapter.submit(prepared.payment) : adapter.lookup(prepared.payment),
           new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("PROVIDER_TIMEOUT")), policy.timeoutMs); })]);
       } catch { /* No response is not proof of failure. */ }
       finally { if (timer) clearTimeout(timer); }

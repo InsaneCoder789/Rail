@@ -2,7 +2,7 @@ import type { PoolClient } from "pg";
 import { createHash, randomUUID } from "node:crypto";
 import { advanceProviderPayment, createProviderPayment, parseProviderPaymentBinding, providerBudgetDisposition, providerPaymentConsentPayload,
   providerPaymentConsentFingerprint,
-  providerPaymentFingerprint, type ProviderPayment, type ProviderPaymentBinding, type ProviderPaymentEvent } from "../domain/providerPayment.js";
+  providerPaymentFingerprint, type ProviderPayment, type ProviderPaymentBinding, type ProviderPaymentEvent, type StripeObservationProvenance } from "../domain/providerPayment.js";
 import type { OwnerPasskeyStore } from "./ownerPasskeys.js";
 import type { AgentEvidenceStore } from "./agentEvidence.js";
 import type { OwnerPrincipal } from "../server/types.js";
@@ -13,6 +13,7 @@ import { RequestError } from "../server/http.js";
 import { isCurrency, isRecord, isSafeText, isValidAmountMinor } from "../server/validation.js";
 
 export interface ProviderPaymentRecord extends ProviderPayment {
+  readonly provenance?: StripeObservationProvenance;
   readonly revision: number;
   readonly attemptNumber: number;
   readonly authorizationRequired: boolean;
@@ -29,7 +30,8 @@ function restore(row: Record<string, unknown>): ProviderPaymentRecord {
     firstSubmissionAtMs: row.first_submission_at_ms === null ? null : Number(row.first_submission_at_ms),
     retryWindowEndsAtMs: row.retry_window_ends_at_ms === null ? null : Number(row.retry_window_ends_at_ms),
     updatedAtMs: Number(row.updated_at_ms), revision: Number(row.revision), attemptNumber: Number(row.attempt_number),
-    authorizationRequired: row.authorization_required === true });
+    authorizationRequired: row.authorization_required === true,
+    ...(row.outcome_provenance ? { provenance: row.outcome_provenance as StripeObservationProvenance } : {}) });
 }
 
 async function databaseTime(client: PoolClient): Promise<number> {
@@ -85,11 +87,13 @@ export async function advanceProviderPaymentInTransaction(client: PoolClient, id
     const next = advanceProviderPayment(current, snapshot, await databaseTime(client));
     if (next === current) return current;
     const attemptNumber = current.attemptNumber + (snapshot.type === "begin_submission" || snapshot.type === "retry_submission" ? 1 : 0);
+    const provenance = current.binding.provider === "stripe" && snapshot.type === "provider_observed"
+      ? snapshot.observation.provenance : current.provenance;
     const changed = await client.query(`UPDATE rail_provider_payments SET status=$2,provider_ref=$3,first_submission_at_ms=$4,
-        retry_window_ends_at_ms=$5,updated_at_ms=$6,revision=revision+1,attempt_number=$7,last_event=$8
+        retry_window_ends_at_ms=$5,updated_at_ms=$6,revision=revision+1,attempt_number=$7,last_event=$8,outcome_provenance=$9::jsonb
       WHERE operation_id=$1 RETURNING *`,
     [operationId, next.status, next.providerRef, next.firstSubmissionAtMs, next.retryWindowEndsAtMs,
-      next.updatedAtMs, attemptNumber, snapshot.type]);
+      next.updatedAtMs, attemptNumber, snapshot.type, provenance ? JSON.stringify(provenance) : null]);
     return restore(changed.rows[0]);
   });
 }
@@ -237,6 +241,8 @@ export async function prepareProviderProposalInTransaction(client: PoolClient, i
     return providerProposalView({ ...previous.rows[0], ...status.rows[0] });
   }
   const target = targets.resolve(request.targetId, agent.ownerWalletId, request.currency);
+  if (target.provider === "stripe" && (!["USD", "INR"].includes(request.currency) || request.amountMinor > 99999999))
+    throw new RequestError(422, "stripe_terms_unsupported", "unsupported Stripe test payment terms");
   const policy = await client.query("SELECT *,expires_at>clock_timestamp() AS valid FROM rail_agent_mandates WHERE mandate_id=$1 AND agent_id=$2 AND owner_wallet_id=$3 FOR UPDATE",
     [request.mandateId, agent.agentId, agent.ownerWalletId]);
   const mandate = policy.rows[0];

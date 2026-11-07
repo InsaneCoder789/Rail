@@ -1505,6 +1505,7 @@ CREATE TABLE IF NOT EXISTS rail_provider_payments (
       AND status<>'reserved'),FALSE))
 );
 ALTER TABLE rail_provider_payments ADD COLUMN IF NOT EXISTS authorization_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE rail_provider_payments ADD COLUMN IF NOT EXISTS outcome_provenance JSONB;
 CREATE INDEX IF NOT EXISTS idx_provider_payments_owner ON rail_provider_payments(owner_wallet_id,operation_id);
 CREATE INDEX IF NOT EXISTS idx_provider_payments_mandate_totals
   ON rail_provider_payments(mandate_id,status) WHERE authorization_required;
@@ -1528,7 +1529,7 @@ LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
     RAISE EXCEPTION 'provider_payment_history_is_immutable' USING ERRCODE='23514';
   END IF;
   IF TG_OP='INSERT' THEN
-    IF NEW.revision<>1 OR NEW.attempt_number<>0 OR NEW.last_event<>'created' OR NEW.status<>'reserved' THEN
+    IF NEW.revision<>1 OR NEW.attempt_number<>0 OR NEW.last_event<>'created' OR NEW.status<>'reserved' OR NEW.outcome_provenance IS NOT NULL THEN
       RAISE EXCEPTION 'provider_payment_initial_state_invalid' USING ERRCODE='23514';
     END IF;
     RETURN NEW;
@@ -1541,7 +1542,10 @@ LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
     OR (OLD.first_submission_at_ms IS NOT NULL AND ROW(NEW.first_submission_at_ms,NEW.retry_window_ends_at_ms)
       IS DISTINCT FROM ROW(OLD.first_submission_at_ms,OLD.retry_window_ends_at_ms))
     OR (OLD.provider_ref IS NOT NULL AND NEW.provider_ref IS DISTINCT FROM OLD.provider_ref)
-    OR (OLD.status IN ('succeeded','failed','cancelled') AND NEW.status IS DISTINCT FROM OLD.status)
+    OR (OLD.status IN ('succeeded','failed','cancelled') AND (NEW.status IS DISTINCT FROM OLD.status OR NEW.outcome_provenance IS DISTINCT FROM OLD.outcome_provenance))
+    OR (NEW.outcome_provenance IS DISTINCT FROM OLD.outcome_provenance AND NEW.last_event<>'provider_observed')
+    OR (NEW.binding->>'provider'='stripe' AND OLD.status NOT IN ('succeeded','failed','cancelled')
+      AND NEW.status IN ('succeeded','failed','cancelled') AND NEW.first_submission_at_ms IS NOT NULL AND NEW.outcome_provenance IS NULL)
     OR NEW.attempt_number<>OLD.attempt_number+(CASE WHEN NEW.last_event IN ('begin_submission','retry_submission') THEN 1 ELSE 0 END) THEN
     RAISE EXCEPTION 'provider_payment_binding_or_history_invalid' USING ERRCODE='23514';
   END IF;

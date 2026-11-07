@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { parseProviderPaymentBinding, providerBudgetDisposition, providerPaymentConsentFingerprint,
-  providerPaymentFingerprint, type ProviderPayment } from "./providerPayment.js";
+  providerPaymentFingerprint, verifyStripeObservation, type ProviderPayment, type StripeObservationProvenance } from "./providerPayment.js";
 
 export interface ProviderOutcomeReceipt {
-  readonly version: 1;
-  readonly assurance: "local_simulator_outcome";
+  readonly version: 1 | 2;
+  readonly assurance: "local_simulator_outcome" | "server_observed_stripe_test_api" | "server_cancelled_before_submission";
+  readonly provenance?: StripeObservationProvenance;
   readonly operationId: string;
   readonly ownerWalletId: string;
   readonly agentId: string;
@@ -25,13 +26,13 @@ export interface ProviderOutcomeReceipt {
   readonly journalRevision: number;
 }
 
-/** Trusted journal input only. This contract cannot attest a real provider or settlement. */
-export function createProviderOutcomeReceipt(payment: ProviderPayment & { readonly revision: number }, consent: {
+/** Server-protected evidence, not a provider signature or proof of live settlement. */
+export function createProviderOutcomeReceipt(payment: ProviderPayment & { readonly revision: number; readonly provenance?: StripeObservationProvenance }, consent: {
   readonly merchantWalletId: string; readonly consentFingerprint: string; readonly challengeId: string;
 }): ProviderOutcomeReceipt {
   const binding = parseProviderPaymentBinding(payment.binding);
   const timestamp = (value: number) => Number.isSafeInteger(value) && value >= 0 && value <= 8640000000000000;
-  if (binding.provider !== "simulator" || payment.fingerprint !== providerPaymentFingerprint(binding) ||
+  if (!["simulator", "stripe"].includes(binding.provider) || payment.fingerprint !== providerPaymentFingerprint(binding) ||
       payment.idempotencyKey !== `rail_provider_v1_${binding.operationId}` ||
       consent.consentFingerprint !== providerPaymentConsentFingerprint(binding, consent.merchantWalletId) ||
       !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(consent.challengeId) ||
@@ -43,7 +44,14 @@ export function createProviderOutcomeReceipt(payment: ProviderPayment & { readon
       typeof payment.providerRef !== "string" || !/^[A-Za-z0-9_.:-]{3,128}$/.test(payment.providerRef)) {
     throw new Error("INVALID_PROVIDER_OUTCOME_RECEIPT");
   }
-  return Object.freeze({ version: 1, assurance: "local_simulator_outcome", operationId: binding.operationId,
+  const provenance = binding.provider === "stripe" && payment.firstSubmissionAtMs !== null
+    ? verifyStripeObservation({ operationId: binding.operationId, fingerprint: payment.fingerprint, provider: "stripe",
+      providerAccountRef: binding.providerAccountRef, providerRef: payment.providerRef!, amountMinor: binding.amountMinor,
+      currency: binding.currency, status: payment.status as "succeeded" | "cancelled", final: true, provenance: payment.provenance }) : undefined;
+  if (binding.provider === "stripe" && payment.status === "failed") throw new Error("INVALID_PROVIDER_OUTCOME_RECEIPT");
+  return Object.freeze({ version: binding.provider === "simulator" ? 1 : 2,
+    assurance: binding.provider === "simulator" ? "local_simulator_outcome" : provenance ? "server_observed_stripe_test_api" : "server_cancelled_before_submission",
+    ...(provenance ? { provenance } : {}), operationId: binding.operationId,
     ownerWalletId: binding.ownerWalletId, agentId: binding.agentId, mandateId: binding.mandateId,
     sharedBudgetId: binding.sharedBudgetId, intentId: binding.intentId, paymentFingerprint: payment.fingerprint,
     consentFingerprint: consent.consentFingerprint, consentChallengeId: consent.challengeId,

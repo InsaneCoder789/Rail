@@ -51,6 +51,13 @@ children and native selects explicit shrink boundaries. The rerun passed 320,
 - Inspect a paginated provider journal and verify protected simulator outcome
   receipts. Loading provider payments also refreshes current budget totals.
 
+Explicit Stripe test execution can now use the same owner review flow; see
+[the test worker guide](PROVIDER_PAYMENTS.md#explicit-stripe-test-execution-and-protected-outcomes).
+The page does not receive Stripe API keys or agent signing keys. Version-2 Stripe
+receipts identify server-observed test API outcomes, not live settlement. The
+additional Chromium acceptance journey uses a fake SDK transport; a real sandbox
+walkthrough is still a separate gate.
+
 Approval does not execute a payment. The independently authenticated agent client
 must still request execution and pass live financial checks. Integer limit inputs
 are minor units, not decimal currency amounts. Provider settlement and blockchain

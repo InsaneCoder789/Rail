@@ -34,6 +34,7 @@ export interface ProviderPayment {
 
 /** Normalize only after authenticated callback/retrieval and actual provider-field checks. */
 export interface ProviderObservation {
+  readonly provenance?: StripeObservationProvenance;
   readonly operationId: string;
   readonly fingerprint: string;
   readonly provider: string;
@@ -44,6 +45,24 @@ export interface ProviderObservation {
   readonly status: "processing" | "requires_owner_action" | "succeeded" | "failed" | "cancelled";
   /** A recoverable decline or requires_payment_method must not be normalized as final failure. */
   readonly final: boolean;
+}
+
+export const STRIPE_TEST_API_VERSION = "2026-10-28.endive" as const;
+export interface StripeObservationProvenance {
+  readonly kind: "stripe_test_api";
+  readonly apiVersion: typeof STRIPE_TEST_API_VERSION;
+  readonly observationHash: string;
+}
+export function providerObservationHash(value: ProviderObservation): string {
+  return createHash("sha256").update(JSON.stringify(["rail:provider-observation:v1", value.operationId, value.fingerprint,
+    value.provider, value.providerAccountRef, value.providerRef, value.amountMinor, value.currency, value.status, value.final])).digest("hex");
+}
+export function verifyStripeObservation(value: ProviderObservation): StripeObservationProvenance {
+  const source = value.provenance;
+  if (value.provider !== "stripe" || !source || Object.keys(source).length !== 3 || source.kind !== "stripe_test_api" ||
+      source.apiVersion !== STRIPE_TEST_API_VERSION || source.observationHash !== providerObservationHash(value))
+    throw new Error("STRIPE_OBSERVATION_PROVENANCE_REQUIRED");
+  return Object.freeze({ ...source });
 }
 
 export type ProviderPaymentEvent = { readonly type: "begin_submission"; readonly idempotencyWindowMs: number } |
@@ -123,6 +142,7 @@ export function advanceProviderPayment(payment: ProviderPayment, event: Provider
       return update({ status: "cancelled" });
     case "provider_observed": {
       const observed = event.observation, expected = payment.binding;
+      if (expected.provider === "stripe") verifyStripeObservation(observed);
       if (observed.operationId !== expected.operationId || observed.fingerprint !== payment.fingerprint || observed.provider !== expected.provider ||
           observed.providerAccountRef !== expected.providerAccountRef || observed.amountMinor !== expected.amountMinor || observed.currency !== expected.currency ||
           !reference(observed.providerRef) || (payment.providerRef !== null && payment.providerRef !== observed.providerRef)) throw new Error("PROVIDER_OBSERVATION_MISMATCH");

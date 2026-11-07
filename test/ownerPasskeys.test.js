@@ -39,6 +39,7 @@ import { runAgentSimulation } from "../dist/demo/runAgentSimulator.js";
 import { ProviderTargetRegistry } from "../dist/domain/providerTargets.js";
 import { providerPaymentConsentFingerprint } from "../dist/domain/providerPayment.js";
 import { dispatchProviderBatch, LocalPaymentSimulator } from "../dist/persistence/providerWorker.js";
+import { StripeTestProvider } from "../dist/rail/stripeProvider.js";
 import { authorizeProviderPaymentInTransaction, advanceProviderPaymentInTransaction, createProviderPaymentInTransaction,
   readProviderPaymentInTransaction } from "../dist/persistence/providerPayments.js";
 
@@ -648,7 +649,7 @@ async function proofFixture(work, scope = "payments:propose", balance = 0, targe
 const providerTargetFixture = { version: 1, targetId: "fixture_trip", revision: 1, ownerWalletId: "owner_wallet", provider: "simulator",
   providerAccountRef: "account_fixture", instrumentRef: "instrument_fixture", merchantWalletId: "other_wallet", merchantRef: "merchant_fixture", currency: "INR", status: "active" };
 
-async function providerProposalFixture(work, scope = "payments:propose", simulatorExecution = false) {
+async function providerProposalFixture(work, scope = "payments:propose", simulatorExecution = false, target = providerTargetFixture) {
   const previous = process.env.JWT_SECRET;
   process.env.JWT_SECRET = "provider_http_fixture_jwt_secret_01234567890123456789";
   try {
@@ -667,7 +668,7 @@ async function providerProposalFixture(work, scope = "payments:propose", simulat
         new ProviderTargetRegistry(JSON.stringify([value])));
       const input = { mandateId: mandate.mandateId, clientRequestId: "signed_provider_fixture", targetId: "fixture_trip", amountMinor: 100, currency: "INR" };
       await work({ ...fixture, input, budget, owner, token, consent, replacement });
-    }, scope, 0, new ProviderTargetRegistry(JSON.stringify([providerTargetFixture])), simulatorExecution);
+    }, scope, 0, new ProviderTargetRegistry(JSON.stringify([target])), simulatorExecution);
   } finally { if (previous === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = previous; }
 }
 
@@ -692,6 +693,103 @@ async function queuedProviderFixture(work, fault = "none") {
     assert.equal((await f.pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
   }, "payments:execute", true);
 }
+
+async function stripeQueuedFixture(work, fault = "none", enabled = true) {
+  const target = { ...providerTargetFixture, provider: "stripe", providerAccountRef: "acct_fixture", merchantRef: "acct_fixture", instrumentRef: "pm_fixture" };
+  await providerProposalFixture(async f => {
+    await f.pool.query("CREATE TABLE stripe_test_effects(operation_id UUID PRIMARY KEY,intent JSONB NOT NULL)");
+    await f.http("POST", "/v2/agent/provider-payments", f.input, { signed: true });
+    const proposal = (await f.strict.listOwnerProviderProposals(f.owner.walletId, f.agent.agentId, f.owner))[0];
+    const permission = await f.consent(proposal.consentFingerprint);
+    await f.strict.authorizeProviderProposal(f.owner.walletId, f.agent.agentId, proposal.operationId,
+      { requestFingerprint: proposal.requestFingerprint, grantToken: permission.grantToken }, f.owner);
+    let creates = 0;
+    const client = { accounts: { retrieve: async () => ({ id: "acct_fixture" }) },
+      paymentMethods: { retrieve: async () => ({ id: "pm_fixture", livemode: false, type: "card", customer: "cus_fixture" }) },
+      paymentIntents: {
+        create: async params => {
+          creates++;
+          const intent = { id: `pi_${params.metadata.rail_operation_id.replaceAll("-", "")}`, object: "payment_intent", livemode: false,
+            amount: params.amount, amount_received: params.amount, amount_capturable: 0, currency: params.currency,
+            customer: params.customer, payment_method: params.payment_method, payment_method_types: ["card"],
+            capture_method: "automatic", confirmation_method: "automatic", on_behalf_of: null, transfer_data: null,
+            application_fee_amount: null, metadata: params.metadata, status: "succeeded" };
+          await f.pool.query("INSERT INTO stripe_test_effects VALUES($1,$2::jsonb) ON CONFLICT DO NOTHING", [proposal.operationId, JSON.stringify(intent)]);
+          if (fault === "lose_reply") throw new Error("mock_stripe_reply_lost");
+          return (await f.pool.query("SELECT intent FROM stripe_test_effects WHERE operation_id=$1", [proposal.operationId])).rows[0].intent;
+        },
+        list: async () => ({ data: (await f.pool.query("SELECT intent FROM stripe_test_effects")).rows.map(row => row.intent), has_more: false }),
+        retrieve: async id => (await f.pool.query("SELECT intent FROM stripe_test_effects WHERE intent->>'id'=$1", [id])).rows[0].intent
+      } };
+    const adapter = () => new StripeTestProvider({ secretKey: `sk_test_${"a".repeat(32)}`, accountId: "acct_fixture",
+      instruments: [{ ownerWalletId: f.owner.walletId, paymentMethodId: "pm_fixture", customerId: "cus_fixture" }] }, client);
+    const targets = new ProviderTargetRegistry(JSON.stringify([target]));
+    const drain = (provider = adapter()) => dispatchProviderBatch(f.pool, targets, provider, { evidence: f.authority, batchSize: 1 });
+    const queue = () => f.http("POST", `/v2/agent/provider-payments/${proposal.operationId}/execute`, { requestFingerprint: proposal.requestFingerprint }, { signed: true });
+    const ready = () => f.pool.query("UPDATE outbox SET next_attempt_at=clock_timestamp()-interval '1 second' WHERE provider_operation_id IS NOT NULL");
+    const state = async () => (await f.pool.query(`SELECT payment.status,budget.reserved_budget_minor,budget.spent_budget_minor
+      FROM rail_provider_payments payment JOIN rail_shared_budgets budget ON budget.budget_id=payment.shared_budget_id`)).rows[0];
+    await work({ ...f, proposal, queue, drain, ready, state, adapter, creates: () => creates });
+    assert.equal((await f.pool.query("SELECT count(*) FROM ledger_entries")).rows[0].count, "0");
+  }, "payments:execute", { simulator: !enabled, stripe: enabled }, target);
+}
+
+test("Stripe test jobs are provider-isolated and atomically resolve allowance with versioned protected API evidence", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async ({ pool, queue, drain, state, strict, owner, agent, proposal, creates }) => {
+    await queue(); await queue();
+    assert.deepEqual(await drain(new LocalPaymentSimulator(pool)), { resolved: 0, pending: 0, lostLease: 0 });
+    assert.equal((await drain()).resolved, 1);
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+    const original = await strict.readProviderOutcome(owner.walletId, agent.agentId, proposal.operationId, owner);
+    assert.equal(original.status, "verified"); assert.equal(original.receipt.version, 2);
+    assert.equal(original.receipt.assurance, "server_observed_stripe_test_api");
+    assert.equal(original.receipt.provenance.kind, "stripe_test_api");
+    await queue(); await drain(); assert.equal(creates(), 1);
+    assert.deepEqual(await strict.readProviderOutcome(owner.walletId, agent.agentId, proposal.operationId, owner), original);
+    await assert.rejects(pool.query("UPDATE rail_provider_payments SET outcome_provenance=NULL,revision=revision+1"), { code: "23514" });
+  });
+});
+
+test("Stripe lost reply remains held and read-only recovery works after agent revocation without another charge", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async ({ queue, drain, ready, state, strict, owner, agent, creates }) => {
+    await queue(); assert.equal((await drain()).pending, 1);
+    assert.deepEqual(await state(), { status: "unknown", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    await strict.revokeAgent(owner.walletId, agent.agentId, owner);
+    await ready(); assert.equal((await drain()).resolved, 1);
+    assert.deepEqual(await state(), { status: "succeeded", reserved_budget_minor: "0", spent_budget_minor: "100" });
+    assert.equal(creates(), 1);
+  }, "lose_reply");
+});
+
+test("Stripe receipt failure rolls back provenance and accounting while preserving the independently stored effect", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async ({ pool, queue, drain, ready, state, creates }) => {
+    await pool.query(`CREATE FUNCTION fail_stripe_receipt() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'stripe_receipt_fault'; END $$;
+      CREATE TRIGGER fail_stripe_receipt BEFORE INSERT ON rail_provider_outcome_evidence FOR EACH ROW EXECUTE FUNCTION fail_stripe_receipt()`);
+    await queue(); assert.equal((await drain()).pending, 1);
+    assert.deepEqual(await state(), { status: "submitting", reserved_budget_minor: "100", spent_budget_minor: "0" });
+    assert.equal((await pool.query("SELECT outcome_provenance FROM rail_provider_payments")).rows[0].outcome_provenance, null);
+    await pool.query("DROP TRIGGER fail_stripe_receipt ON rail_provider_outcome_evidence");
+    await ready(); assert.equal((await drain()).resolved, 1); assert.equal(creates(), 1);
+  });
+});
+
+test("Stripe revocation before submission creates a cancellation receipt without inventing API evidence", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async ({ queue, drain, strict, owner, agent, proposal, creates }) => {
+    await queue(); await strict.revokeAgent(owner.walletId, agent.agentId, owner);
+    assert.equal((await drain()).resolved, 1); assert.equal(creates(), 0);
+    const result = await strict.readProviderOutcome(owner.walletId, agent.agentId, proposal.operationId, owner);
+    assert.equal(result.status, "verified"); assert.equal(result.receipt.assurance, "server_cancelled_before_submission");
+    assert.equal(result.receipt.provenance, undefined);
+  });
+});
+
+test("Stripe execution stays disabled when only simulator permission is enabled", { skip: !databaseUrl }, async () => {
+  await stripeQueuedFixture(async ({ queue, pool, creates }) => {
+    await assert.rejects(queue(), { code: "provider_target_unavailable" });
+    assert.equal((await pool.query("SELECT count(*) FROM outbox WHERE provider_operation_id IS NOT NULL")).rows[0].count, "0");
+    assert.equal(creates(), 0);
+  }, "none", false);
+});
 
 test("simulator execution requires execution scope and explicit enablement, never just proposal authority", { skip: !databaseUrl }, async () => {
   await providerProposalFixture(async ({ http }) => {

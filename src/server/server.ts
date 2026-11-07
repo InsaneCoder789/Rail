@@ -41,6 +41,7 @@ import { OwnerPasskeyStore, loadOwnerPasskeyConfig } from "../persistence/ownerP
 import { handlePasskeyRoutes } from "./routes/passkeyRoutes.js";
 import { StripeCallbackInbox, loadStripeCallbackConfiguration } from "../persistence/stripeCallbacks.js";
 import { handleStripeRoutes } from "./routes/stripeRoutes.js";
+import { loadStripeTestConfiguration } from "../rail/stripeProvider.js";
 
 const tracer = consoleTracer("[rail]");
 
@@ -68,6 +69,7 @@ export async function createServerContext(options: {
   const providerTargets = new ProviderTargetRegistry(process.env.RAIL_PROVIDER_TARGETS);
   const passkeyConfig = loadOwnerPasskeyConfig(process.env.RAIL_WEBAUTHN_RP_ID, process.env.RAIL_WEBAUTHN_ORIGIN);
   const stripeCallbackConfig = loadStripeCallbackConfiguration();
+  const stripeTestConfig = loadStripeTestConfiguration();
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const ownerPasskeys = passkeyConfig ? new OwnerPasskeyStore(pool, passkeyConfig) : undefined;
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
@@ -129,7 +131,8 @@ export async function createServerContext(options: {
     riskProtection,
     auditStore: new AuditBatchStore(pool, evidenceStore, riskProtection),
     agentStore: new AgentAuthorityStore(pool, engine, authorityEvidence, merchantQuotes, { required: true, store: ownerPasskeys }, { required: true, ready: Boolean(config.agentApiOrigin) }, providerTargets,
-      process.env.RAIL_PROVIDER_SIMULATOR === "true" && process.env.RAIL_DEMO_MODE === "true" && process.env.NODE_ENV !== "production"),
+      { simulator: process.env.RAIL_PROVIDER_SIMULATOR === "true" && process.env.RAIL_DEMO_MODE === "true" && process.env.NODE_ENV !== "production",
+        stripe: Boolean(stripeTestConfig) }),
     rateLimiter: new PostgresRateLimiter(pool),
     authResolver: createAuthResolver({
       getPool: () => pool,

@@ -38,6 +38,36 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Stripe Test Worker And Versioned Outcome Evidence
+
+Integrated the Stripe adapter with existing proof-bound execution admission and
+the durable worker behind an independent, default-off test-payment flag. Provider
+filtering isolates simulator and Stripe jobs. Exact owner consent, live authority
+rechecks, shared holds, leases and conservative lookup-only recovery are preserved.
+The new `provider:stripe` command processes a finite batch, not a deployed scheduler.
+Only USD/INR with bounded amounts are enabled; this avoids silently misrepresenting
+other currency exponents in the current owner console.
+
+API-observation provenance, terminal status, allowance resolution and encrypted
+version-2 outcome evidence commit atomically. Stripe test API evidence is labeled
+`server_observed_stripe_test_api`; unsubmitted cancellation does not invent provider
+evidence. Existing simulator version-1 receipts remain unchanged. These are server
+observations, not provider signatures or live settlement certificates. Final
+provenance cannot be rewritten through normal SQL updates.
+
+Focused tests cover provider-isolated queues, exact replay, lost replies and recovery
+after revocation, receipt-fault rollback and disabled-provider rejection. A fifth
+native Chromium journey exercises the Stripe-enabled server/owner flow with a fake
+SDK transport. Final local acceptance passed all 503 backend tests and five native
+Chromium journeys, zero failures/skips, on Node 20.19.6 and isolated PostgreSQL data.
+Dependency audit found zero known vulnerabilities. Disposable database
+`rail_stripe_worker_1794042628419` was removed. Untracked evidence is retained at
+`deliverables/portfolio-maintenance/rail_stripe_worker_1794042628419.log`; browser
+captures are under `deliverables/rail-owner-console/provider-stripe-*.png`.
+No new remote CI or real Stripe API/account/sandbox acceptance is claimed.
+The callback inbox still lacks its consumer and cannot resolve payments by itself;
+that integration and actual sandbox acceptance remain required for C2/C3 sign-off.
+
 ### Durable Stripe Test Callback Admission
 
 Added an opt-in, non-production Stripe callback endpoint and PostgreSQL inbox.

@@ -13,7 +13,7 @@ audit reported zero known vulnerabilities. The disposable local PostgreSQL datab
 was removed after verification. Trusted target configuration and
 proof-bound proposal admission are now implemented as described below. Stripe is
 now owner-selected. Its test adapter boundary and optional callback inbox are implemented as described below;
-account access, runtime execution/callback consumption and actual sandbox acceptance
+account access, callback consumption and actual sandbox acceptance
 remain open.
 
 The 1 November owner-history increment adds the console walkthrough described in
@@ -123,7 +123,7 @@ configuration changes cannot erase outstanding financial liability. Database gua
 reject proposal rewrites, proof reuse and attaching a proposal after an operation.
 Routes retain existing quotas/body limits and return `Cache-Control: no-store`.
 
-The proposal proof alone does not authorize execution. The simulator-only route above
+The proposal proof alone does not authorize execution. The separately enabled test-provider route above
 requires a separate execution proof. There is no real-provider execute integration,
 provider SDK call or settlement claim. Authenticated callbacks, real-provider recovery,
 protected outcome receipts and actual sandbox acceptance remain separate work.
@@ -411,10 +411,11 @@ Unapproved proposals have no admitted payment journal and therefore no history y
 ## Selected Stripe Test Adapter Boundary
 
 The owner selected Stripe. `src/rail/stripeProvider.ts` adds an isolated test-mode
-adapter using pinned `stripe@23.1.0` and API version `2026-10-28.endive`. It is not
-yet wired to the public execute route or worker. The optional callback inbox below
-only admits events. Payment execution remains simulator-only; adding this dependency does not enable Stripe
-charges. There is still no sandbox account or real Stripe acceptance evidence.
+adapter using pinned `stripe@23.1.0` and API version `2026-10-28.endive`. It is
+now wired to the public execute route and provider-isolated worker behind a separate
+test-only flag described below. The optional callback inbox below only admits
+events; it does not resolve them. Nothing is enabled by default, and adding the
+dependency alone does not enable charges. There is still no real Stripe acceptance evidence.
 
 The supported model is one configured Stripe test merchant charging a configured
 customer's previously saved test card. It is not arbitrary merchant purchasing,
@@ -460,12 +461,13 @@ state before resolving anything. It currently accepts the documented snapshot
 PaymentIntent event family; thin event handling is not claimed.
 [Stripe webhook guidance](https://docs.stripe.com/webhooks)
 
-Fifteen isolated boundary tests cover exact parameters, account/instrument/mode
+Eighteen isolated boundary tests cover exact parameters, account/instrument/mode
 substitution, outcome states, ambiguity, transport failure and webhook tampering.
 One uses the real SDK's HTTP serialization against an in-process fake transport;
 webhook tests use synthetic signatures. These are local contract tests, not Stripe
-network, sandbox or deployed callback acceptance. Callback consumption,
-worker integration and protected Stripe-specific outcome provenance remain required.
+network, sandbox or deployed callback acceptance. Callback consumption and actual
+sandbox acceptance remain required. The current
+worker and protected Stripe outcome contract are described below.
 
 ## Durable Stripe Test Callback Inbox
 
@@ -501,8 +503,8 @@ HTTP 200 means **received**, not processed, paid, settled or reconciled. Snapsho
 amount/status fields never update money, allowance or the payment journal. A
 signature proves possession of the configured endpoint secret, not the configured
 account's identity by itself; the subsequent authenticated API retrieval must also
-verify account/object/operation bindings. The durable consumer and Stripe financial
-worker are still required before enabling the full flow. Until then, this opt-in
+verify account/object/operation bindings. The durable consumer is still required
+before enabling callback-driven recovery. Until then, this opt-in
 test inbox accumulates pending events and eventually backpressures at its cap.
 
 Tests use disposable PostgreSQL schemas, concurrent clients, a real loopback HTTP
@@ -512,3 +514,62 @@ forged credentials, JSON/raw-byte/body limits and unchanged financial tables.
 They do not establish delivery from a registered Stripe endpoint or real sandbox
 acceptance. Never enable a real event source and assume an unfinished consumer is
 processing it.
+
+## Explicit Stripe Test Execution And Protected Outcomes
+
+`RAIL_STRIPE_TEST_PAYMENTS=true` independently enables Stripe execution admission
+only in a non-production `RAIL_DEMO_MODE=true` environment. Configure a test-only
+`RAIL_STRIPE_SECRET_KEY`, the expected `RAIL_STRIPE_ACCOUNT_ID`, and
+`RAIL_STRIPE_INSTRUMENTS` as a JSON array of `{ ownerWalletId, paymentMethodId,
+customerId }` mappings. All references must be actual preprovisioned test objects,
+not example IDs. Raw card data and live keys are rejected. The server validates
+configuration without making a Stripe request at startup. The finite worker, not
+an agent request handler or owner page, performs provider I/O.
+
+Stripe targets must set `provider` to `stripe`, both `providerAccountRef` and
+`merchantRef` to the configured merchant account ID, and `instrumentRef` to the
+mapped saved test PaymentMethod. These operator mappings do not independently
+prove ownership. Stripe account/customer/method checks still occur before the API
+write. Only USD and INR and amounts up to 99999999 minor units are admitted in this
+bounded implementation; other currency exponents are not silently displayed as
+two-decimal money. Choose an amount meeting the provider's actual currency minimum
+for real acceptance. Synthetic unit fixtures do not establish provider acceptance.
+
+The existing proposal, exact owner passkey approval and fresh execution-scope DPoP
+route are reused. Execution creates one durable job for the original operation,
+without another hold. A simulator-only configuration cannot admit Stripe execution.
+Queued jobs are claimed by provider: a simulator worker cannot acknowledge Stripe
+work, and vice versa. Existing owner/agent/budget/credential/target checks run before
+the durable submission boundary. Withdrawn authority can cancel only definitely
+unsubmitted work; already uncertain work is still eligible for read-only recovery.
+
+Run `npm run provider:stripe` only against the intended isolated sandbox database
+and securely provisioned test environment. It handles one finite batch, uses a
+60-second lease and a 20-second provider-I/O timeout, and returns nonzero for pending
+or lost-lease work. It does not deploy or schedule itself. No transaction is held
+during Stripe calls. Expired leases fence database writes, not remote side effects;
+late responses and crashes therefore still require reconciliation. The worker
+never resubmits an unknown operation, including when read-only lookup finds no
+object. Keep original configuration/keys available for unresolved operations.
+
+For Stripe observations, a versioned provenance record binds the normalized
+account/object/operation, amount, currency and status to the pinned API version.
+Final journal status, provenance, allowance resolution, protected receipt and job
+completion commit atomically. Receipt failure rolls them back while the independent
+provider effect may already exist; a later worker must look it up rather than charge
+again. Final provenance is immutable in PostgreSQL.
+
+Simulator receipts remain version 1. Stripe API-observed test outcomes use version 2
+with assurance `server_observed_stripe_test_api`; a definitely unsubmitted Stripe
+cancellation uses `server_cancelled_before_submission` without invented API evidence.
+These are encrypted/HMAC-protected server observations, not Stripe signatures,
+nonrepudiation, blockchain evidence or live settlement certificates. The provenance
+hash checks binding consistency; the trusted SDK/API boundary supplies authenticity.
+It is not a substitute for authenticated retrieval or a defense against a compromised
+trusted server. Historical missing evidence remains unavailable, not fabricated.
+
+The native owner-console walkthrough also runs with a fake Stripe SDK transport,
+including lost replies, shared allowance holds, lookup recovery and version-2
+receipt verification. Database tests cover provider isolation, revocation before
+and after submission, replay and receipt-fault rollback. Actual test-account
+execution/webhook delivery and durable callback consumption still gate C2/C3.
