@@ -1723,6 +1723,29 @@ END $$;
 DROP TRIGGER IF EXISTS rail_provider_outcome_immutable ON rail_provider_outcome_evidence;
 CREATE TRIGGER rail_provider_outcome_immutable BEFORE UPDATE OR DELETE ON rail_provider_outcome_evidence
   FOR EACH ROW EXECUTE FUNCTION rail_protect_provider_outcome();
+CREATE TABLE IF NOT EXISTS rail_stripe_callback_inbox (
+  stripe_account_id TEXT NOT NULL CHECK(stripe_account_id ~ '^acct_[A-Za-z0-9]{3,120}$'),
+  event_id TEXT NOT NULL CHECK(event_id ~ '^evt_[A-Za-z0-9]{3,120}$'),
+  payment_intent_id TEXT NOT NULL CHECK(payment_intent_id ~ '^pi_[A-Za-z0-9]{3,120}$'),
+  body_hash TEXT NOT NULL CHECK(body_hash ~ '^[a-f0-9]{64}$'),
+  received_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  processed_at TIMESTAMPTZ CHECK(processed_at>=received_at),
+  PRIMARY KEY(stripe_account_id,event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_stripe_callback_pending ON rail_stripe_callback_inbox(stripe_account_id,received_at,event_id) WHERE processed_at IS NULL;
+CREATE OR REPLACE FUNCTION rail_protect_stripe_callback() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN
+  IF TG_OP='DELETE' THEN RAISE EXCEPTION 'stripe_callback_is_durable' USING ERRCODE='23514'; END IF;
+  IF ROW(NEW.stripe_account_id,NEW.event_id,NEW.payment_intent_id,NEW.body_hash,NEW.received_at)
+    IS DISTINCT FROM ROW(OLD.stripe_account_id,OLD.event_id,OLD.payment_intent_id,OLD.body_hash,OLD.received_at)
+    OR (OLD.processed_at IS NOT NULL AND NEW.processed_at IS DISTINCT FROM OLD.processed_at) THEN
+    RAISE EXCEPTION 'stripe_callback_binding_is_immutable' USING ERRCODE='23514';
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS rail_stripe_callback_immutable ON rail_stripe_callback_inbox;
+CREATE TRIGGER rail_stripe_callback_immutable BEFORE UPDATE OR DELETE ON rail_stripe_callback_inbox
+  FOR EACH ROW EXECUTE FUNCTION rail_protect_stripe_callback();
 `;
 
 async function migrateTransaction(pool: Pool, work: (client: PoolClient) => Promise<void>): Promise<void> {

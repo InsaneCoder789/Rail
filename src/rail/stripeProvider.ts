@@ -7,7 +7,7 @@ export interface StripeTestConfiguration {
   readonly accountId: string;
   readonly instruments: readonly { readonly ownerWalletId: string; readonly paymentMethodId: string; readonly customerId: string }[];
 }
-type Client = Pick<Stripe, "accounts" | "paymentMethods" | "paymentIntents" | "webhooks">;
+type Client = Pick<Stripe, "accounts" | "paymentMethods" | "paymentIntents">;
 const id = (value: unknown, prefix: string): value is string => typeof value === "string" && new RegExp(`^${prefix}_[A-Za-z0-9]{3,120}$`).test(value);
 const objectId = (value: unknown) => typeof value === "string" ? value : value && typeof value === "object" && "id" in value ? value.id : null;
 const failure = (message: string): never => { throw new Error(message); };
@@ -122,18 +122,23 @@ export class StripeTestProvider {
 
   /** Signature verification only. The eventual handler must deduplicate and retrieve current state. */
   verifyWebhook(rawBody: Buffer, signature: unknown, webhookSecret: string) {
-    if (!Buffer.isBuffer(rawBody) || !rawBody.length || rawBody.length > 262144 || typeof signature !== "string" ||
-        signature.length > 4096 || !/^whsec_[A-Za-z0-9]{16,256}$/.test(webhookSecret)) failure("INVALID_STRIPE_WEBHOOK");
-    try {
-      const timestamps = (signature as string).split(",").filter(part => part.startsWith("t="));
-      if (timestamps.length !== 1 || !/^t=[0-9]{1,12}$/.test(timestamps[0]) ||
-          Math.abs(Math.floor(Date.now() / 1000) - Number(timestamps[0].slice(2))) > 300) failure("INVALID_STRIPE_WEBHOOK");
-      const event = this.client.webhooks.constructEvent(rawBody, signature as string, webhookSecret, 300);
-      if (!id(event.id, "evt") || event.livemode !== false || event.account !== undefined) failure("INVALID_STRIPE_WEBHOOK");
-      if (!["payment_intent.succeeded", "payment_intent.processing", "payment_intent.payment_failed", "payment_intent.canceled", "payment_intent.requires_action"].includes(event.type)) return null;
-      const intent = event.data.object as { object?: unknown; id?: unknown };
-      if (intent.object !== "payment_intent" || !id(intent.id, "pi")) failure("INVALID_STRIPE_WEBHOOK");
-      return Object.freeze({ eventId: event.id, paymentIntentId: intent.id, bodyHash: createHash("sha256").update(rawBody).digest("hex") });
-    } catch { return failure("INVALID_STRIPE_WEBHOOK"); }
+    return verifyStripeTestWebhook(rawBody, signature, webhookSecret);
   }
+}
+
+/** Callback admission needs only the endpoint secret, never an API key or charge permission. */
+export function verifyStripeTestWebhook(rawBody: Buffer, signature: unknown, webhookSecret: string) {
+  if (!Buffer.isBuffer(rawBody) || !rawBody.length || rawBody.length > 262144 || typeof signature !== "string" ||
+      signature.length > 4096 || !/^whsec_[A-Za-z0-9]{16,256}$/.test(webhookSecret)) failure("INVALID_STRIPE_WEBHOOK");
+  try {
+    const timestamps = (signature as string).split(",").filter(part => part.startsWith("t="));
+    if (timestamps.length !== 1 || !/^t=[0-9]{1,12}$/.test(timestamps[0]) ||
+        Math.abs(Math.floor(Date.now() / 1000) - Number(timestamps[0].slice(2))) > 300) failure("INVALID_STRIPE_WEBHOOK");
+    const event = Stripe.webhooks.constructEvent(rawBody, signature as string, webhookSecret, 300);
+    if (!id(event.id, "evt") || event.livemode !== false || event.account !== undefined) failure("INVALID_STRIPE_WEBHOOK");
+    if (!["payment_intent.succeeded", "payment_intent.processing", "payment_intent.payment_failed", "payment_intent.canceled", "payment_intent.requires_action"].includes(event.type)) return null;
+    const intent = event.data.object as { object?: unknown; id?: unknown };
+    if (intent.object !== "payment_intent" || !id(intent.id, "pi")) failure("INVALID_STRIPE_WEBHOOK");
+    return Object.freeze({ eventId: event.id, paymentIntentId: intent.id, bodyHash: createHash("sha256").update(rawBody).digest("hex") });
+  } catch { return failure("INVALID_STRIPE_WEBHOOK"); }
 }

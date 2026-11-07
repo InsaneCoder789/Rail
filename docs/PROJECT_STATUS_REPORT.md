@@ -38,6 +38,28 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Durable Stripe Test Callback Admission
+
+Added an opt-in, non-production Stripe callback endpoint and PostgreSQL inbox.
+It verifies raw signatures without needing an API key, stores minimal immutable
+correlation data, deduplicates concurrent deliveries and backpressures at a bounded
+pending capacity. Database failure returns an error rather than acknowledging lost
+work. Source quotas, JSON/body limits, strict query rejection and `no-store` apply.
+
+Callback admission never updates financial state: HTTP 200 means received, not
+paid/reconciled. Event amount/status snapshots and owner/agent tokens cannot bypass
+provider retrieval or execution authority. The worker/consumer and Stripe-specific
+protected outcome provenance remain incomplete; execution is still simulator-only.
+This is not an actual registered webhook, real sandbox run or production release.
+Final local acceptance passed all 495 backend tests and four Chromium journeys,
+zero failures/skips, on isolated PostgreSQL data and Node 20.19.6. Dependency audit
+found zero known vulnerabilities. Disposable database
+`rail_stripe_callbacks_1794041632544` was removed; the untracked log is retained at
+`deliverables/portfolio-maintenance/rail_stripe_callbacks_1794041632544.log`.
+The 21 focused callback/adapter cases include actual loopback HTTP and database
+fault/race checks, but use synthetic signatures and no Stripe network calls.
+No new remote CI or real webhook delivery/Stripe sandbox acceptance is claimed.
+
 ### Stripe Test Adapter Boundary
 
 Stripe is now owner-selected. Added `src/rail/stripeProvider.ts` and the pinned

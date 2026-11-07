@@ -63,6 +63,7 @@ export interface EventStore {
 }
 
 export interface ServerContext {
+  readonly stripeCallbacks?: import("../persistence/stripeCallbacks.js").StripeCallbackInbox;
   readonly agentProofs?: import("../persistence/agentProofs.js").AgentProofStore;
   readonly ownerPasskeys?: OwnerPasskeyStore;
   readonly config: ServerConfig;

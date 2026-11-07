@@ -12,8 +12,8 @@ internal wallet balances for external payments. Latest local acceptance passed
 audit reported zero known vulnerabilities. The disposable local PostgreSQL database
 was removed after verification. Trusted target configuration and
 proof-bound proposal admission are now implemented as described below. Stripe is
-now owner-selected. Its test adapter boundary is implemented as described below;
-account access, runtime execution/callback wiring and actual sandbox acceptance
+now owner-selected. Its test adapter boundary and optional callback inbox are implemented as described below;
+account access, runtime execution/callback consumption and actual sandbox acceptance
 remain open.
 
 The 1 November owner-history increment adds the console walkthrough described in
@@ -412,8 +412,8 @@ Unapproved proposals have no admitted payment journal and therefore no history y
 
 The owner selected Stripe. `src/rail/stripeProvider.ts` adds an isolated test-mode
 adapter using pinned `stripe@23.1.0` and API version `2026-10-28.endive`. It is not
-yet wired to the public execute route, worker or callback endpoint. The existing
-runtime remains simulator-only; adding this dependency does not enable Stripe
+yet wired to the public execute route or worker. The optional callback inbox below
+only admits events. Payment execution remains simulator-only; adding this dependency does not enable Stripe
 charges. There is still no sandbox account or real Stripe acceptance evidence.
 
 The supported model is one configured Stripe test merchant charging a configured
@@ -464,5 +464,51 @@ Fifteen isolated boundary tests cover exact parameters, account/instrument/mode
 substitution, outcome states, ambiguity, transport failure and webhook tampering.
 One uses the real SDK's HTTP serialization against an in-process fake transport;
 webhook tests use synthetic signatures. These are local contract tests, not Stripe
-network, sandbox or deployed callback acceptance. Durable callback ingestion,
+network, sandbox or deployed callback acceptance. Callback consumption,
 worker integration and protected Stripe-specific outcome provenance remain required.
+
+## Durable Stripe Test Callback Inbox
+
+`POST /v2/providers/stripe/webhook` is absent by default. Explicitly enable it with
+`RAIL_STRIPE_TEST_WEBHOOKS=true`, `RAIL_DEMO_MODE=true`, a non-production
+`NODE_ENV`, `RAIL_STRIPE_ACCOUNT_ID=acct_...` and the matching test endpoint's
+`RAIL_STRIPE_WEBHOOK_SECRET=whsec_...`. Invalid or production configuration fails
+startup before opening the database pool. No Stripe API key or charge permission
+is needed by callback admission. These settings do not enable Stripe execution.
+
+Requests must be JSON with no query parameters, include a valid exact-byte
+`Stripe-Signature` and fit the configured body limit (never above 256 KiB).
+Existing PostgreSQL source quotas allow 60 requests/minute; proxy trust follows
+the deployment's explicit configuration. Owner/agent credentials never substitute
+for the signature. Non-payment event types are authenticated and ignored.
+
+Relevant events are durably stored in `rail_stripe_callback_inbox` before HTTP 200.
+The row contains configured account, event ID, PaymentIntent ID, first body hash
+and timestamps, not the raw webhook, client secret, card data or API key.
+Account/event deduplication is serialized across instances. Retries with equivalent
+correlation are acknowledged even if formatting changes; the original body hash is
+preserved. Reusing an event ID for another PaymentIntent is a correlation conflict.
+Immutable database guards prevent rewriting event identity or deleting pending work.
+
+The default pending limit is 10000 events/account. At capacity, new events return
+503 while known duplicates remain acknowledgeable. Database failures roll back
+admission, so Stripe can retry. A normal notification relay cannot consume this
+separate inbox. `processed_at` is reserved for transactional consumer completion;
+the current endpoint never sets it. There is no automatic deletion or silent
+dead-lettering of financial hints.
+
+HTTP 200 means **received**, not processed, paid, settled or reconciled. Snapshot
+amount/status fields never update money, allowance or the payment journal. A
+signature proves possession of the configured endpoint secret, not the configured
+account's identity by itself; the subsequent authenticated API retrieval must also
+verify account/object/operation bindings. The durable consumer and Stripe financial
+worker are still required before enabling the full flow. Until then, this opt-in
+test inbox accumulates pending events and eventually backpressures at its cap.
+
+Tests use disposable PostgreSQL schemas, concurrent clients, a real loopback HTTP
+server and synthetic SDK signatures. They cover retries, conflicts, failed inserts,
+capacity races, repeat migrations, immutable fields, disabled/production settings,
+forged credentials, JSON/raw-byte/body limits and unchanged financial tables.
+They do not establish delivery from a registered Stripe endpoint or real sandbox
+acceptance. Never enable a real event source and assume an unfinished consumer is
+processing it.

@@ -39,6 +39,8 @@ import { MerchantQuoteRegistry } from "../crypto/merchantQuotes.js";
 import { ProviderTargetRegistry } from "../domain/providerTargets.js";
 import { OwnerPasskeyStore, loadOwnerPasskeyConfig } from "../persistence/ownerPasskeys.js";
 import { handlePasskeyRoutes } from "./routes/passkeyRoutes.js";
+import { StripeCallbackInbox, loadStripeCallbackConfiguration } from "../persistence/stripeCallbacks.js";
+import { handleStripeRoutes } from "./routes/stripeRoutes.js";
 
 const tracer = consoleTracer("[rail]");
 
@@ -65,6 +67,7 @@ export async function createServerContext(options: {
   const merchantQuotes = new MerchantQuoteRegistry(process.env.RAIL_MERCHANT_QUOTE_KEYS);
   const providerTargets = new ProviderTargetRegistry(process.env.RAIL_PROVIDER_TARGETS);
   const passkeyConfig = loadOwnerPasskeyConfig(process.env.RAIL_WEBAUTHN_RP_ID, process.env.RAIL_WEBAUTHN_ORIGIN);
+  const stripeCallbackConfig = loadStripeCallbackConfiguration();
   const pool = createPool(databaseUrl, config.dbPoolMax);
   const ownerPasskeys = passkeyConfig ? new OwnerPasskeyStore(pool, passkeyConfig) : undefined;
   const initializeDatabase = options.initializeDatabase ?? !config.serverless;
@@ -118,6 +121,7 @@ export async function createServerContext(options: {
     config,
     pool,
     databaseUrl,
+    stripeCallbacks: stripeCallbackConfig ? new StripeCallbackInbox(pool, stripeCallbackConfig) : undefined,
     offlineTokenStore,
     idempotency,
     engine,
@@ -176,7 +180,7 @@ export async function handleRequest(
       if (await handlePasskeyRoutes(req, res, url, context) || await handleAuthRoutes(req, res, url, context)) {
         return;
       }
-      if (await handleAgentRoutes(req, res, url, context)) return;
+      if (await handleStripeRoutes(req, res, url, context) || await handleAgentRoutes(req, res, url, context)) return;
       if (await handlePaymentRoutes(req, res, url, context)) {
         return;
       }
