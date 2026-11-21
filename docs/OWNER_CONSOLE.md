@@ -1,9 +1,12 @@
-# Owner Console (C3 In Progress)
+# Owner Console
 
-Latest local acceptance, 1 November 2026: all 474 backend tests and four Chromium
+Latest local acceptance, 21 November 2026: all 511 backend tests and five Chromium
 journeys passed with zero failures/skips, including the provider simulator page.
-The disposable database was removed. This is not real-provider/hosted acceptance;
-earlier test counts below describe historical checkpoints.
+The disposable database was removed. The Stripe journey uses fake SDK transport;
+real Stripe acceptance is deferred. Earlier counts below are historical checkpoints.
+Non-verified authority responses no longer receive a verified banner. Pagination
+cursor/reset and unavailable-receipt display also have explicit UI contract tests,
+distinct from actual database pagination and receipt-verification coverage.
 
 ## Purpose And Availability
 
@@ -115,8 +118,10 @@ fingerprints remain; authenticated data and additional safety controls intention
 replace illustrative content. A later change additionally clears hidden totals and
 fingerprints on session cleanup passed combined browser regression. The local
 three-process integration and external-simulator timeout/recovery walkthrough now
-have acceptance coverage. A real external provider, provider-authenticated outcomes
-and actual sandbox acceptance are still unavailable; this does not complete C2/C3.
+have acceptance coverage. The test-only Stripe adapter and protected API-observation
+receipts also exist, but actual Stripe API/webhook acceptance remains unverified and
+owner-deferred. The local console does not depend on that external gate. Neither
+simulator results nor fake SDK transport complete real-provider acceptance.
 
 ## Local Provider Walkthrough
 

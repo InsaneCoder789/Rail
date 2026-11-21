@@ -86,6 +86,9 @@ owner consent, races requests against one shared budget, denies cross-agent exec
 and verifies only permitted internal ledger effects. That is not an external provider
 test. The [standalone simulator executable](./AGENT_SIMULATORS.md) and
 [owner console](./OWNER_CONSOLE.md) now exist. The console has focused native browser
-acceptance; the updated three-process/lost-reply integration case awaits a fresh
-run. External provider timeout/reconciliation remains C2 work; this client alone
-does not complete C3.
+acceptance. The three-process/lost-reply integration case and durable local-provider
+timeout/reconciliation now have regression coverage. This client alone is not the
+complete demonstration: use the owner console and provider walkthrough for exact
+approval, held allowance, lookup recovery, history and protected outcome receipts.
+Real Stripe acceptance is deferred separately; local simulator results never prove
+external settlement.

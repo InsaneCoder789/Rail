@@ -16,6 +16,30 @@ owner/passkey APIs before starting the agent processes.
 
 ## Per-Agent Configuration
 
+For a reproducible automated setup rather than manual provisioning, run the
+existing integration fixture against a newly created, disposable local database:
+
+```sh
+set -e
+DEMO_DB="rail_c3_acceptance_$(date +%s)"
+createdb "$DEMO_DB"
+npm run build
+DATABASE_URL="postgresql://$(whoami)@localhost:5432/$DEMO_DB" \
+  node --test --test-name-pattern="three independent simulator processes" test/ownerPasskeys.test.js
+dropdb "$DEMO_DB"
+```
+
+Run this only when the generated database name is unused and local PostgreSQL access is
+configured. Never substitute a production URL. The fixture provisions synthetic
+wallets, users, separate signing keys, scoped credentials, owner consent, mandates
+and a shared budget; starts a loopback HTTP server; runs the scenario; then removes
+its own schema, temporary keys and server. It uses a synthetic WebAuthn fixture,
+not an interactive physical passkey. Other tests are filtered, not verified by
+this focused command. A failure stops before cleanup; retain its output, then remove
+only the generated disposable database after inspection.
+The manual owner-console path below intentionally requires operator provisioning
+instead of shipping a public endpoint that seeds accounts or grants authority.
+
 Give each process only these environment variables; do not pass the server's
 `.env` or inherit owner/database/provider credentials. A local operator may use
 three private environment files outside the repository, with restricted permissions.
@@ -101,4 +125,7 @@ without duplicate ledger entries. The updated case passed in the direct full
 backend regression on 16 October 2026; all three native Chromium journeys also
 passed and the disposable database was removed. A dropped internal HTTP reply is not proof of correct external
 provider timeout reconciliation. C2's durable worker, verified callbacks and actual
-selected-provider sandbox gate remain open.
+selected-provider sandbox gate remain open at that historical checkpoint. The
+durable simulator worker, protected receipts and owner history are now implemented;
+see [the current provider walkthrough](OWNER_CONSOLE.md#local-provider-walkthrough).
+Real Stripe acceptance is owner-deferred and is not part of the local closeout.
