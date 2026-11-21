@@ -294,6 +294,10 @@ test("Chromium owner console: actual sign-in, passkeys, exact approval, budget c
     assert.equal(await page.locator("#agent option").textContent(), agent.name + " / active");
     await page.locator("#load-intents").click(); await page.locator("#intent-rows button").click();
     assert.equal(await page.locator("#fingerprint").textContent(), intent.requestFingerprint);
+    await page.locator("#verify").click();
+    await page.waitForFunction(() => document.getElementById("receipt").textContent.includes('"verification": "not_executed"') && !document.getElementById("refresh").disabled);
+    assert.ok((await page.locator("#message").textContent()).includes("Authority status: not_executed"));
+    assert.ok(!(await page.locator("#message").textContent()).includes("Server-verified"));
     await page.locator("#approve").click();
     await page.waitForFunction(() => document.getElementById("review-detail").textContent.includes("Status: approved") && !document.getElementById("refresh").disabled);
     assert.equal((await context.pool.query("SELECT * FROM ledger_entries")).rowCount, 0);
@@ -303,6 +307,17 @@ test("Chromium owner console: actual sign-in, passkeys, exact approval, budget c
     await page.locator("#load-intents").click();
     await page.waitForFunction(() => document.querySelector("#intent-rows .status")?.textContent === "executed" && !document.getElementById("refresh").disabled);
     await page.locator("#intent-rows button").click(); await page.locator("#verify").click();
+    await page.waitForFunction(() => document.getElementById("receipt").textContent.includes('"verification": "verified"') && !document.getElementById("refresh").disabled);
+    assert.ok((await page.locator("#message").textContent()).includes("Server-verified authority"));
+    const authorityRoute = "**/v2/agents/*/intents/*/authority";
+    await page.route(authorityRoute, route => route.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ authority: { status: "verification_unavailable", reason: "key_unavailable" } }) }));
+    await page.locator("#verify").click();
+    await page.waitForFunction(() => document.getElementById("receipt").textContent.includes('"verification": "verification_unavailable"') && !document.getElementById("refresh").disabled);
+    assert.ok((await page.locator("#message").textContent()).includes("Authority status: verification_unavailable"));
+    assert.ok(!(await page.locator("#message").textContent()).includes("Server-verified"));
+    await page.unroute(authorityRoute);
+    await page.locator("#verify").click();
     await page.waitForFunction(() => document.getElementById("receipt").textContent.includes('"verification": "verified"') && !document.getElementById("refresh").disabled);
     await page.locator("#refresh").click();
     await page.waitForFunction(() => document.getElementById("spent").textContent.includes("1.00") && !document.getElementById("refresh").disabled);
@@ -413,6 +428,34 @@ test(`Chromium ${providerName} console: exact approval, lost reply, journal hist
     assert.ok((await page.locator("#reserved").textContent()).includes("0.00"));
     await page.locator("#provider-history").click();
     await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes("succeeded") && !document.getElementById("load-provider").disabled);
+    if (providerName === "simulator") {
+      // A UI contract fixture exercises a full page without fabricating financial journal rows.
+      const cursors = [], historyRoute = "**/v2/agents/*/provider-payments/*/history?*";
+      await page.route(historyRoute, route => {
+        const after = Number(new URL(route.request().url()).searchParams.get("afterRevision"));
+        cursors.push(after);
+        const entries = Array.from({ length: after === 0 ? 25 : 2 }, (_, index) => ({ revision: after + index + 1,
+          status: "processing", event: "processing_observed", attemptNumber: 1, recordedAt: "2026-11-21T00:00:00.000Z" }));
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ history: {
+          entries, status: "processing", assurance: "server_journal_history", nextAfterRevision: after === 0 ? 25 : null } }) });
+      });
+      await page.locator("#provider-history").click();
+      await page.waitForFunction(() => !document.getElementById("provider-next").disabled);
+      const first = JSON.parse(await page.locator("#provider-timeline").textContent());
+      assert.equal(first.entries.length, 25);
+      await page.locator("#provider-next").click();
+      await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes('"revision": 27') && !document.getElementById("load-provider").disabled);
+      const second = JSON.parse(await page.locator("#provider-timeline").textContent());
+      assert.deepEqual(second.entries.map(item => item.revision), [26, 27]);
+      assert.deepEqual(cursors, [0, 25]);
+      assert.equal(await page.locator("#provider-next").isDisabled(), true);
+      await page.locator("#provider-rows button").click();
+      assert.equal(await page.locator("#provider-next").isDisabled(), true);
+      assert.equal(await page.locator("#provider-timeline").textContent(), "");
+      await page.unroute(historyRoute);
+      await page.locator("#provider-history").click();
+      await page.waitForFunction(() => document.getElementById("provider-timeline").textContent.includes("succeeded") && !document.getElementById("load-provider").disabled);
+    }
     await page.locator("#provider-verify").click();
     await page.waitForFunction(() => document.getElementById("provider-receipt").textContent.includes('"status": "verified"') && !document.getElementById("load-provider").disabled);
     assert.ok((await page.locator("#provider-receipt").textContent()).includes(providerName === "stripe" ? "server_observed_stripe_test_api" : "local_simulator_outcome"));

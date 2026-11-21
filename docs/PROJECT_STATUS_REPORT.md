@@ -38,6 +38,47 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Non-Stripe Local Closeout, 21 November 2026
+
+The owner has explicitly deferred real Stripe acceptance while completing the
+surrounding C0-C3 work. Authentication, shared allowances, durable local-provider
+execution, protected outcome receipts, paginated owner history and the owner console
+are implemented. This checkpoint does not mark the original real-provider gate as
+complete or authorize C4-C8, deployment or live payments.
+
+Closeout corrects one misleading console banner: only a `verified` authority
+response now says server-verified. Pending, legacy and unavailable evidence remain
+explicitly non-verified; an unavailable receipt does not imply payment failure.
+Independent handler reproduction confirmed the original issue and verified all
+four repaired status branches. Browser regressions cover pending and unavailable
+responses as well as successful verification. The unavailable-response fixture is
+a UI contract test, not operational key-loss acceptance.
+
+The three-agent integration now launches fresh CLI processes for execution,
+lost-response status inspection and exact replay as well as concurrent proposals.
+Repeated migrations are checked against a completed protected receipt, journal
+history and allowance counters. A labeled browser fixture exercises the history
+next-page cursor and reset without inserting fictitious financial rows; separate
+PostgreSQL tests verify actual revision pagination and owner isolation.
+
+Final local validation passed all 511 backend tests and five Chromium journeys,
+zero failures/skips, with zero known dependency advisories. Node 20.19.6 was used.
+Browser startup initially failed because its matching executable was absent; the
+matching Playwright Chromium was installed before the successful fresh rerun.
+Evidence: `deliverables/portfolio-maintenance/rail_closeout_final_1795244661554.log`.
+Both disposable run databases were removed. The fifth journey uses fake Stripe
+transport as retained regression coverage, not actual Stripe acceptance. The local
+non-Stripe closeout is ready for owner review; no new remote CI, hosted, physical-
+authenticator or real-provider acceptance is claimed. The owner authorized two
+descriptive closeout commits: the receipt-display fix/regression tests and the
+updated operator documentation. No push is authorized by this commit request.
+
+Residual boundaries: raw privileged database access is outside ordinary API
+authority; receipt creation remains worker-enforced rather than a new SQL terminal-
+receipt completeness constraint. Arbitrary historical-version migration fixtures,
+physical authenticators, hosted custody/restore and production review remain
+separate assurance work. No zero-vulnerability or real-settlement claim is made.
+
 ### Real Stripe Acceptance Handoff
 
 The owner has confirmed that no Stripe sandbox account is available yet. The

@@ -252,7 +252,9 @@ const SCRIPT = String.raw`
     el('receipt').textContent = JSON.stringify({ verification: value.status, assurance: receipt && receipt.assurance, txId: receipt && receipt.txId,
       agentId: receipt && receipt.agentId, amountMinor: receipt && receipt.amountMinor, currency: receipt && receipt.policy.currency,
       consentSource: receipt && receipt.consentSource, sharedBudgetId: receipt && receipt.policy.sharedBudgetId, commitment: value.commitment },null,2);
-    message('Server-verified authority is not a blockchain attestation or external settlement confirmation.');
+    message(value.status === 'verified'
+      ? 'Server-verified authority is not a blockchain attestation or external settlement confirmation.'
+      : 'Authority status: ' + value.status + '. No verified authority receipt is available; this is not proof of payment failure.', value.status !== 'verified');
   });
   el('limit').onclick = () => run(async expected => {
     const budget = selectedBudget(), totalBudgetMinor = Number(el('new-limit').value);

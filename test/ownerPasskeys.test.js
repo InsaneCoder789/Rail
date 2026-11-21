@@ -537,12 +537,13 @@ test("three independent simulator processes coordinate a shared allowance and re
       const amounts = [650, 350, 250];
       const requests = agents.map((item, index) => ({ mandateId: item.mandate.mandateId, clientRequestId: randomUUID(),
         receiverWalletId: "other_wallet", amountMinor: amounts[index], currency: "INR", ttlSeconds: 300 }));
-      const results = await Promise.allSettled(agents.map(async (item, index) => {
+      const simulate = async (index, action) => {
+        const item = agents[index];
         const path = join(directory, `agent-${index}.pem`);
         await writeFile(path, item.key.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
         return new Promise((resolve, reject) => {
           // Each process receives exactly one agent's configuration, never the server environment.
-          const child = spawn(process.execPath, ["dist/demo/runAgentSimulator.js", "propose"], {
+          const child = spawn(process.execPath, ["dist/demo/runAgentSimulator.js", action], {
             env: { NODE_ENV: "test", RAIL_DEMO_MODE: "true", RAIL_AGENT_ORIGIN: origin, RAIL_AGENT_TOKEN: item.credential.token,
               RAIL_AGENT_PRIVATE_KEY_PATH: path, RAIL_AGENT_MANDATE_ID: requests[index].mandateId,
               RAIL_AGENT_REQUEST_ID: requests[index].clientRequestId, RAIL_AGENT_RECEIVER_WALLET_ID: "other_wallet",
@@ -557,7 +558,8 @@ test("three independent simulator processes coordinate a shared allowance and re
             } catch { reject(new Error("simulator_process_failed")); }
           });
         });
-      }));
+      };
+      const results = await Promise.allSettled(agents.map((_, index) => simulate(index, "propose")));
       const winners = results.map((result, index) => ({ result, index })).filter(item => item.result.status === "fulfilled");
       const loser = results.findIndex(result => result.status === "rejected");
       assert.equal(winners.length, 2);
@@ -570,10 +572,10 @@ test("three independent simulator processes coordinate a shared allowance and re
       for (const { result, index } of winners) {
         if (index === winners[0].index) {
           dropNextExecute = true;
-          await assert.rejects(runAgentSimulation(clients[index], "execute", requests[index]), { status: 0, code: "agent_network_error" });
-          assert.equal((await runAgentSimulation(clients[index], "status", requests[index])).status, "executed");
+          await assert.rejects(simulate(index, "execute"), { status: 0, code: "agent_network_error" });
+          assert.equal((await simulate(index, "status")).status, "executed");
         }
-        const response = await runAgentSimulation(clients[index], "execute", requests[index]);
+        const response = await simulate(index, "execute");
         assert.equal(response.status, "executed");
       }
       const total = winners.reduce((sum, item) => sum + amounts[item.index], 0);
@@ -942,6 +944,14 @@ test("simulator outcome receipts bind consent and final accounting, survive repl
     await assert.rejects(strict.readProviderOutcome(otherOwner.walletId, agent.agentId, proposal.operationId, otherOwner));
     await queue(); await drain();
     assert.deepEqual(await readReceipt(), original);
+    const beforeMigration = (await pool.query("SELECT * FROM rail_provider_outcome_evidence")).rows;
+    const historyBeforeMigration = await strict.listProviderHistory(owner.walletId, agent.agentId, proposal.operationId, owner);
+    const allowanceBeforeMigration = (await pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows;
+    await runMigrations(pool); await ensureOutboxSchema(pool);
+    assert.deepEqual((await pool.query("SELECT * FROM rail_provider_outcome_evidence")).rows, beforeMigration);
+    assert.deepEqual(await readReceipt(), original);
+    assert.deepEqual(await strict.listProviderHistory(owner.walletId, agent.agentId, proposal.operationId, owner), historyBeforeMigration);
+    assert.deepEqual((await pool.query("SELECT reserved_budget_minor,spent_budget_minor FROM rail_shared_budgets")).rows, allowanceBeforeMigration);
     assert.equal((await pool.query("SELECT count(*) FROM rail_provider_outcome_evidence")).rows[0].count, "1");
     await assert.rejects(strict.readProviderOutcome(owner.walletId, agent.agentId, randomUUID(), owner), { code: "provider_payment_not_found" });
     await assert.rejects(pool.query("DELETE FROM rail_provider_outcome_evidence"), /provider_outcome_evidence_is_immutable/);
