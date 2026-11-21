@@ -627,3 +627,43 @@ real HTTP callback route with a synthetic SDK signature, consumes the hint, then
 resolves the job through a fake Stripe API transport and verifies the owner receipt.
 No test here establishes actual account access, Stripe network behavior or hosted
 webhook delivery. Those remain explicit final acceptance gates.
+
+## Real Sandbox Acceptance Checklist
+
+Status: waiting for owner-provided Stripe test access. The local fake-transport
+tests above do not complete this checklist. Do not enable live payments or paste
+credentials into chat, commits, screenshots or reports.
+
+1. The owner supplies access to an isolated Stripe test environment. Account
+   creation is an owner action, not an automated Rail task.
+2. Provision a test customer and a saved test card PaymentMethod with the required
+   setup/consent. Confirm the customer, method and configured merchant account
+   belong to the same test environment. Never use a real card for this exercise.
+3. Configure the documented test flags, account and instrument mappings, independent
+   Rail key rings, allowed origins and target registry through private environment
+   configuration. Use an isolated PostgreSQL database and run `npm run migrate`.
+4. Arrange an explicitly authorized callback endpoint reachable by Stripe, with its
+   own endpoint signing secret. Confirm signature rejection before accepting events.
+   Hosting or exposing an endpoint needs separate authorization; this checklist
+   does not deploy one. The finite worker must be invoked separately.
+5. Through the owner console, approve one exact payment and admit it using the
+   original agent proof. Choose a supported currency and an amount satisfying the
+   actual provider minimum. Record the operation ID without recording credentials.
+6. Run `npm run provider:stripe` against that isolated environment. Verify the
+   resulting test PaymentIntent account, amount, currency and original correlation
+   against the journal. Verify allowance resolution and the protected owner receipt;
+   an HTTP success or worker exit alone is insufficient evidence.
+7. Verify a genuine Stripe delivery reaches the durable inbox and is consumed.
+   Duplicate delivery must retain the same correlation, receipt and accounting.
+   Replay the original execution request and confirm there is only one provider
+   payment and one allowance resolution.
+8. In isolated test data, exercise lost-response recovery without resubmission,
+   revocation before submission, and reconciliation after submission. Pending or
+   conflicting outcomes must retain their hold rather than invent success or failure.
+9. Save sanitized API, webhook, database and owner-console evidence, including
+   runtime versions and unresolved failures. Record the real sandbox result in the
+   project report before closing C2/C3. No sandbox result certifies production,
+   refunds/disputes, compliance or real-money readiness.
+
+Keep unresolved operations and their original configuration available for recovery.
+Do not drop their database or revoke required keys merely to clean up a test run.

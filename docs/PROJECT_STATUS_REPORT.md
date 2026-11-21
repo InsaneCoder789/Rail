@@ -38,6 +38,16 @@ Use it in the following ways:
 
 ## Latest Status
 
+### Real Stripe Acceptance Handoff
+
+The owner has confirmed that no Stripe sandbox account is available yet. The
+provider guide now includes an ordered real-sandbox acceptance checklist covering
+private test configuration, owner approval, genuine API/webhook evidence, replay,
+recovery and safe retention of unresolved operations. This is documentation only;
+no account, deployment, charge or new acceptance run was performed. C2/C3 remain
+incomplete until actual sandbox evidence is collected. Existing local regression
+results below remain distinct from real-provider acceptance.
+
 ### Stripe Callback Consumption And Durable Lookup Hints
 
 The Stripe worker now consumes authenticated callback hints before its payment
